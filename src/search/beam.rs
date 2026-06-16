@@ -3,10 +3,18 @@
 //! At each step the engine:
 //!   1. Expands the current beam by applying every available `CraftingMethod`
 //!      to every `ItemState` in the beam.
-//!   2. Scores each resulting state using the user-supplied `score_fn`.
+//!   2. Scores each resulting state: `score_fn(state) - cost_weight * cumulative_cost`.
 //!   3. Keeps the top `beam_width` states by score (ties broken arbitrarily).
 //!
 //! The search terminates when `max_steps` is reached or the beam is empty.
+//!
+//! ## Probability tracking
+//! `cumulative_prob` is the product of per-step outcome probabilities along the
+//! path. For methods that enumerate exact outcomes (Exalted, Annulment, Harvest)
+//! this is meaningful. For Monte Carlo methods (Chaos, Alch, Essence, Fossil) each
+//! sample carries probability 1/N, so `cumulative_prob` reflects sample weight, not
+//! true in-game probability. It is tracked for reporting only and does NOT affect
+//! node ranking.
 
 use std::cmp::Reverse;
 use std::sync::Arc;
@@ -23,6 +31,10 @@ pub struct BeamConfig {
     pub beam_width: usize,
     /// Maximum number of crafting steps to simulate.
     pub max_steps: usize,
+    /// Cost penalty per chaos orb applied to node ranking.
+    /// `node.score = score_fn(state) - cost_weight * cumulative_cost`
+    /// Tune relative to the scale of your `score_fn`. Use 0.0 to ignore cost in ranking.
+    pub cost_weight: f64,
 }
 
 /// A node in the beam — the current item state plus its ancestry for path reconstruction.
@@ -35,8 +47,7 @@ pub struct BeamNode {
     pub cumulative_cost: f64,
     /// Product of outcome probabilities along this path (1.0 = fully certain).
     pub cumulative_prob: f64,
-    /// Probability-weighted score: `score_fn(state) * cumulative_prob`.
-    /// Lower-probability paths score lower even if the item itself is better.
+    /// Ranking score: `score_fn(state) - cost_weight * cumulative_cost`.
     pub score: f64,
 }
 
@@ -72,6 +83,7 @@ impl<'db> BeamSearch<'db> {
     where
         F: Fn(&ItemState) -> f64 + Send + Sync,
     {
+        let cost_weight = self.config.cost_weight;
         let initial_score = score_fn(&initial);
         let mut beam: Vec<BeamNode> = vec![BeamNode {
             state: initial,
@@ -99,15 +111,15 @@ impl<'db> BeamSearch<'db> {
                         };
                         for (next_state, prob) in outcomes {
                             let raw = score_fn(&next_state);
-                            let next_prob = node.cumulative_prob * prob;
+                            let new_cost = node.cumulative_cost + method.cost_chaos();
                             let mut path = node.path.clone();
                             path.push(method.name().to_string());
                             local.push(BeamNode {
                                 state: next_state,
                                 path,
-                                cumulative_cost: node.cumulative_cost + method.cost_chaos(),
-                                cumulative_prob: next_prob,
-                                score: raw * next_prob,
+                                cumulative_cost: new_cost,
+                                cumulative_prob: node.cumulative_prob * prob,
+                                score: raw - cost_weight * new_cost,
                             });
                         }
                     }

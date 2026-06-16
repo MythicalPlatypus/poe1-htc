@@ -119,7 +119,7 @@ pub fn roll_mods<R: Rng>(
             break;
         }
         let (mod_id, picked) = weighted_pick(&pool, rng)
-            .expect("pool non-empty but weighted_pick returned None");
+            .ok_or_else(|| anyhow::anyhow!("weighted_pick returned None on non-empty pool"))?;
 
         let rolls = random_rolls_pub(&picked.stats, rng);
         let modifier = Modifier {

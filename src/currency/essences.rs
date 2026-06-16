@@ -1,5 +1,7 @@
 //! Essence crafting — guarantees one specific mod while rerolling the rest as a Chaos Orb.
 
+use std::collections::HashSet;
+
 use anyhow::{bail, Result};
 use rand::{rng, Rng};
 
@@ -44,6 +46,31 @@ impl CraftingMethod for Essence {
             );
         }
 
+        // After apply, prefixes/suffixes/crafted_mod are cleared; fractured mods remain.
+        // Validate that the forced mod can be placed alongside them.
+        let fractured_groups: HashSet<&str> = item.fractured.iter()
+            .filter_map(|m| db.mods.get(&m.mod_id))
+            .flat_map(|m| m.groups.iter().map(|g| g.as_str()))
+            .collect();
+        if guaranteed.groups.iter().any(|g| fractured_groups.contains(g.as_str())) {
+            bail!(
+                "{}: guaranteed mod '{}' shares a mod group with a fractured mod",
+                self.display_name,
+                self.guaranteed_mod_id
+            );
+        }
+        let frac_prefixes = item.fractured.iter()
+            .filter(|m| m.generation_type == GenerationType::Prefix).count();
+        let frac_suffixes = item.fractured.iter()
+            .filter(|m| m.generation_type == GenerationType::Suffix).count();
+        match guaranteed.generation_type {
+            GenerationType::Prefix if frac_prefixes >= 3 =>
+                bail!("{}: no open prefix slot — all taken by fractured mods", self.display_name),
+            GenerationType::Suffix if frac_suffixes >= 3 =>
+                bail!("{}: no open suffix slot — all taken by fractured mods", self.display_name),
+            _ => {}
+        }
+
         let prob = 1.0 / MONTE_CARLO_SAMPLES as f64;
         let mut rng = rng();
         let mut outcomes = Vec::with_capacity(MONTE_CARLO_SAMPLES);
@@ -65,7 +92,7 @@ impl CraftingMethod for Essence {
             match guaranteed.generation_type {
                 GenerationType::Prefix => next.prefixes.push(forced),
                 GenerationType::Suffix => next.suffixes.push(forced),
-                _ => unreachable!("validated above"),
+                _ => bail!("{}: guaranteed mod is not a prefix or suffix (validated above)", self.display_name),
             }
 
             // Fill remaining slots (4–6 total like Chaos Orb; 1 already placed).

@@ -114,7 +114,7 @@ impl CraftingMethod for EldritchExaltedOrb {
         let current_mod_id = match self.god {
             EldritchGod::SearingExarch => item.exarch_implicit.as_ref().map(|m| &m.mod_id),
             EldritchGod::EaterOfWorlds => item.eater_implicit.as_ref().map(|m| &m.mod_id),
-        }.expect("can_apply verified implicit exists");
+        }.ok_or_else(|| anyhow::anyhow!("{}: implicit slot is empty", self.name()))?;
 
         let current_mod = db.mods.get(current_mod_id)
             .ok_or_else(|| anyhow::anyhow!("Implicit mod '{}' not in DB", current_mod_id))?;

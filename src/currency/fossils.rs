@@ -1,6 +1,8 @@
 //! Fossil crafting — rerolls the item as a Chaos Orb but with modified spawn weight tables.
 //! Up to 4 fossils can be combined in one resonator.
 
+use std::collections::HashSet;
+
 use anyhow::{bail, Result};
 use rand::{rng, Rng};
 
@@ -54,13 +56,43 @@ impl CraftingMethod for FossilCraft {
             })
             .collect();
 
-        // Validate forced mods exist and are prefix/suffix before sampling.
+        // Validate all forced mods before sampling: existence, type, group conflicts, slot capacity.
+        // After apply, prefixes/suffixes/crafted_mod are cleared; fractured mods remain.
+        // Track occupied groups and slots as forced mods are accepted in order.
+        let mut occupied_groups: HashSet<&str> = item.fractured.iter()
+            .filter_map(|m| db.mods.get(&m.mod_id))
+            .flat_map(|m| m.groups.iter().map(|g| g.as_str()))
+            .collect();
+        let mut forced_prefixes = item.fractured.iter()
+            .filter(|m| m.generation_type == GenerationType::Prefix).count();
+        let mut forced_suffixes = item.fractured.iter()
+            .filter(|m| m.generation_type == GenerationType::Suffix).count();
+
         for fossil in &self.fossils {
             for mod_id in &fossil.forced_mod_ids {
                 let forced_mod = db.mods.get(mod_id)
                     .ok_or_else(|| anyhow::anyhow!("Fossil forced mod '{}' not in DB", mod_id))?;
                 if !matches!(forced_mod.generation_type, GenerationType::Prefix | GenerationType::Suffix) {
                     bail!("{}: forced mod '{}' is not a prefix or suffix", self.display_name, mod_id);
+                }
+                if forced_mod.groups.iter().any(|g| occupied_groups.contains(g.as_str())) {
+                    bail!(
+                        "{}: forced mod '{}' shares a mod group with a fractured mod or another forced mod",
+                        self.display_name, mod_id
+                    );
+                }
+                match forced_mod.generation_type {
+                    GenerationType::Prefix if forced_prefixes >= 3 =>
+                        bail!("{}: no open prefix slot for forced mod '{}'", self.display_name, mod_id),
+                    GenerationType::Suffix if forced_suffixes >= 3 =>
+                        bail!("{}: no open suffix slot for forced mod '{}'", self.display_name, mod_id),
+                    _ => {}
+                }
+                for g in &forced_mod.groups { occupied_groups.insert(g.as_str()); }
+                match forced_mod.generation_type {
+                    GenerationType::Prefix => forced_prefixes += 1,
+                    GenerationType::Suffix => forced_suffixes += 1,
+                    _ => {}
                 }
             }
         }
@@ -76,10 +108,11 @@ impl CraftingMethod for FossilCraft {
             next.suffixes.clear();
             next.crafted_mod = None;
 
-            // Place forced mods first.
+            // Place forced mods first (validity confirmed in upfront checks above).
             for fossil in &self.fossils {
                 for mod_id in &fossil.forced_mod_ids {
-                    let forced_mod = db.mods.get(mod_id).expect("validated above");
+                    let forced_mod = db.mods.get(mod_id)
+                        .ok_or_else(|| anyhow::anyhow!("{}: forced mod '{}' missing from DB", self.display_name, mod_id))?;
                     let rolls = random_rolls_pub(&forced_mod.stats, &mut rng);
                     let modifier = Modifier {
                         mod_id: mod_id.clone(),
@@ -89,7 +122,7 @@ impl CraftingMethod for FossilCraft {
                     match forced_mod.generation_type {
                         GenerationType::Prefix => next.prefixes.push(modifier),
                         GenerationType::Suffix => next.suffixes.push(modifier),
-                        _ => unreachable!("validated above"),
+                        _ => bail!("{}: forced mod '{}' is not a prefix or suffix (validated above)", self.display_name, mod_id),
                     }
                 }
             }
