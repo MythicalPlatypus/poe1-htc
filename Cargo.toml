@@ -1,0 +1,34 @@
+[package]
+name = "poe1_htc"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "poe1_htc"
+path = "src/main.rs"
+
+[dependencies]
+# Serialization / deserialization of RePoE JSON data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Parallel iteration for beam search and mod evaluation
+rayon = "1"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Ordered float for priority queues in beam search
+ordered-float = "4"
+
+# Random number generation for weighted mod selection and stat rolling
+rand = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
