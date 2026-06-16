@@ -4,3 +4,5 @@ data/*.json
 .idea/
 .cargo/
 .claude/
+CLAUDE.md
+AGENTS.md
