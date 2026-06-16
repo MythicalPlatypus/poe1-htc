@@ -1,8 +1,11 @@
-/// Monte Carlo sample count for stochastic full-reroll currencies (Alchemy, Chaos,
-/// Essence, Fossil). These have too many possible outcomes for exact enumeration,
-/// so we draw this many independent samples, each returned with probability 1/N.
-/// This gives the beam search representative diversity while correctly discounting
-/// the probability of each specific outcome.
+/// Sample count for stochastic full-reroll currencies (Alchemy, Chaos, Essence, Fossil).
+/// These currencies have too many possible outcomes for exact enumeration, so we draw
+/// N independent samples. Each sample is returned with weight 1/N.
+///
+/// IMPORTANT: 1/N is a sample weight, not a true in-game probability. The actual
+/// probability of any specific outcome depends on the full mod pool and is not
+/// computed here. `path_weight` values that include Monte Carlo steps are therefore
+/// NOT true probabilities and must not be treated as such in scoring or reporting.
 pub const MONTE_CARLO_SAMPLES: usize = 50;
 
 pub mod orbs;

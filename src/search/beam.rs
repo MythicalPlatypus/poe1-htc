@@ -8,13 +8,13 @@
 //!
 //! The search terminates when `max_steps` is reached or the beam is empty.
 //!
-//! ## Probability tracking
-//! `cumulative_prob` is the product of per-step outcome probabilities along the
-//! path. For methods that enumerate exact outcomes (Exalted, Annulment, Harvest)
-//! this is meaningful. For Monte Carlo methods (Chaos, Alch, Essence, Fossil) each
-//! sample carries probability 1/N, so `cumulative_prob` reflects sample weight, not
-//! true in-game probability. It is tracked for reporting only and does NOT affect
-//! node ranking.
+//! ## Path weight vs. true probability
+//! `path_weight` is the product of per-step outcome weights along the path.
+//! For methods that enumerate exact outcomes (Exalted, Annulment, Harvest) this
+//! equals the true in-game probability of the path. For Monte Carlo methods (Chaos,
+//! Alch, Essence, Fossil) each sample carries weight 1/N — a sample weight, NOT a
+//! true probability. Mixed paths are therefore not comparable on this field.
+//! `path_weight` is tracked for reporting only and does NOT affect node ranking.
 
 use std::cmp::Reverse;
 use std::sync::Arc;
@@ -45,8 +45,12 @@ pub struct BeamNode {
     pub path: Vec<String>,
     /// Cumulative cost in chaos orbs along this path.
     pub cumulative_cost: f64,
-    /// Product of outcome probabilities along this path (1.0 = fully certain).
-    pub cumulative_prob: f64,
+    /// Product of per-step outcome weights along this path.
+    /// Equals true probability only for paths composed entirely of exact-enumeration
+    /// methods (Exalted, Annulment, Harvest). For Monte Carlo methods each step
+    /// contributes 1/N (a sample weight), making this field a mixed, non-comparable
+    /// number on such paths. Used for reporting only; does not affect ranking.
+    pub path_weight: f64,
     /// Ranking score: `score_fn(state) - cost_weight * cumulative_cost`.
     pub score: f64,
 }
@@ -58,9 +62,11 @@ pub struct SearchResult {
     pub path: Vec<String>,
     /// Total cost in chaos orbs along the winning path.
     pub total_cost: f64,
-    /// Probability of this specific outcome sequence occurring.
-    pub path_probability: f64,
-    /// Probability-weighted score at the winning node.
+    /// Product of per-step outcome weights along the winning path.
+    /// True probability only when no Monte Carlo methods appear in the path;
+    /// otherwise a sample weight (see module-level doc for details).
+    pub path_weight: f64,
+    /// Ranking score at the winning node: `score_fn(state) - cost_weight * total_cost`.
     pub score: f64,
 }
 
@@ -89,7 +95,7 @@ impl<'db> BeamSearch<'db> {
             state: initial,
             path: Vec::new(),
             cumulative_cost: 0.0,
-            cumulative_prob: 1.0,
+            path_weight: 1.0,
             score: initial_score,
         }];
 
@@ -118,7 +124,7 @@ impl<'db> BeamSearch<'db> {
                                 state: next_state,
                                 path,
                                 cumulative_cost: new_cost,
-                                cumulative_prob: node.cumulative_prob * prob,
+                                path_weight: node.path_weight * prob,
                                 score: raw - cost_weight * new_cost,
                             });
                         }
@@ -148,7 +154,7 @@ impl<'db> BeamSearch<'db> {
             state: n.state,
             path: n.path,
             total_cost: n.cumulative_cost,
-            path_probability: n.cumulative_prob,
+            path_weight: n.path_weight,
             score: n.score,
         })
     }
