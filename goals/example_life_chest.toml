@@ -1,0 +1,42 @@
+# Example goal: a life + fire resistance body armour.
+#
+# Run with:
+#   cargo run --release -- --goal goals/example_life_chest.toml
+#
+# Field reference (see src/goal/mod.rs for full semantics):
+#   [item]    base       — base item display name or RePoE metadata ID
+#             item_level — gates which mods can roll (default 84)
+#   [[wants]] mod_id     — exact RePoE mod ID (e.g. "IncreasedLife7")
+#             group      — RePoE mod group, matches any tier (e.g. "IncreasedLife")
+#             stat       — RePoE stat ID (e.g. "base_maximum_life")
+#             min_value  — minimum rolled value for `stat` (requires `stat`)
+#             weight     — score when satisfied (default 1.0, must be > 0)
+#   [search]  optional overrides; CLI flags take precedence over these
+
+[item]
+base = "Astral Plate"
+item_level = 86
+
+# Any tier of the flat life prefix.
+[[wants]]
+group = "IncreasedLife"
+weight = 10.0
+
+# A high life roll specifically (T2+ starts around 90).
+[[wants]]
+stat = "base_maximum_life"
+min_value = 90
+weight = 5.0
+
+# Any tier of fire resistance suffix.
+[[wants]]
+group = "FireResistance"
+weight = 8.0
+
+# Search parameters. cost_weight is the chaos-cost penalty per point of score:
+# with weights summing to 23, a cost_weight of 0.05 means the search will spend
+# up to ~20 chaos to gain 1 point of score.
+[search]
+beam_width = 20
+max_steps = 8
+cost_weight = 0.05

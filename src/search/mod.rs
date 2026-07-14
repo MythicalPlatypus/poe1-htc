@@ -1,3 +1,3 @@
 pub mod beam;
 
-pub use beam::{BeamSearch, BeamConfig, SearchResult};
+pub use beam::{BeamConfig, BeamSearch, SearchResult};

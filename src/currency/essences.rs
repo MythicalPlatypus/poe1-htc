@@ -5,12 +5,12 @@ use std::collections::HashSet;
 use anyhow::{bail, Result};
 use rand::{rng, Rng};
 
-use crate::data::GameData;
+use super::{CraftingMethod, MONTE_CARLO_SAMPLES};
 use crate::data::mods::GenerationType;
+use crate::data::GameData;
 use crate::engine::mod_pool::{random_rolls_pub, roll_mods};
 use crate::item::modifier::Modifier;
-use crate::item::{ItemState, state::Rarity};
-use super::{CraftingMethod, MONTE_CARLO_SAMPLES};
+use crate::item::{state::Rarity, ItemState};
 
 /// An Essence application: guarantees `guaranteed_mod_id` on the item.
 pub struct Essence {
@@ -22,8 +22,16 @@ pub struct Essence {
 }
 
 impl CraftingMethod for Essence {
-    fn name(&self) -> &str { &self.display_name }
-    fn cost_chaos(&self) -> f64 { self.cost_chaos }
+    fn name(&self) -> &str {
+        &self.display_name
+    }
+    fn cost_chaos(&self) -> f64 {
+        self.cost_chaos
+    }
+    // Monte Carlo sampling — weights are 1/N, not probabilities.
+    fn weights_are_probabilities(&self) -> bool {
+        false
+    }
 
     fn can_apply(&self, item: &ItemState, db: &GameData) -> bool {
         item.is_craftable()
@@ -32,13 +40,19 @@ impl CraftingMethod for Essence {
     }
 
     fn apply(&self, item: &ItemState, db: &GameData) -> Result<Vec<(ItemState, f64)>> {
-        if !self.can_apply(item, db) { bail!("Cannot apply {}", self.display_name); }
+        if !self.can_apply(item, db) {
+            bail!("Cannot apply {}", self.display_name);
+        }
 
-        let guaranteed = db.mods.get(&self.guaranteed_mod_id)
-            .ok_or_else(|| anyhow::anyhow!("Essence mod '{}' not found in DB", self.guaranteed_mod_id))?;
+        let guaranteed = db.mods.get(&self.guaranteed_mod_id).ok_or_else(|| {
+            anyhow::anyhow!("Essence mod '{}' not found in DB", self.guaranteed_mod_id)
+        })?;
 
         // Validate generation_type once before sampling.
-        if !matches!(guaranteed.generation_type, GenerationType::Prefix | GenerationType::Suffix) {
+        if !matches!(
+            guaranteed.generation_type,
+            GenerationType::Prefix | GenerationType::Suffix
+        ) {
             bail!(
                 "{}: guaranteed mod '{}' is not a prefix or suffix",
                 self.display_name,
@@ -48,26 +62,42 @@ impl CraftingMethod for Essence {
 
         // After apply, prefixes/suffixes/crafted_mod are cleared; fractured mods remain.
         // Validate that the forced mod can be placed alongside them.
-        let fractured_groups: HashSet<&str> = item.fractured.iter()
+        let fractured_groups: HashSet<&str> = item
+            .fractured
+            .iter()
             .filter_map(|m| db.mods.get(&m.mod_id))
             .flat_map(|m| m.groups.iter().map(|g| g.as_str()))
             .collect();
-        if guaranteed.groups.iter().any(|g| fractured_groups.contains(g.as_str())) {
+        if guaranteed
+            .groups
+            .iter()
+            .any(|g| fractured_groups.contains(g.as_str()))
+        {
             bail!(
                 "{}: guaranteed mod '{}' shares a mod group with a fractured mod",
                 self.display_name,
                 self.guaranteed_mod_id
             );
         }
-        let frac_prefixes = item.fractured.iter()
-            .filter(|m| m.generation_type == GenerationType::Prefix).count();
-        let frac_suffixes = item.fractured.iter()
-            .filter(|m| m.generation_type == GenerationType::Suffix).count();
+        let frac_prefixes = item
+            .fractured
+            .iter()
+            .filter(|m| m.generation_type == GenerationType::Prefix)
+            .count();
+        let frac_suffixes = item
+            .fractured
+            .iter()
+            .filter(|m| m.generation_type == GenerationType::Suffix)
+            .count();
         match guaranteed.generation_type {
-            GenerationType::Prefix if frac_prefixes >= 3 =>
-                bail!("{}: no open prefix slot — all taken by fractured mods", self.display_name),
-            GenerationType::Suffix if frac_suffixes >= 3 =>
-                bail!("{}: no open suffix slot — all taken by fractured mods", self.display_name),
+            GenerationType::Prefix if frac_prefixes >= 3 => bail!(
+                "{}: no open prefix slot — all taken by fractured mods",
+                self.display_name
+            ),
+            GenerationType::Suffix if frac_suffixes >= 3 => bail!(
+                "{}: no open suffix slot — all taken by fractured mods",
+                self.display_name
+            ),
             _ => {}
         }
 
@@ -92,7 +122,10 @@ impl CraftingMethod for Essence {
             match guaranteed.generation_type {
                 GenerationType::Prefix => next.prefixes.push(forced),
                 GenerationType::Suffix => next.suffixes.push(forced),
-                _ => bail!("{}: guaranteed mod is not a prefix or suffix (validated above)", self.display_name),
+                _ => bail!(
+                    "{}: guaranteed mod is not a prefix or suffix (validated above)",
+                    self.display_name
+                ),
             }
 
             // Fill remaining slots (4–6 total like Chaos Orb; 1 already placed).

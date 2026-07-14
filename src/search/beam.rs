@@ -77,8 +77,16 @@ pub struct BeamSearch<'db> {
 }
 
 impl<'db> BeamSearch<'db> {
-    pub fn new(config: BeamConfig, db: &'db GameData, methods: Vec<Arc<dyn CraftingMethod>>) -> Self {
-        Self { config, db, methods }
+    pub fn new(
+        config: BeamConfig,
+        db: &'db GameData,
+        methods: Vec<Arc<dyn CraftingMethod>>,
+    ) -> Self {
+        Self {
+            config,
+            db,
+            methods,
+        }
     }
 
     /// Run the beam search starting from `initial`, using `score_fn` to rank states.
@@ -102,7 +110,9 @@ impl<'db> BeamSearch<'db> {
         let mut best: Option<BeamNode> = None;
 
         for _step in 0..self.config.max_steps {
-            if beam.is_empty() { break; }
+            if beam.is_empty() {
+                break;
+            }
 
             // Expand: for each node × each method, generate successors in parallel.
             let mut candidates: Vec<BeamNode> = beam
@@ -110,7 +120,9 @@ impl<'db> BeamSearch<'db> {
                 .flat_map(|node| {
                     let mut local: Vec<BeamNode> = Vec::new();
                     for method in &self.methods {
-                        if !method.can_apply(&node.state, self.db) { continue; }
+                        if !method.can_apply(&node.state, self.db) {
+                            continue;
+                        }
                         let outcomes = match method.apply(&node.state, self.db) {
                             Ok(o) => o,
                             Err(_) => continue,
@@ -133,7 +145,9 @@ impl<'db> BeamSearch<'db> {
                 })
                 .collect();
 
-            if candidates.is_empty() { break; }
+            if candidates.is_empty() {
+                break;
+            }
 
             // Sort descending by score, keep beam_width best.
             candidates.sort_by_key(|n| Reverse(OrderedFloat(n.score)));
@@ -141,7 +155,7 @@ impl<'db> BeamSearch<'db> {
 
             // Track global best.
             if let Some(top) = candidates.first() {
-                let is_better = best.as_ref().map_or(true, |b| top.score > b.score);
+                let is_better = best.as_ref().is_none_or(|b| top.score > b.score);
                 if is_better {
                     best = Some(top.clone());
                 }

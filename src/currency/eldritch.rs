@@ -4,12 +4,12 @@
 use anyhow::{bail, Result};
 use rand::rng;
 
-use crate::data::GameData;
+use super::CraftingMethod;
 use crate::data::mods::GenerationType;
+use crate::data::GameData;
 use crate::engine::mod_pool::{eligible_mods_eldritch, random_rolls_pub};
 use crate::item::modifier::Modifier;
-use crate::item::{ItemState, state::Rarity};
-use super::CraftingMethod;
+use crate::item::{state::Rarity, ItemState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EldritchGod {
@@ -28,7 +28,9 @@ fn eldritch_gen_type(god: EldritchGod) -> GenerationType {
 }
 
 fn item_supports_eldritch(item: &ItemState) -> bool {
-    item.base_tags.iter().any(|t| ELDRITCH_ITEM_TAGS.contains(&t.as_str()))
+    item.base_tags
+        .iter()
+        .any(|t| ELDRITCH_ITEM_TAGS.contains(&t.as_str()))
 }
 
 // ── Eldritch Chaos Orb ───────────────────────────────────────────────────────
@@ -46,37 +48,47 @@ impl CraftingMethod for EldritchChaosOrb {
             EldritchGod::EaterOfWorlds => "Eldritch Chaos Orb (Eater)",
         }
     }
-    fn cost_chaos(&self) -> f64 { 5.0 }
+    fn cost_chaos(&self) -> f64 {
+        5.0
+    }
 
     fn can_apply(&self, item: &ItemState, _db: &GameData) -> bool {
         item.is_craftable() && item.rarity == Rarity::Rare && item_supports_eldritch(item)
     }
 
     fn apply(&self, item: &ItemState, db: &GameData) -> Result<Vec<(ItemState, f64)>> {
-        if !self.can_apply(item, db) { bail!("Cannot apply {}", self.name()); }
+        if !self.can_apply(item, db) {
+            bail!("Cannot apply {}", self.name());
+        }
 
         let gen_type = eldritch_gen_type(self.god);
         let pool = eligible_mods_eldritch(item, &gen_type, db);
         let total_weight: u64 = pool.iter().map(|(_, _, w)| *w as u64).sum();
         if total_weight == 0 {
-            bail!("{}: no eligible eldritch implicits for this item", self.name());
+            bail!(
+                "{}: no eligible eldritch implicits for this item",
+                self.name()
+            );
         }
 
         let mut rng = rng();
-        let outcomes = pool.iter().map(|(mod_id, picked, weight)| {
-            let mut next = item.clone();
-            let rolls = random_rolls_pub(&picked.stats, &mut rng);
-            let modifier = Modifier {
-                mod_id: mod_id.to_string(),
-                generation_type: picked.generation_type.clone(),
-                rolls,
-            };
-            match self.god {
-                EldritchGod::SearingExarch => next.exarch_implicit = Some(modifier),
-                EldritchGod::EaterOfWorlds => next.eater_implicit = Some(modifier),
-            }
-            (next, *weight as f64 / total_weight as f64)
-        }).collect();
+        let outcomes = pool
+            .iter()
+            .map(|(mod_id, picked, weight)| {
+                let mut next = item.clone();
+                let rolls = random_rolls_pub(&picked.stats, &mut rng);
+                let modifier = Modifier {
+                    mod_id: mod_id.to_string(),
+                    generation_type: picked.generation_type.clone(),
+                    rolls,
+                };
+                match self.god {
+                    EldritchGod::SearingExarch => next.exarch_implicit = Some(modifier),
+                    EldritchGod::EaterOfWorlds => next.eater_implicit = Some(modifier),
+                }
+                (next, *weight as f64 / total_weight as f64)
+            })
+            .collect();
 
         Ok(outcomes)
     }
@@ -97,11 +109,17 @@ impl CraftingMethod for EldritchExaltedOrb {
             EldritchGod::EaterOfWorlds => "Eldritch Exalted Orb (Eater)",
         }
     }
-    fn cost_chaos(&self) -> f64 { 20.0 }
+    fn cost_chaos(&self) -> f64 {
+        20.0
+    }
 
     fn can_apply(&self, item: &ItemState, _db: &GameData) -> bool {
-        if !item.is_craftable() || item.rarity != Rarity::Rare { return false; }
-        if !item_supports_eldritch(item) { return false; }
+        if !item.is_craftable() || item.rarity != Rarity::Rare {
+            return false;
+        }
+        if !item_supports_eldritch(item) {
+            return false;
+        }
         match self.god {
             EldritchGod::SearingExarch => item.exarch_implicit.is_some(),
             EldritchGod::EaterOfWorlds => item.eater_implicit.is_some(),
@@ -109,20 +127,27 @@ impl CraftingMethod for EldritchExaltedOrb {
     }
 
     fn apply(&self, item: &ItemState, db: &GameData) -> Result<Vec<(ItemState, f64)>> {
-        if !self.can_apply(item, db) { bail!("Cannot apply {}", self.name()); }
+        if !self.can_apply(item, db) {
+            bail!("Cannot apply {}", self.name());
+        }
 
         let current_mod_id = match self.god {
             EldritchGod::SearingExarch => item.exarch_implicit.as_ref().map(|m| &m.mod_id),
             EldritchGod::EaterOfWorlds => item.eater_implicit.as_ref().map(|m| &m.mod_id),
-        }.ok_or_else(|| anyhow::anyhow!("{}: implicit slot is empty", self.name()))?;
+        }
+        .ok_or_else(|| anyhow::anyhow!("{}: implicit slot is empty", self.name()))?;
 
-        let current_mod = db.mods.get(current_mod_id)
+        let current_mod = db
+            .mods
+            .get(current_mod_id)
             .ok_or_else(|| anyhow::anyhow!("Implicit mod '{}' not in DB", current_mod_id))?;
 
         let gen_type = eldritch_gen_type(self.god);
 
         // Next-tier mod: same mod_type, same generation_type, lowest required_level above current.
-        let upgrade = db.mods.iter()
+        let upgrade = db
+            .mods
+            .iter()
             .filter(|(_, m)| {
                 m.mod_type == current_mod.mod_type
                     && m.generation_type == gen_type
@@ -130,8 +155,8 @@ impl CraftingMethod for EldritchExaltedOrb {
             })
             .min_by_key(|(_, m)| m.required_level);
 
-        let (upgrade_id, upgrade_mod) = upgrade
-            .ok_or_else(|| anyhow::anyhow!("{}: already at maximum tier", self.name()))?;
+        let (upgrade_id, upgrade_mod) =
+            upgrade.ok_or_else(|| anyhow::anyhow!("{}: already at maximum tier", self.name()))?;
 
         let mut rng = rng();
         let mut next = item.clone();

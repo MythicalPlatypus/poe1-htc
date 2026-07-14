@@ -5,8 +5,14 @@ use std::collections::HashSet;
 use anyhow::{bail, Result};
 use rand::Rng;
 
-use crate::data::{mods::{GenerationType, ModStat}, GameData};
-use crate::item::{modifier::{Modifier, StatRoll}, state::ItemState};
+use crate::data::{
+    mods::{GenerationType, ModStat},
+    GameData,
+};
+use crate::item::{
+    modifier::{Modifier, StatRoll},
+    state::ItemState,
+};
 
 /// Returns all mods eligible to be added to `item`, given the current tags
 /// (base_tags + any `adds_tags` accumulated during an in-progress roll session).
@@ -51,7 +57,10 @@ pub fn eligible_mods<'a>(
             if weight == 0 {
                 return None;
             }
-            if m.groups.iter().any(|g| existing_groups.contains(g.as_str())) {
+            if m.groups
+                .iter()
+                .any(|g| existing_groups.contains(g.as_str()))
+            {
                 return None;
             }
             match m.generation_type {
@@ -95,7 +104,10 @@ pub fn random_rolls_pub<R: Rng>(stats: &[ModStat], rng: &mut R) -> Vec<StatRoll>
             } else {
                 rng.random_range(s.min..=s.max)
             };
-            StatRoll { stat_id: s.id.clone(), value }
+            StatRoll {
+                stat_id: s.id.clone(),
+                value,
+            }
         })
         .collect()
 }
@@ -160,30 +172,52 @@ pub fn eligible_mods_fossil<'a>(
         .collect();
 
     let effective_tags: Vec<&str> = item
-        .base_tags.iter().map(|t| t.as_str())
+        .base_tags
+        .iter()
+        .map(|t| t.as_str())
         .chain(extra_tags.iter().map(|t| t.as_str()))
         .collect();
 
-    db.mods.iter().filter_map(|(id, m)| {
-        if !m.is_craftable() { return None; }
-        if m.required_level > item.item_level { return None; }
-        if blocked_mod_ids.iter().any(|b| b == id) { return None; }
-        let base_weight = m.spawn_weight_for_tags(&effective_tags);
-        if base_weight == 0 { return None; }
-        if m.groups.iter().any(|g| existing_groups.contains(g.as_str())) { return None; }
-        match m.generation_type {
-            GenerationType::Prefix if !item.has_open_prefix() => return None,
-            GenerationType::Suffix if !item.has_open_suffix() => return None,
-            _ => {}
-        }
-        // Apply generation_weight multipliers from fossil tags.
-        let gen_multiplier: f64 = m.generation_weights.iter()
-            .filter(|gw| fossil_gen_tags.contains(&gw.tag.as_str()))
-            .fold(1.0_f64, |acc, gw| acc * gw.weight as f64 / 100.0);
-        let effective_weight = (base_weight as f64 * gen_multiplier).round() as u32;
-        if effective_weight == 0 { return None; }
-        Some((id.as_str(), m, effective_weight))
-    }).collect()
+    db.mods
+        .iter()
+        .filter_map(|(id, m)| {
+            if !m.is_craftable() {
+                return None;
+            }
+            if m.required_level > item.item_level {
+                return None;
+            }
+            if blocked_mod_ids.iter().any(|b| b == id) {
+                return None;
+            }
+            let base_weight = m.spawn_weight_for_tags(&effective_tags);
+            if base_weight == 0 {
+                return None;
+            }
+            if m.groups
+                .iter()
+                .any(|g| existing_groups.contains(g.as_str()))
+            {
+                return None;
+            }
+            match m.generation_type {
+                GenerationType::Prefix if !item.has_open_prefix() => return None,
+                GenerationType::Suffix if !item.has_open_suffix() => return None,
+                _ => {}
+            }
+            // Apply generation_weight multipliers from fossil tags.
+            let gen_multiplier: f64 = m
+                .generation_weights
+                .iter()
+                .filter(|gw| fossil_gen_tags.contains(&gw.tag.as_str()))
+                .fold(1.0_f64, |acc, gw| acc * gw.weight as f64 / 100.0);
+            let effective_weight = (base_weight as f64 * gen_multiplier).round() as u32;
+            if effective_weight == 0 {
+                return None;
+            }
+            Some((id.as_str(), m, effective_weight))
+        })
+        .collect()
 }
 
 /// Returns mods eligible for eldritch implicit rolling.
@@ -195,13 +229,22 @@ pub fn eligible_mods_eldritch<'a>(
     db: &'a GameData,
 ) -> Vec<(&'a str, &'a crate::data::mods::Mod, u32)> {
     let effective_tags: Vec<&str> = item.base_tags.iter().map(|t| t.as_str()).collect();
-    db.mods.iter().filter_map(|(id, m)| {
-        if &m.generation_type != gen_type { return None; }
-        if m.required_level > item.item_level { return None; }
-        let weight = m.spawn_weight_for_tags(&effective_tags);
-        if weight == 0 { return None; }
-        Some((id.as_str(), m, weight))
-    }).collect()
+    db.mods
+        .iter()
+        .filter_map(|(id, m)| {
+            if &m.generation_type != gen_type {
+                return None;
+            }
+            if m.required_level > item.item_level {
+                return None;
+            }
+            let weight = m.spawn_weight_for_tags(&effective_tags);
+            if weight == 0 {
+                return None;
+            }
+            Some((id.as_str(), m, weight))
+        })
+        .collect()
 }
 
 /// Returns mods eligible for harvest add/augment operations, filtered to only
@@ -217,35 +260,51 @@ pub fn eligible_mods_harvest_tag<'a>(
         .flat_map(|m| m.groups.iter().map(|g| g.as_str()))
         .collect();
     let effective_tags: Vec<&str> = item.base_tags.iter().map(|t| t.as_str()).collect();
-    db.mods.iter().filter_map(|(id, m)| {
-        if !m.is_craftable() { return None; }
-        if m.required_level > item.item_level { return None; }
-        if !m.tags.iter().any(|t| t == harvest_tag) { return None; }
-        let weight = m.spawn_weight_for_tags(&effective_tags);
-        if weight == 0 { return None; }
-        if m.groups.iter().any(|g| existing_groups.contains(g.as_str())) { return None; }
-        match m.generation_type {
-            GenerationType::Prefix if !item.has_open_prefix() => return None,
-            GenerationType::Suffix if !item.has_open_suffix() => return None,
-            _ => {}
-        }
-        Some((id.as_str(), m, weight))
-    }).collect()
+    db.mods
+        .iter()
+        .filter_map(|(id, m)| {
+            if !m.is_craftable() {
+                return None;
+            }
+            if m.required_level > item.item_level {
+                return None;
+            }
+            if !m.tags.iter().any(|t| t == harvest_tag) {
+                return None;
+            }
+            let weight = m.spawn_weight_for_tags(&effective_tags);
+            if weight == 0 {
+                return None;
+            }
+            if m.groups
+                .iter()
+                .any(|g| existing_groups.contains(g.as_str()))
+            {
+                return None;
+            }
+            match m.generation_type {
+                GenerationType::Prefix if !item.has_open_prefix() => return None,
+                GenerationType::Suffix if !item.has_open_suffix() => return None,
+                _ => {}
+            }
+            Some((id.as_str(), m, weight))
+        })
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use rand::rng;
+    use std::collections::HashMap;
 
     use super::*;
     use crate::data::{
-        GameData,
         mods::{Domain, GenerationType, Mod, ModStat, SpawnWeight},
+        GameData,
     };
-    use crate::item::state::{ItemState, Rarity};
     use crate::item::modifier::Modifier;
+    use crate::item::state::{ItemState, Rarity};
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -260,8 +319,15 @@ mod tests {
             name: mod_type.to_string(),
             generation_type: gen_type,
             required_level,
-            stats: vec![ModStat { id: "stat".to_string(), min: 1, max: 10 }],
-            spawn_weights: vec![SpawnWeight { tag: tag.to_string(), weight }],
+            stats: vec![ModStat {
+                id: "stat".to_string(),
+                min: 1,
+                max: 10,
+            }],
+            spawn_weights: vec![SpawnWeight {
+                tag: tag.to_string(),
+                weight,
+            }],
             generation_weights: vec![],
             adds_tags: vec![],
             tags: vec![],
@@ -277,7 +343,10 @@ mod tests {
     fn one_mod_db(id: &str, m: Mod) -> GameData {
         let mut mods = HashMap::new();
         mods.insert(id.to_string(), m);
-        GameData { mods, base_items: HashMap::new() }
+        GameData {
+            mods,
+            base_items: HashMap::new(),
+        }
     }
 
     fn sword_item(item_level: u32) -> ItemState {
@@ -297,7 +366,10 @@ mod tests {
         let db = one_mod_db("M", make_mod(GenerationType::Prefix, 80, "T", "sword", 100));
         // ilvl 70 — mod requires 80, should not appear
         let pool = eligible_mods(&rare_sword(70), &[], &db);
-        assert!(pool.is_empty(), "mod requiring ilvl 80 must not appear on ilvl 70 item");
+        assert!(
+            pool.is_empty(),
+            "mod requiring ilvl 80 must not appear on ilvl 70 item"
+        );
 
         // ilvl 80 — exactly meets requirement, should appear
         let pool = eligible_mods(&rare_sword(80), &[], &db);
@@ -336,7 +408,10 @@ mod tests {
 
         // Another mod of same mod_type should be excluded.
         let pool = eligible_mods(&item, &[], &db);
-        assert!(pool.is_empty(), "mod_type conflict must exclude the candidate");
+        assert!(
+            pool.is_empty(),
+            "mod_type conflict must exclude the candidate"
+        );
     }
 
     #[test]
@@ -370,7 +445,11 @@ mod tests {
             });
         }
         let pool = eligible_mods(&item, &[], &db);
-        assert_eq!(pool.len(), 1, "suffix mod must still appear when only prefix slots are full");
+        assert_eq!(
+            pool.len(),
+            1,
+            "suffix mod must still appear when only prefix slots are full"
+        );
     }
 
     // ── weighted_pick ────────────────────────────────────────────────────────
@@ -408,13 +487,25 @@ mod tests {
     #[test]
     fn random_rolls_within_range() {
         let stats = vec![
-            ModStat { id: "s1".to_string(), min: 5, max: 20 },
-            ModStat { id: "s2".to_string(), min: 42, max: 42 },
+            ModStat {
+                id: "s1".to_string(),
+                min: 5,
+                max: 20,
+            },
+            ModStat {
+                id: "s2".to_string(),
+                min: 42,
+                max: 42,
+            },
         ];
         let mut r = rng();
         for _ in 0..100 {
             let rolls = random_rolls_pub(&stats, &mut r);
-            assert!((5..=20).contains(&rolls[0].value), "s1 out of range: {}", rolls[0].value);
+            assert!(
+                (5..=20).contains(&rolls[0].value),
+                "s1 out of range: {}",
+                rolls[0].value
+            );
             assert_eq!(rolls[1].value, 42, "fixed stat must be exactly 42");
         }
     }
@@ -426,10 +517,19 @@ mod tests {
         // Build a db with 3 prefix mods and 3 suffix mods, all eligible.
         let mut mods = HashMap::new();
         for i in 0..3u32 {
-            mods.insert(format!("P{i}"), make_mod(GenerationType::Prefix, 1, &format!("PT{i}"), "sword", 100));
-            mods.insert(format!("S{i}"), make_mod(GenerationType::Suffix, 1, &format!("ST{i}"), "sword", 100));
+            mods.insert(
+                format!("P{i}"),
+                make_mod(GenerationType::Prefix, 1, &format!("PT{i}"), "sword", 100),
+            );
+            mods.insert(
+                format!("S{i}"),
+                make_mod(GenerationType::Suffix, 1, &format!("ST{i}"), "sword", 100),
+            );
         }
-        let db = GameData { mods, base_items: HashMap::new() };
+        let db = GameData {
+            mods,
+            base_items: HashMap::new(),
+        };
         let mut item = rare_sword(84);
 
         roll_mods(&mut item, 4, &db, &mut rng()).unwrap();
@@ -441,10 +541,20 @@ mod tests {
         // Many mods, each with a unique group (via make_mod's groups = [mod_type]).
         let mut mods = HashMap::new();
         for i in 0..10u32 {
-            let gen = if i % 2 == 0 { GenerationType::Prefix } else { GenerationType::Suffix };
-            mods.insert(format!("M{i}"), make_mod(gen, 1, &format!("Type{i}"), "sword", 100));
+            let gen = if i % 2 == 0 {
+                GenerationType::Prefix
+            } else {
+                GenerationType::Suffix
+            };
+            mods.insert(
+                format!("M{i}"),
+                make_mod(gen, 1, &format!("Type{i}"), "sword", 100),
+            );
         }
-        let db = GameData { mods, base_items: HashMap::new() };
+        let db = GameData {
+            mods,
+            base_items: HashMap::new(),
+        };
         let mut item = rare_sword(84);
 
         roll_mods(&mut item, 6, &db, &mut rng()).unwrap();
@@ -467,9 +577,18 @@ mod tests {
     fn roll_mods_stops_early_when_pool_exhausted() {
         // Only 2 mods available (1 prefix slot, 1 suffix slot) but we ask for 6.
         let mut mods = HashMap::new();
-        mods.insert("P0".to_string(), make_mod(GenerationType::Prefix, 1, "PT0", "sword", 100));
-        mods.insert("S0".to_string(), make_mod(GenerationType::Suffix, 1, "ST0", "sword", 100));
-        let db = GameData { mods, base_items: HashMap::new() };
+        mods.insert(
+            "P0".to_string(),
+            make_mod(GenerationType::Prefix, 1, "PT0", "sword", 100),
+        );
+        mods.insert(
+            "S0".to_string(),
+            make_mod(GenerationType::Suffix, 1, "ST0", "sword", 100),
+        );
+        let db = GameData {
+            mods,
+            base_items: HashMap::new(),
+        };
         let mut item = rare_sword(84);
 
         roll_mods(&mut item, 6, &db, &mut rng()).unwrap();

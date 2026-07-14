@@ -8,16 +8,16 @@
 /// NOT true probabilities and must not be treated as such in scoring or reporting.
 pub const MONTE_CARLO_SAMPLES: usize = 50;
 
-pub mod orbs;
+pub mod eldritch;
 pub mod essences;
 pub mod fossils;
 pub mod harvest;
-pub mod eldritch;
 pub mod influence;
+pub mod orbs;
 
-use anyhow::Result;
 use crate::data::GameData;
 use crate::item::ItemState;
+use anyhow::Result;
 
 /// Every crafting method implements this trait.
 /// The beam search engine calls `apply` to generate successor states.
@@ -41,4 +41,15 @@ pub trait CraftingMethod: Send + Sync {
     /// For probabilistic operations (e.g. Chaos Orb) the Vec contains one entry
     /// per distinct outcome; callers sample or enumerate as needed.
     fn apply(&self, item: &ItemState, db: &GameData) -> Result<Vec<(ItemState, f64)>>;
+
+    /// Whether the f64 weights returned by `apply` are true in-game probabilities.
+    ///
+    /// Exact-enumeration methods (Exalted, Annulment, Harvest, Eldritch, Scouring)
+    /// return true (the default). Monte Carlo methods (Chaos, Alchemy, Essence,
+    /// Fossil) MUST override this to return false — their weights are 1/N sample
+    /// weights. Reporting layers use this to decide whether a path's cumulative
+    /// weight may be presented as a probability.
+    fn weights_are_probabilities(&self) -> bool {
+        true
+    }
 }

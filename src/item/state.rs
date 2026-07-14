@@ -1,12 +1,12 @@
-use crate::data::mods::GenerationType;
 use super::Modifier;
+use crate::data::mods::GenerationType;
 
 /// Rarity of an item — governs prefix/suffix capacity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rarity {
     Normal,
-    Magic,  // 1 prefix, 1 suffix
-    Rare,   // up to 3 prefixes, 3 suffixes
+    Magic, // 1 prefix, 1 suffix
+    Rare,  // up to 3 prefixes, 3 suffixes
     Unique,
 }
 
@@ -73,16 +73,28 @@ impl ItemState {
 
     pub fn prefix_count(&self) -> usize {
         self.prefixes.len()
-            + self.fractured.iter().filter(|m| m.generation_type == GenerationType::Prefix).count()
-            + self.crafted_mod.as_ref()
+            + self
+                .fractured
+                .iter()
+                .filter(|m| m.generation_type == GenerationType::Prefix)
+                .count()
+            + self
+                .crafted_mod
+                .as_ref()
                 .filter(|m| m.generation_type == GenerationType::Prefix)
                 .map_or(0, |_| 1)
     }
 
     pub fn suffix_count(&self) -> usize {
         self.suffixes.len()
-            + self.fractured.iter().filter(|m| m.generation_type == GenerationType::Suffix).count()
-            + self.crafted_mod.as_ref()
+            + self
+                .fractured
+                .iter()
+                .filter(|m| m.generation_type == GenerationType::Suffix)
+                .count()
+            + self
+                .crafted_mod
+                .as_ref()
                 .filter(|m| m.generation_type == GenerationType::Suffix)
                 .map_or(0, |_| 1)
     }
@@ -124,7 +136,8 @@ impl ItemState {
     /// All mods that occupy affix slots and participate in group-conflict checks:
     /// prefixes, suffixes, fractured mods, and the crafted mod (if present).
     pub fn all_mods_for_conflict(&self) -> impl Iterator<Item = &Modifier> {
-        self.prefixes.iter()
+        self.prefixes
+            .iter()
             .chain(self.suffixes.iter())
             .chain(self.fractured.iter())
             .chain(self.crafted_mod.iter())

@@ -6,7 +6,7 @@ PoE1 HTC models item states, RePoE modifier data, crafting currency behavior, an
 
 > Given a base item and a desired set of mods, what sequence of crafting actions is likely to get there cheaply?
 
-This project is currently in active development. The core data model, mod-pool filtering, item state representation, several crafting methods, and beam-search skeleton exist. The command-line interface is still early and does not yet expose a complete goal-driven optimizer.
+This project is currently in active development. The core data model, mod-pool filtering, item state representation, several crafting methods, beam search, and a goal-driven CLI are working end-to-end: describe your target item in a TOML goal file and the optimizer prints the best crafting path it found, its estimated cost, and which goals the final item satisfies.
 
 ## Features
 
@@ -31,7 +31,10 @@ This project is currently in active development. The core data model, mod-pool f
   - Eldritch crafts
   - Influence application
 - Uses Rayon-backed parallel expansion in beam search
-- Includes unit tests for data loading and mod-pool behavior
+- TOML goal specification (target mods by group, mod ID, or stat with roll thresholds)
+- Goal-driven CLI: prints the best path, cost, final item, and goal satisfaction
+- Unit tests for data loading, mod-pool behavior, and goal parsing/scoring
+- Integration tests for beam ranking, probability invariants, and forced-mod legality
 
 ## Current Status
 
@@ -44,18 +47,19 @@ Working:
 - Mod pool filtering
 - Weighted mod selection
 - Currency trait and several currency implementations
-- Beam-search structure
-- Basic CLI argument parsing
-- Unit tests for important mod-pool rules
+- Beam search with cost-aware ranking
+- TOML goal specification and scoring
+- End-to-end optimizer CLI (`--goal file.toml`)
+- Unit tests for mod-pool rules and goal parsing/scoring
+- Integration tests for beam ranking, probability sums, and Essence/Fossil legality
 
 Still in progress:
 
-- CLI goal specification
-- Goal scoring wired into the CLI
-- Full end-to-end optimizer command
-- More exact probability modeling
-- Integration tests over realistic crafting scenarios
-- Better reporting of expected cost, hit chance, and final path quality
+- Exposing essences, fossils, harvest, and eldritch methods through the goal file
+  (implemented as `CraftingMethod`s but they need per-instance configuration)
+- More exact probability modeling for full rerolls (currently Monte Carlo sampled)
+- Expected-cost estimation across repeated attempts (current cost is per-path)
+- Deterministic RNG hooks for reproducible runs
 
 ## Requirements
 
@@ -108,13 +112,46 @@ cargo fmt
 
 ## Usage
 
-The CLI currently loads data and accepts early optimizer configuration flags:
+Describe the item you want in a TOML goal file (see `goals/example_life_chest.toml`):
 
-```bash
-cargo run -- --data-dir data --base-item "Astral Plate" --beam-width 100 --max-steps 20
+```toml
+[item]
+base = "Astral Plate"     # display name or RePoE metadata ID
+item_level = 86
+
+[[wants]]
+group = "IncreasedLife"   # any tier of the flat life prefix
+weight = 10.0
+
+[[wants]]
+stat = "base_maximum_life"
+min_value = 90            # only satisfied by a T2+ roll
+weight = 5.0
+
+[search]
+beam_width = 20
+max_steps = 8
+cost_weight = 0.05        # chaos-cost penalty per point of score
 ```
 
-Current output confirms configuration and data loading. Full goal-driven search is planned but not yet exposed through the CLI.
+Then run the optimizer (release mode recommended — the mod pool is large):
+
+```bash
+cargo run --release -- --goal goals/example_life_chest.toml
+```
+
+Output shows the best path found, its estimated chaos cost, the final item's
+mods, and a checklist of which wants were satisfied. CLI flags
+(`--beam-width`, `--max-steps`, `--cost-weight`, `--base-item`) override the
+goal file's values.
+
+Without `--goal` the binary just verifies that the data files load.
+
+Note on probabilities: paths containing full-reroll steps (Chaos, Alchemy,
+Essence, Fossil) are Monte Carlo sampled — the reported path weight for those
+is a sample weight, not a hit chance, and the printed path is one
+representative outcome. Paths built only from exact-enumeration steps
+(Exalted, Annulment, Harvest, Scouring) report true probabilities.
 
 ## Architecture
 
@@ -124,8 +161,11 @@ src/
   currency/   CraftingMethod trait and currency implementations
   data/       RePoE JSON loading and data structs
   engine/     Mod-pool filtering, weighted selection, and rolling logic
+  goal/       TOML goal specification and scoring
   item/       ItemState, Modifier, and StatRoll models
   search/     Beam-search implementation
+goals/        Example goal files
+tests/        Integration tests (synthetic GameData, no data files needed)
 ```
 
 ### Data Flow
@@ -176,12 +216,9 @@ cargo fmt
 
 ## Roadmap
 
-- Add a real goal spec format, likely TOML or JSON
-- Build scoring functions for target affixes and stat thresholds
-- Wire `BeamSearch` into `cli::run`
-- Report best path, total cost, estimated chance, and final item state
-- Improve probability handling for full rerolls
-- Add integration tests for common crafting workflows
+- Expose essences, fossils, harvest, and eldritch crafts through the goal file
+- Improve probability handling for full rerolls (exact where practical)
+- Estimate expected total cost over repeated attempts, not just per-path cost
 - Add benchmark fixtures for large RePoE mod pools
 - Add deterministic RNG hooks for reproducible tests
 

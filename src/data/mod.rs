@@ -1,6 +1,6 @@
+pub mod base_items;
 pub mod loader;
 pub mod mods;
-pub mod base_items;
 
 /// Central database holding all loaded RePoE data.
 pub struct GameData {

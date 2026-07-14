@@ -3,6 +3,10 @@ name = "poe1_htc"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "poe1_htc"
+path = "src/lib.rs"
+
 [[bin]]
 name = "poe1_htc"
 path = "src/main.rs"
@@ -27,6 +31,9 @@ ordered-float = "4"
 
 # Random number generation for weighted mod selection and stat rolling
 rand = "0.9"
+
+# Goal specification files (what the user wants to craft)
+toml = "0.8"
 
 [profile.release]
 opt-level = 3

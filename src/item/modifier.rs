@@ -23,25 +23,39 @@ pub struct StatRoll {
 impl Modifier {
     /// Create a modifier with all stats rolled to their minimum values.
     /// Useful for deterministic testing.
-    pub fn from_min_rolls(mod_id: impl Into<String>, gen_type: GenerationType, stats: &[ModStat]) -> Self {
+    pub fn from_min_rolls(
+        mod_id: impl Into<String>,
+        gen_type: GenerationType,
+        stats: &[ModStat],
+    ) -> Self {
         Self {
             mod_id: mod_id.into(),
             generation_type: gen_type,
             rolls: stats
                 .iter()
-                .map(|s| StatRoll { stat_id: s.id.clone(), value: s.min })
+                .map(|s| StatRoll {
+                    stat_id: s.id.clone(),
+                    value: s.min,
+                })
                 .collect(),
         }
     }
 
     /// Create a modifier with all stats rolled to their maximum values.
-    pub fn from_max_rolls(mod_id: impl Into<String>, gen_type: GenerationType, stats: &[ModStat]) -> Self {
+    pub fn from_max_rolls(
+        mod_id: impl Into<String>,
+        gen_type: GenerationType,
+        stats: &[ModStat],
+    ) -> Self {
         Self {
             mod_id: mod_id.into(),
             generation_type: gen_type,
             rolls: stats
                 .iter()
-                .map(|s| StatRoll { stat_id: s.id.clone(), value: s.max })
+                .map(|s| StatRoll {
+                    stat_id: s.id.clone(),
+                    value: s.max,
+                })
                 .collect(),
         }
     }

@@ -47,9 +47,18 @@ mod tests {
     /// contain a plausible number of entries. Requires `data/` to be populated.
     #[test]
     fn loads_repoe_data() {
-        let db = load_all("data").expect("data/mods.json must exist — run the curl commands from the README");
-        assert!(db.mods.len() > 10_000, "expected 10k+ mods, got {}", db.mods.len());
-        assert!(db.base_items.len() > 100, "expected 100+ base items, got {}", db.base_items.len());
+        let db = load_all("data")
+            .expect("data/mods.json must exist — run the curl commands from the README");
+        assert!(
+            db.mods.len() > 10_000,
+            "expected 10k+ mods, got {}",
+            db.mods.len()
+        );
+        assert!(
+            db.base_items.len() > 100,
+            "expected 100+ base items, got {}",
+            db.base_items.len()
+        );
     }
 
     /// Spot-checks that every mod in the loaded data has a non-empty mod_type,
@@ -61,11 +70,21 @@ mod tests {
             assert!(!m.mod_type.is_empty(), "mod {id} has empty mod_type");
             if m.is_craftable() {
                 assert!(
-                    matches!(m.generation_type, GenerationType::Prefix | GenerationType::Suffix),
+                    matches!(
+                        m.generation_type,
+                        GenerationType::Prefix | GenerationType::Suffix
+                    ),
                     "is_craftable() returned true for non-prefix/suffix mod {id}"
                 );
-                assert_eq!(m.domain, Domain::Item, "craftable mod {id} has wrong domain");
-                assert!(!m.is_essence_only, "is_craftable() returned true for essence-only mod {id}");
+                assert_eq!(
+                    m.domain,
+                    Domain::Item,
+                    "craftable mod {id} has wrong domain"
+                );
+                assert!(
+                    !m.is_essence_only,
+                    "is_craftable() returned true for essence-only mod {id}"
+                );
             }
         }
     }
@@ -77,12 +96,22 @@ mod tests {
         let db = load_all("data").expect("data/ must be populated");
         // Find any mod that has a "default" spawn weight > 0.
         let mod_with_default = db.mods.values().find(|m| {
-            m.spawn_weights.iter().any(|sw| sw.tag == "default" && sw.weight > 0)
+            m.spawn_weights
+                .iter()
+                .any(|sw| sw.tag == "default" && sw.weight > 0)
         });
         if let Some(m) = mod_with_default {
             let w = m.spawn_weight_for_tags(&["this_tag_does_not_exist"]);
-            let default_w = m.spawn_weights.iter().find(|sw| sw.tag == "default").unwrap().weight;
-            assert_eq!(w, default_w, "spawn_weight_for_tags should fall back to 'default'");
+            let default_w = m
+                .spawn_weights
+                .iter()
+                .find(|sw| sw.tag == "default")
+                .unwrap()
+                .weight;
+            assert_eq!(
+                w, default_w,
+                "spawn_weight_for_tags should fall back to 'default'"
+            );
         }
     }
 }
