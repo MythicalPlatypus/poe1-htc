@@ -322,8 +322,8 @@ fn exalted_orb_probabilities_sum_to_one() {
     assert_eq!(outcomes.len(), 8);
     assert_weights_sum_to_one(&outcomes, "Exalted Orb");
     assert!(
-        ExaltedOrb.weights_are_probabilities(),
-        "Exalted Orb enumerates exact outcomes"
+        !ExaltedOrb.weights_are_probabilities(),
+        "Exalted mod selection is exact, but numeric rolls are sampled"
     );
     assert!(
         !ExaltedOrb.repeatable_on_failure(),
@@ -389,7 +389,7 @@ fn alchemy_produces_valid_rares() {
 }
 
 #[test]
-fn harvest_add_probabilities_sum_to_one() {
+fn harvest_augment_probabilities_sum_to_one() {
     // Two life-tagged suffixes with different weights.
     let mut m1 = make_mod(GenerationType::Suffix, "LifeA", "sword", 100);
     m1.tags = vec!["life".to_string()];
@@ -401,11 +401,13 @@ fn harvest_add_probabilities_sum_to_one() {
         display_name: "Augment Life".to_string(),
         cost_chaos: 30.0,
         target: HarvestTarget::Life,
-        op: HarvestOp::Add,
+        op: HarvestOp::Augment,
     };
-    let outcomes = craft.apply(&rare_sword(), &db, &mut test_rng()).unwrap();
+    let mut item = rare_sword();
+    item.prefixes.push(marker("junk", GenerationType::Prefix));
+    let outcomes = craft.apply(&item, &db, &mut test_rng()).unwrap();
     assert_eq!(outcomes.len(), 2);
-    assert_weights_sum_to_one(&outcomes, "Harvest Add");
+    assert_weights_sum_to_one(&outcomes, "Harvest Augment");
     // Weighted 100 vs 300 → probabilities 0.25 and 0.75.
     let mut probs: Vec<f64> = outcomes.iter().map(|(_, p)| *p).collect();
     probs.sort_by(|a, b| a.partial_cmp(b).unwrap());

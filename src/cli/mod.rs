@@ -8,6 +8,8 @@ use anyhow::{bail, Result};
 use clap::Parser;
 
 use crate::currency::{
+    bench::RemoveCraftedMods,
+    fracturing::FracturingOrb,
     orbs::{
         ChaosOrb, DivineOrb, ExaltedOrb, OrbOfAlchemy, OrbOfAlteration, OrbOfAnnulment,
         OrbOfAugmentation, OrbOfScouring, OrbOfTransmutation, RegalOrb,
@@ -84,6 +86,7 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     let goal = GoalSpec::load(goal_path)?;
+    goal.validate_against_db(&db)?;
 
     // CLI --base-item overrides the goal file's [item] base.
     let base_query = args.base_item.as_deref().unwrap_or(&goal.item.base);
@@ -108,6 +111,15 @@ pub fn run(args: Args) -> Result<()> {
             .unwrap_or(DEFAULT_COST_WEIGHT),
         seed: args.seed.or(goal.search.seed),
     };
+    if config.beam_width == 0 {
+        bail!("beam_width must be greater than 0");
+    }
+    if config.max_steps == 0 {
+        bail!("max_steps must be greater than 0");
+    }
+    if config.cost_weight < 0.0 || !config.cost_weight.is_finite() {
+        bail!("cost_weight must be a non-negative finite number");
+    }
     println!(
         "Search: beam_width={}, max_steps={}, cost_weight={}{}",
         config.beam_width,
@@ -163,7 +175,10 @@ pub fn run(args: Args) -> Result<()> {
     }
     let starting_score = goal.score(&initial, &db);
 
-    let top = args.top.or(goal.search.top).unwrap_or(1).max(1);
+    let top = args.top.or(goal.search.top).unwrap_or(1);
+    if top == 0 {
+        bail!("top must be greater than 0");
+    }
     let search = BeamSearch::new(config, &db, methods);
     let results = search.run_k(initial, |s| goal.score(s, &db), top);
 
@@ -171,20 +186,26 @@ pub fn run(args: Args) -> Result<()> {
         Some(best) => {
             print_result(best, &goal, &db);
             for (i, alt) in results.iter().enumerate().skip(1) {
+                let raw_score = goal.score(&alt.state, &db);
+                let satisfied = goal.satisfied_count(&alt.state, &db);
                 println!(
-                    "\n--- Alternative pathway #{} (score {:.1}, expected ~{:.1}c, one-shot odds {}) ---",
+                    "\n--- Alternative pathway #{} (goal {:.1}/{:.1}, {}/{} wants, expected ~{:.1}c, one-shot odds {}) ---",
                     i + 1,
-                    alt.score,
+                    raw_score,
+                    goal.max_score(),
+                    satisfied,
+                    goal.wants.len(),
                     alt.expected_cost,
                     fmt_prob(alt.success_prob)
                 );
                 let names: Vec<&str> = alt.steps.iter().map(|s| s.method.as_str()).collect();
                 println!("  {}", names.join(", then "));
             }
-            if starting_score >= best.score {
+            let best_raw_score = goal.score(&best.state, &db);
+            if starting_score >= best_raw_score {
                 println!(
                     "\nNote: the starting item already scores {starting_score:.1}; \
-                     no found path beats leaving it alone."
+                     no found path improves its raw goal score."
                 );
             }
         }
@@ -220,6 +241,8 @@ fn default_methods() -> Vec<Arc<dyn CraftingMethod>> {
         Arc::new(ExaltedOrb),
         Arc::new(OrbOfAnnulment),
         Arc::new(DivineOrb),
+        Arc::new(FracturingOrb),
+        Arc::new(RemoveCraftedMods),
     ]
 }
 
@@ -259,7 +282,20 @@ fn resolve_base_item<'db>(
 /// Pretty-print the winning path with retry economics, the final item, and
 /// goal satisfaction.
 fn print_result(result: &SearchResult, goal: &GoalSpec, db: &GameData) {
-    println!("\n=== Best crafting path (score {:.1}) ===", result.score);
+    let raw_score = goal.score(&result.state, db);
+    let satisfied = goal.satisfied_count(&result.state, db);
+    let status = if goal.is_complete(&result.state, db) {
+        "COMPLETE"
+    } else {
+        "INCOMPLETE"
+    };
+    println!(
+        "\n=== Best crafting path: target {status} ({satisfied}/{} wants, goal score {:.1}/{:.1}, ranking score {:.1}) ===",
+        goal.wants.len(),
+        raw_score,
+        goal.max_score(),
+        result.score
+    );
     if result.steps.is_empty() {
         println!("(the unmodified base item already scores best)");
     }

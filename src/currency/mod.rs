@@ -12,6 +12,7 @@ pub mod bench;
 pub mod eldritch;
 pub mod essences;
 pub mod fossils;
+pub mod fracturing;
 pub mod harvest;
 pub mod influence;
 pub mod orbs;

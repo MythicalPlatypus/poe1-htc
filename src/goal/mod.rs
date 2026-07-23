@@ -49,7 +49,7 @@ use serde::Deserialize;
 
 use crate::currency::{
     bench::BenchCraft,
-    eldritch::{EldritchChaosOrb, EldritchExaltedOrb, EldritchGod},
+    eldritch::{EldritchChaosOrb, EldritchExaltedOrb, EldritchGod, EldritchOrbOfAnnulment},
     essences::Essence,
     fossils::{FossilCraft, FossilModifier},
     harvest::{HarvestCraft, HarvestOp, HarvestTarget},
@@ -98,6 +98,8 @@ pub struct GoalSpec {
 /// base = "Astral Plate"
 /// item_level = 86
 /// rarity = "rare"                  # normal (default) | magic | rare
+/// exarch_implicit = "ExampleEldritchImplicit3"
+/// eater_implicit = "OtherEldritchImplicit4"
 ///
 /// [[item.mods]]
 /// mod_id = "IncreasedLife9"
@@ -123,6 +125,10 @@ pub struct ItemSpec {
     /// Mods already on the item when crafting starts.
     #[serde(default)]
     pub mods: Vec<StartingModSpec>,
+    /// Existing Searing Exarch implicit mod ID, for starting from a mid-craft.
+    pub exarch_implicit: Option<String>,
+    /// Existing Eater of Worlds implicit mod ID, for starting from a mid-craft.
+    pub eater_implicit: Option<String>,
 }
 
 /// One existing mod on the starting item.
@@ -161,6 +167,21 @@ impl ItemSpec {
             Some(other) => bail!("[item] rarity '{other}' (expected normal, magic, or rare)"),
         };
 
+        item.exarch_implicit = self.build_eldritch_implicit(
+            self.exarch_implicit.as_deref(),
+            GenerationType::ExarchImplicit,
+            "exarch_implicit",
+            &item.base_tags,
+            db,
+        )?;
+        item.eater_implicit = self.build_eldritch_implicit(
+            self.eater_implicit.as_deref(),
+            GenerationType::EaterImplicit,
+            "eater_implicit",
+            &item.base_tags,
+            db,
+        )?;
+
         for (i, spec) in self.mods.iter().enumerate() {
             let m = db.mods.get(&spec.mod_id).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -178,6 +199,22 @@ impl ItemSpec {
                 bail!(
                     "[[item.mods]] entry {i}: '{}' is not a prefix or suffix",
                     spec.mod_id
+                );
+            }
+            if m.required_level > self.item_level {
+                bail!(
+                    "[[item.mods]] entry {i}: '{}' requires item level {}, but [item] item_level is {}",
+                    spec.mod_id,
+                    m.required_level,
+                    self.item_level
+                );
+            }
+            let base_tag_refs: Vec<&str> = item.base_tags.iter().map(String::as_str).collect();
+            if m.domain != Domain::Crafted && m.spawn_weight_for_tags(&base_tag_refs) == 0 {
+                bail!(
+                    "[[item.mods]] entry {i}: '{}' cannot appear on base '{}'",
+                    spec.mod_id,
+                    item.base_id
                 );
             }
             if spec.crafted {
@@ -281,6 +318,54 @@ impl ItemSpec {
         }
         Ok(item)
     }
+
+    fn build_eldritch_implicit(
+        &self,
+        mod_id: Option<&str>,
+        expected_type: GenerationType,
+        field: &str,
+        base_tags: &[String],
+        db: &GameData,
+    ) -> Result<Option<Modifier>> {
+        let Some(mod_id) = mod_id else {
+            return Ok(None);
+        };
+        let m = db
+            .mods
+            .get(mod_id)
+            .ok_or_else(|| anyhow::anyhow!("[item] {field}: mod '{mod_id}' not in mods.json"))?;
+        if m.generation_type != expected_type {
+            bail!(
+                "[item] {field}: mod '{mod_id}' has generation type {:?}, expected {:?}",
+                m.generation_type,
+                expected_type
+            );
+        }
+        if m.required_level > self.item_level {
+            bail!(
+                "[item] {field}: mod '{mod_id}' requires item level {}, but [item] item_level is {}",
+                m.required_level,
+                self.item_level
+            );
+        }
+        let base_tag_refs: Vec<&str> = base_tags.iter().map(String::as_str).collect();
+        if m.spawn_weight_for_tags(&base_tag_refs) == 0 {
+            bail!("[item] {field}: mod '{mod_id}' cannot appear on the selected base");
+        }
+        let rolls = m
+            .stats
+            .iter()
+            .map(|stat| StatRoll {
+                stat_id: stat.id.clone(),
+                value: stat.min + (stat.max - stat.min) / 2,
+            })
+            .collect();
+        Ok(Some(Modifier {
+            mod_id: mod_id.to_string(),
+            generation_type: m.generation_type.clone(),
+            rolls,
+        }))
+    }
 }
 
 /// One desired mod. All specified criteria must hold on a single mod
@@ -331,7 +416,7 @@ fn default_bench_cost() -> f64 {
 ///
 /// [[methods]]
 /// type = "harvest"
-/// op = "augment"                # remove | add | remove_add | augment
+/// op = "reforge"                # reforge | augment
 /// target = "life"               # attack, caster, speed, life, defences, ...
 /// cost = 30.0
 ///
@@ -346,7 +431,7 @@ fn default_bench_cost() -> f64 {
 /// boosted_tags = ["life"]
 ///
 /// [[methods]]
-/// type = "eldritch_chaos"       # or "eldritch_exalt"
+/// type = "eldritch_chaos"       # or "eldritch_exalt" / "eldritch_annul"
 /// god = "exarch"                # exarch | eater
 /// ```
 #[derive(Debug, Deserialize)]
@@ -383,16 +468,18 @@ pub enum MethodSpec {
         #[serde(default)]
         fossils: Vec<FossilPartSpec>,
     },
-    /// Targeted harvest craft, e.g. op = "augment", target = "life".
+    /// Current targeted Harvest craft: "reforge" or "augment".
     Harvest {
         op: String,
         target: String,
         cost: f64,
     },
-    /// Rerolls the eldritch implicit for `god` ("exarch" | "eater").
+    /// Rerolls explicit prefixes/suffixes selected by Eldritch dominance.
     EldritchChaos { god: String },
-    /// Upgrades the eldritch implicit tier for `god` ("exarch" | "eater").
+    /// Adds an explicit prefix/suffix selected by Eldritch dominance.
     EldritchExalt { god: String },
+    /// Removes an explicit prefix/suffix selected by Eldritch dominance.
+    EldritchAnnul { god: String },
 }
 
 /// One fossil inside a multi-fossil resonator (`[[methods.fossils]]`).
@@ -410,6 +497,18 @@ pub struct FossilPartSpec {
 }
 
 impl MethodSpec {
+    fn configured_cost(&self) -> Option<f64> {
+        match self {
+            Self::Essence { cost, .. }
+            | Self::Bench { cost, .. }
+            | Self::Fossil { cost, .. }
+            | Self::Harvest { cost, .. } => Some(*cost),
+            Self::EldritchChaos { .. }
+            | Self::EldritchExalt { .. }
+            | Self::EldritchAnnul { .. } => None,
+        }
+    }
+
     /// Build the runtime `CraftingMethod`, validating references against the DB
     /// so a typo'd mod ID fails at load time rather than mid-search.
     pub fn build(&self, db: &GameData) -> Result<Arc<dyn CraftingMethod>> {
@@ -483,7 +582,7 @@ impl MethodSpec {
             MethodSpec::Harvest { op, target, cost } => {
                 let parsed_op = HarvestOp::parse(op).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "[[methods]] harvest: unknown op '{op}' (expected remove, add, remove_add, augment)"
+                        "[[methods]] harvest: unknown op '{op}' (expected reforge or augment)"
                     )
                 })?;
                 let parsed_target = HarvestTarget::parse(target).ok_or_else(|| {
@@ -500,6 +599,9 @@ impl MethodSpec {
                 god: parse_god(god)?,
             })),
             MethodSpec::EldritchExalt { god } => Ok(Arc::new(EldritchExaltedOrb {
+                god: parse_god(god)?,
+            })),
+            MethodSpec::EldritchAnnul { god } => Ok(Arc::new(EldritchOrbOfAnnulment {
                 god: parse_god(god)?,
             })),
         }
@@ -535,6 +637,9 @@ impl GoalSpec {
         if self.item.base.trim().is_empty() {
             bail!("[item] base must not be empty");
         }
+        if self.item.item_level == 0 || self.item.item_level > 100 {
+            bail!("[item] item_level must be between 1 and 100");
+        }
         if self.wants.is_empty() {
             bail!("Goal must contain at least one [[wants]] entry");
         }
@@ -554,6 +659,84 @@ impl GoalSpec {
                 bail!("[prices] \"{name}\": price must be a positive finite number");
             }
         }
+        for (i, method) in self.methods.iter().enumerate() {
+            if let Some(cost) = method.configured_cost() {
+                if cost <= 0.0 || !cost.is_finite() {
+                    bail!("[[methods]] entry {i}: cost must be a positive finite number");
+                }
+            }
+            if let MethodSpec::Fossil {
+                blocked_mod_ids,
+                forced_mod_ids,
+                fossils,
+                ..
+            } = method
+            {
+                if fossils.len() > 3 {
+                    bail!("[[methods]] entry {i}: a resonator can contain at most 4 fossils");
+                }
+                let blocked = blocked_mod_ids
+                    .iter()
+                    .chain(fossils.iter().flat_map(|f| f.blocked_mod_ids.iter()));
+                let forced: std::collections::HashSet<&str> = forced_mod_ids
+                    .iter()
+                    .chain(fossils.iter().flat_map(|f| f.forced_mod_ids.iter()))
+                    .map(String::as_str)
+                    .collect();
+                if let Some(id) = blocked.map(String::as_str).find(|id| forced.contains(id)) {
+                    bail!(
+                        "[[methods]] entry {i}: fossil mod '{id}' cannot be both blocked and forced"
+                    );
+                }
+            }
+        }
+        if self.search.beam_width == Some(0) {
+            bail!("[search] beam_width must be greater than 0");
+        }
+        if self.search.max_steps == Some(0) {
+            bail!("[search] max_steps must be greater than 0");
+        }
+        if self.search.top == Some(0) {
+            bail!("[search] top must be greater than 0");
+        }
+        if self
+            .search
+            .cost_weight
+            .is_some_and(|weight| weight < 0.0 || !weight.is_finite())
+        {
+            bail!("[search] cost_weight must be a non-negative finite number");
+        }
+        Ok(())
+    }
+
+    /// Validate goal selectors against the loaded RePoE export so typos fail
+    /// before an expensive search silently chases an impossible target.
+    pub fn validate_against_db(&self, db: &GameData) -> Result<()> {
+        for (i, want) in self.wants.iter().enumerate() {
+            if let Some(mod_id) = &want.mod_id {
+                if !db.mods.contains_key(mod_id) {
+                    bail!("[[wants]] entry {i}: mod_id '{mod_id}' not found in mods.json");
+                }
+            }
+            if let Some(group) = &want.group {
+                if !db
+                    .mods
+                    .values()
+                    .any(|candidate| candidate.groups.iter().any(|g| g == group))
+                {
+                    bail!("[[wants]] entry {i}: group '{group}' not found in mods.json");
+                }
+            }
+            if let Some(stat) = &want.stat {
+                if !db
+                    .mods
+                    .values()
+                    .any(|candidate| candidate.stats.iter().any(|s| &s.id == stat))
+                {
+                    bail!("[[wants]] entry {i}: stat '{stat}' not found in mods.json");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -565,6 +748,24 @@ impl GoalSpec {
             .filter(|w| scorable_mods(state).any(|m| want_matches(w, m, db)))
             .map(|w| w.weight)
             .sum()
+    }
+
+    /// Maximum raw goal score when every requested condition is satisfied.
+    pub fn max_score(&self) -> f64 {
+        self.wants.iter().map(|want| want.weight).sum()
+    }
+
+    /// Number of requested conditions satisfied by `state`.
+    pub fn satisfied_count(&self, state: &ItemState, db: &GameData) -> usize {
+        self.wants
+            .iter()
+            .filter(|want| scorable_mods(state).any(|m| want_matches(want, m, db)))
+            .count()
+    }
+
+    /// True only when every requested condition is present on the same item.
+    pub fn is_complete(&self, state: &ItemState, db: &GameData) -> bool {
+        self.satisfied_count(state, db) == self.wants.len()
     }
 
     /// Human-readable satisfaction report for the final CLI output:

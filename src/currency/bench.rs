@@ -37,7 +37,12 @@ impl BenchCraft {
                 self.display_name
             );
         }
-        if item.crafted_mod.is_some() {
+        let has_fractured_crafted_mod = item.fractured.iter().any(|modifier| {
+            db.mods
+                .get(&modifier.mod_id)
+                .is_some_and(|m| m.domain == Domain::Crafted)
+        });
+        if item.crafted_mod.is_some() || has_fractured_crafted_mod {
             bail!("{}: item already has a crafted mod", self.display_name);
         }
         let m = db.mods.get(&self.mod_id).ok_or_else(|| {
@@ -80,12 +85,48 @@ impl BenchCraft {
     }
 }
 
+/// Removes the item's removable bench-crafted modifier.
+#[derive(Debug, Clone, Copy)]
+pub struct RemoveCraftedMods;
+
+impl CraftingMethod for RemoveCraftedMods {
+    fn name(&self) -> &str {
+        "Remove Crafted Mods"
+    }
+
+    fn cost_chaos(&self) -> f64 {
+        1.0
+    }
+
+    fn can_apply(&self, item: &ItemState, _db: &GameData) -> bool {
+        item.is_craftable() && item.crafted_mod.is_some()
+    }
+
+    fn apply(
+        &self,
+        item: &ItemState,
+        db: &GameData,
+        _rng: &mut dyn RngCore,
+    ) -> Result<Vec<(ItemState, f64)>> {
+        if !self.can_apply(item, db) {
+            bail!("Remove Crafted Mods requires a removable crafted modifier");
+        }
+        let mut next = item.clone();
+        next.crafted_mod = None;
+        Ok(vec![(next, 1.0)])
+    }
+}
+
 impl CraftingMethod for BenchCraft {
     fn name(&self) -> &str {
         &self.display_name
     }
     fn cost_chaos(&self) -> f64 {
         self.cost_chaos
+    }
+
+    fn weights_are_probabilities(&self) -> bool {
+        false
     }
 
     fn can_apply(&self, item: &ItemState, db: &GameData) -> bool {
