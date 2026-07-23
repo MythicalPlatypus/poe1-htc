@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use anyhow::{bail, Result};
-use rand::{rng, Rng};
+use rand::{Rng, RngCore};
 
 use super::{CraftingMethod, MONTE_CARLO_SAMPLES};
 use crate::data::mods::GenerationType;
@@ -32,6 +32,10 @@ impl CraftingMethod for Essence {
     fn weights_are_probabilities(&self) -> bool {
         false
     }
+    // Full reroll: reapplying is an independent draw from the same distribution.
+    fn repeatable_on_failure(&self) -> bool {
+        true
+    }
 
     fn can_apply(&self, item: &ItemState, db: &GameData) -> bool {
         item.is_craftable()
@@ -39,7 +43,12 @@ impl CraftingMethod for Essence {
             && db.mods.contains_key(&self.guaranteed_mod_id)
     }
 
-    fn apply(&self, item: &ItemState, db: &GameData) -> Result<Vec<(ItemState, f64)>> {
+    fn apply(
+        &self,
+        item: &ItemState,
+        db: &GameData,
+        rng: &mut dyn RngCore,
+    ) -> Result<Vec<(ItemState, f64)>> {
         if !self.can_apply(item, db) {
             bail!("Cannot apply {}", self.display_name);
         }
@@ -102,7 +111,6 @@ impl CraftingMethod for Essence {
         }
 
         let prob = 1.0 / MONTE_CARLO_SAMPLES as f64;
-        let mut rng = rng();
         let mut outcomes = Vec::with_capacity(MONTE_CARLO_SAMPLES);
 
         for _ in 0..MONTE_CARLO_SAMPLES {
@@ -113,7 +121,7 @@ impl CraftingMethod for Essence {
             next.crafted_mod = None;
 
             // Place the guaranteed mod first.
-            let rolls = random_rolls_pub(&guaranteed.stats, &mut rng);
+            let rolls = random_rolls_pub(&guaranteed.stats, rng);
             let forced = Modifier {
                 mod_id: self.guaranteed_mod_id.clone(),
                 generation_type: guaranteed.generation_type.clone(),
@@ -130,7 +138,7 @@ impl CraftingMethod for Essence {
 
             // Fill remaining slots (4–6 total like Chaos Orb; 1 already placed).
             let total: usize = rng.random_range(4..=6);
-            roll_mods(&mut next, total - 1, db, &mut rng)?;
+            roll_mods(&mut next, total - 1, db, rng)?;
             outcomes.push((next, prob));
         }
 

@@ -12,7 +12,7 @@ pub fn load_all(data_dir: &str) -> Result<GameData> {
     let mods = load_mods(dir)?;
     let base_items = load_base_items(dir)?;
 
-    Ok(GameData { mods, base_items })
+    Ok(GameData::new(mods, base_items))
 }
 
 fn load_mods(dir: &Path) -> Result<std::collections::HashMap<String, Mod>> {

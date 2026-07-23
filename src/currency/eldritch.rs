@@ -2,7 +2,7 @@
 //! Applies to helmets, gloves, boots, and body armours.
 
 use anyhow::{bail, Result};
-use rand::rng;
+use rand::RngCore;
 
 use super::CraftingMethod;
 use crate::data::mods::GenerationType;
@@ -56,7 +56,12 @@ impl CraftingMethod for EldritchChaosOrb {
         item.is_craftable() && item.rarity == Rarity::Rare && item_supports_eldritch(item)
     }
 
-    fn apply(&self, item: &ItemState, db: &GameData) -> Result<Vec<(ItemState, f64)>> {
+    fn apply(
+        &self,
+        item: &ItemState,
+        db: &GameData,
+        rng: &mut dyn RngCore,
+    ) -> Result<Vec<(ItemState, f64)>> {
         if !self.can_apply(item, db) {
             bail!("Cannot apply {}", self.name());
         }
@@ -71,12 +76,11 @@ impl CraftingMethod for EldritchChaosOrb {
             );
         }
 
-        let mut rng = rng();
         let outcomes = pool
             .iter()
             .map(|(mod_id, picked, weight)| {
                 let mut next = item.clone();
-                let rolls = random_rolls_pub(&picked.stats, &mut rng);
+                let rolls = random_rolls_pub(&picked.stats, rng);
                 let modifier = Modifier {
                     mod_id: mod_id.to_string(),
                     generation_type: picked.generation_type.clone(),
@@ -126,7 +130,12 @@ impl CraftingMethod for EldritchExaltedOrb {
         }
     }
 
-    fn apply(&self, item: &ItemState, db: &GameData) -> Result<Vec<(ItemState, f64)>> {
+    fn apply(
+        &self,
+        item: &ItemState,
+        db: &GameData,
+        rng: &mut dyn RngCore,
+    ) -> Result<Vec<(ItemState, f64)>> {
         if !self.can_apply(item, db) {
             bail!("Cannot apply {}", self.name());
         }
@@ -158,9 +167,8 @@ impl CraftingMethod for EldritchExaltedOrb {
         let (upgrade_id, upgrade_mod) =
             upgrade.ok_or_else(|| anyhow::anyhow!("{}: already at maximum tier", self.name()))?;
 
-        let mut rng = rng();
         let mut next = item.clone();
-        let rolls = random_rolls_pub(&upgrade_mod.stats, &mut rng);
+        let rolls = random_rolls_pub(&upgrade_mod.stats, rng);
         let modifier = Modifier {
             mod_id: upgrade_id.clone(),
             generation_type: upgrade_mod.generation_type.clone(),

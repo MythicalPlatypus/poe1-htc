@@ -4,12 +4,12 @@
 use std::collections::HashSet;
 
 use anyhow::{bail, Result};
-use rand::{rng, Rng};
+use rand::{Rng, RngCore};
 
 use super::{CraftingMethod, MONTE_CARLO_SAMPLES};
 use crate::data::mods::GenerationType;
 use crate::data::GameData;
-use crate::engine::mod_pool::{eligible_mods_fossil, random_rolls_pub, weighted_pick};
+use crate::engine::mod_pool::{random_rolls_pub, roll_mods_from_pool, RollPool};
 use crate::item::modifier::Modifier;
 use crate::item::{state::Rarity, ItemState};
 
@@ -44,12 +44,21 @@ impl CraftingMethod for FossilCraft {
     fn weights_are_probabilities(&self) -> bool {
         false
     }
+    // Full reroll: reapplying is an independent draw from the same distribution.
+    fn repeatable_on_failure(&self) -> bool {
+        true
+    }
 
     fn can_apply(&self, item: &ItemState, _db: &GameData) -> bool {
         item.is_craftable() && matches!(item.rarity, Rarity::Normal | Rarity::Magic | Rarity::Rare)
     }
 
-    fn apply(&self, item: &ItemState, db: &GameData) -> Result<Vec<(ItemState, f64)>> {
+    fn apply(
+        &self,
+        item: &ItemState,
+        db: &GameData,
+        rng: &mut dyn RngCore,
+    ) -> Result<Vec<(ItemState, f64)>> {
         if !self.can_apply(item, db) {
             bail!("Cannot apply {}", self.display_name);
         }
@@ -114,7 +123,8 @@ impl CraftingMethod for FossilCraft {
                 {
                     bail!(
                         "{}: forced mod '{}' shares a mod group with a fractured mod or another forced mod",
-                        self.display_name, mod_id
+                        self.display_name,
+                        mod_id
                     );
                 }
                 match forced_mod.generation_type {
@@ -141,8 +151,11 @@ impl CraftingMethod for FossilCraft {
             }
         }
 
+        // Build the fossil-modified candidate pool once; each sample only pays
+        // the cheap per-pick filtering inside roll_mods_from_pool.
+        let pool = RollPool::with_fossils(item, &blocked_mod_ids, &fossil_gen_tags, db);
+
         let prob = 1.0 / MONTE_CARLO_SAMPLES as f64;
-        let mut rng = rng();
         let mut outcomes = Vec::with_capacity(MONTE_CARLO_SAMPLES);
 
         for _ in 0..MONTE_CARLO_SAMPLES {
@@ -162,7 +175,7 @@ impl CraftingMethod for FossilCraft {
                             mod_id
                         )
                     })?;
-                    let rolls = random_rolls_pub(&forced_mod.stats, &mut rng);
+                    let rolls = random_rolls_pub(&forced_mod.stats, rng);
                     let modifier = Modifier {
                         mod_id: mod_id.clone(),
                         generation_type: forced_mod.generation_type.clone(),
@@ -180,43 +193,11 @@ impl CraftingMethod for FossilCraft {
                 }
             }
 
-            // Roll remaining mods using fossil-modified pool (4–6 total).
+            // Roll remaining mods from the fossil-modified pool (4–6 total).
             let forced_count = next.prefixes.len() + next.suffixes.len();
             let total: usize = rng.random_range(4..=6);
             let remaining = total.saturating_sub(forced_count);
-
-            let mut extra_tags: Vec<String> = Vec::new();
-            for _ in 0..remaining {
-                let pool = eligible_mods_fossil(
-                    &next,
-                    &extra_tags,
-                    &blocked_mod_ids,
-                    &fossil_gen_tags,
-                    db,
-                );
-                if pool.is_empty() {
-                    break;
-                }
-                let (mod_id, picked) = match weighted_pick(&pool, &mut rng) {
-                    Some(m) => m,
-                    None => break,
-                };
-                let rolls = random_rolls_pub(&picked.stats, &mut rng);
-                let modifier = Modifier {
-                    mod_id: mod_id.to_string(),
-                    generation_type: picked.generation_type.clone(),
-                    rolls,
-                };
-                match picked.generation_type {
-                    GenerationType::Prefix => next.prefixes.push(modifier),
-                    GenerationType::Suffix => next.suffixes.push(modifier),
-                    _ => bail!(
-                        "{}: rolled non-prefix/suffix mod: {mod_id}",
-                        self.display_name
-                    ),
-                }
-                extra_tags.extend(picked.adds_tags.iter().cloned());
-            }
+            roll_mods_from_pool(&mut next, remaining, &pool, db, rng)?;
             outcomes.push((next, prob));
         }
 

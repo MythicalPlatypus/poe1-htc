@@ -4,10 +4,11 @@
 ///
 /// IMPORTANT: 1/N is a sample weight, not a true in-game probability. The actual
 /// probability of any specific outcome depends on the full mod pool and is not
-/// computed here. `path_weight` values that include Monte Carlo steps are therefore
-/// NOT true probabilities and must not be treated as such in scoring or reporting.
+/// computed here. Success probabilities derived from these weights are Monte Carlo
+/// estimates with resolution 1/N and must be labelled as such in reporting.
 pub const MONTE_CARLO_SAMPLES: usize = 50;
 
+pub mod bench;
 pub mod eldritch;
 pub mod essences;
 pub mod fossils;
@@ -18,6 +19,7 @@ pub mod orbs;
 use crate::data::GameData;
 use crate::item::ItemState;
 use anyhow::Result;
+use rand::RngCore;
 
 /// Every crafting method implements this trait.
 /// The beam search engine calls `apply` to generate successor states.
@@ -40,16 +42,78 @@ pub trait CraftingMethod: Send + Sync {
     ///
     /// For probabilistic operations (e.g. Chaos Orb) the Vec contains one entry
     /// per distinct outcome; callers sample or enumerate as needed.
-    fn apply(&self, item: &ItemState, db: &GameData) -> Result<Vec<(ItemState, f64)>>;
+    ///
+    /// All randomness MUST come from `rng` — never from thread-local RNGs — so
+    /// that seeded searches are reproducible.
+    fn apply(
+        &self,
+        item: &ItemState,
+        db: &GameData,
+        rng: &mut dyn RngCore,
+    ) -> Result<Vec<(ItemState, f64)>>;
 
     /// Whether the f64 weights returned by `apply` are true in-game probabilities.
     ///
     /// Exact-enumeration methods (Exalted, Annulment, Harvest, Eldritch, Scouring)
     /// return true (the default). Monte Carlo methods (Chaos, Alchemy, Essence,
-    /// Fossil) MUST override this to return false — their weights are 1/N sample
-    /// weights. Reporting layers use this to decide whether a path's cumulative
-    /// weight may be presented as a probability.
+    /// Fossil, Divine, Transmutation, Alteration) MUST override this to return
+    /// false — their weights are 1/N sample weights. Reporting layers use this to
+    /// decide whether derived probabilities may be presented as exact.
     fn weights_are_probabilities(&self) -> bool {
         true
+    }
+
+    /// Whether a disappointing application can be retried with the same outcome
+    /// distribution at the same cost ("reroll until it hits").
+    ///
+    /// True for full/partial reroll methods where the post-application state does
+    /// not depend on the pre-application state (Chaos, Alchemy, Alteration,
+    /// Essence, Fossil, Divine, Transmutation*): rolling again is an independent
+    /// draw from the same distribution. False (the default) for additive or
+    /// destructive one-shot methods (Exalted, Regal, Augmentation, Annulment,
+    /// Harvest): a miss changes the item, so a retry is a different problem.
+    ///
+    /// The expected-cost model in the beam search prices repeatable steps at
+    /// `cost / P(at least this good)` and one-shot steps at `cost` (with the
+    /// hit probability reported separately).
+    ///
+    /// *Transmutation retries strictly need a Scouring Orb in between; the
+    /// approximation ignores that ~1c overhead.
+    fn repeatable_on_failure(&self) -> bool {
+        false
+    }
+}
+
+/// Decorator that overrides a method's chaos cost — used by the goal file's
+/// `[prices]` table so league-accurate prices don't require code changes.
+/// Delegates everything else to the wrapped method.
+pub struct Repriced {
+    pub inner: std::sync::Arc<dyn CraftingMethod>,
+    pub cost: f64,
+}
+
+impl CraftingMethod for Repriced {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn cost_chaos(&self) -> f64 {
+        self.cost
+    }
+    fn can_apply(&self, item: &ItemState, db: &GameData) -> bool {
+        self.inner.can_apply(item, db)
+    }
+    fn apply(
+        &self,
+        item: &ItemState,
+        db: &GameData,
+        rng: &mut dyn RngCore,
+    ) -> Result<Vec<(ItemState, f64)>> {
+        self.inner.apply(item, db, rng)
+    }
+    fn weights_are_probabilities(&self) -> bool {
+        self.inner.weights_are_probabilities()
+    }
+    fn repeatable_on_failure(&self) -> bool {
+        self.inner.repeatable_on_failure()
     }
 }

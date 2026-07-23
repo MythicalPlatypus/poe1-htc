@@ -26,7 +26,8 @@
 //! ## Scoring semantics
 //! `GoalSpec::score` returns the sum of `weight` over all *satisfied* wants.
 //! A want is satisfied when at least one mod on the item (prefix, suffix,
-//! fractured, or crafted) matches **all** criteria the want specifies:
+//! fractured, crafted, or eldritch implicit) matches **all** criteria the want
+//! specifies:
 //!
 //! - `mod_id` — the mod's RePoE ID equals this string exactly.
 //! - `group`  — the mod's DB entry lists this group in `groups` (the same
@@ -39,12 +40,25 @@
 //! match it. Scoring is binary per want (no partial credit for low rolls
 //! except via the `min_value` threshold).
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use crate::currency::{
+    bench::BenchCraft,
+    eldritch::{EldritchChaosOrb, EldritchExaltedOrb, EldritchGod},
+    essences::Essence,
+    fossils::{FossilCraft, FossilModifier},
+    harvest::{HarvestCraft, HarvestOp, HarvestTarget},
+    CraftingMethod,
+};
+use crate::data::mods::{Domain, GenerationType};
 use crate::data::GameData;
+use crate::item::modifier::StatRoll;
+use crate::item::state::Rarity;
 use crate::item::{ItemState, Modifier};
 
 fn default_item_level() -> u32 {
@@ -62,12 +76,37 @@ pub struct GoalSpec {
     pub item: ItemSpec,
     /// Desired mods. At least one required.
     pub wants: Vec<WantSpec>,
+    /// Extra crafting methods (essences, fossils, harvest, bench, eldritch)
+    /// made available to the search on top of the default orb set.
+    #[serde(default)]
+    pub methods: Vec<MethodSpec>,
+    /// Per-method chaos-cost overrides keyed by method display name
+    /// (e.g. `"Divine Orb" = 220.0`). Applied to default orbs and [[methods]]
+    /// alike, so league prices can live in the goal file.
+    #[serde(default)]
+    pub prices: HashMap<String, f64>,
     /// Optional search-parameter overrides.
     #[serde(default)]
     pub search: SearchSpec,
 }
 
-/// The base item to start crafting from.
+/// The item to start crafting from — a fresh base by default, or a mid-craft
+/// item when `rarity` / `[[item.mods]]` describe existing state. Example:
+///
+/// ```toml
+/// [item]
+/// base = "Astral Plate"
+/// item_level = 86
+/// rarity = "rare"                  # normal (default) | magic | rare
+///
+/// [[item.mods]]
+/// mod_id = "IncreasedLife9"
+/// values = [97]                    # one per stat; omitted = midpoint rolls
+/// fractured = true                 # locked against removal
+///
+/// [[item.mods]]
+/// mod_id = "FireResist5"           # plain suffix at midpoint roll
+/// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ItemSpec {
@@ -77,6 +116,171 @@ pub struct ItemSpec {
     /// Item level — gates which mods can roll (`required_level <= item_level`).
     #[serde(default = "default_item_level")]
     pub item_level: u32,
+    /// Starting rarity: "normal" (default), "magic", or "rare". Must be set
+    /// when `[[item.mods]]` are present (Normal items hold no explicit mods).
+    #[serde(default)]
+    pub rarity: Option<String>,
+    /// Mods already on the item when crafting starts.
+    #[serde(default)]
+    pub mods: Vec<StartingModSpec>,
+}
+
+/// One existing mod on the starting item.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartingModSpec {
+    /// RePoE mod ID (e.g. "IncreasedLife9").
+    pub mod_id: String,
+    /// Rolled value per stat, in the mod's stat order. Omitted stats roll at
+    /// the midpoint of their range. Values outside [min, max] are rejected.
+    pub values: Option<Vec<i32>>,
+    /// Fractured — locked, survives rerolls, blocks its group.
+    #[serde(default)]
+    pub fractured: bool,
+    /// Bench-crafted — occupies the single crafted-mod slot
+    /// (requires a `domain = "crafted"` mod).
+    #[serde(default)]
+    pub crafted: bool,
+}
+
+impl ItemSpec {
+    /// Construct the starting `ItemState`, validating every declared mod
+    /// against the DB: existence, prefix/suffix type, roll ranges, slot
+    /// capacity for the declared rarity, and group conflicts.
+    pub fn build_state(
+        &self,
+        base_id: String,
+        base_tags: Vec<String>,
+        db: &GameData,
+    ) -> Result<ItemState> {
+        let mut item = ItemState::new_base(base_id, base_tags, self.item_level);
+        item.rarity = match self.rarity.as_deref() {
+            None | Some("normal") => Rarity::Normal,
+            Some("magic") => Rarity::Magic,
+            Some("rare") => Rarity::Rare,
+            Some(other) => bail!("[item] rarity '{other}' (expected normal, magic, or rare)"),
+        };
+
+        for (i, spec) in self.mods.iter().enumerate() {
+            let m = db.mods.get(&spec.mod_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[[item.mods]] entry {i}: mod '{}' not in mods.json",
+                    spec.mod_id
+                )
+            })?;
+            if spec.fractured && spec.crafted {
+                bail!("[[item.mods]] entry {i}: a mod cannot be both fractured and crafted");
+            }
+            if !matches!(
+                m.generation_type,
+                GenerationType::Prefix | GenerationType::Suffix
+            ) {
+                bail!(
+                    "[[item.mods]] entry {i}: '{}' is not a prefix or suffix",
+                    spec.mod_id
+                );
+            }
+            if spec.crafted {
+                if m.domain != Domain::Crafted {
+                    bail!(
+                        "[[item.mods]] entry {i}: crafted = true but '{}' has domain {:?}",
+                        spec.mod_id,
+                        m.domain
+                    );
+                }
+                if item.crafted_mod.is_some() {
+                    bail!("[[item.mods]] entry {i}: only one crafted mod is allowed");
+                }
+            }
+
+            // Group conflicts against everything placed so far.
+            let conflict = item
+                .all_mods_for_conflict()
+                .filter_map(|placed| db.mods.get(&placed.mod_id))
+                .flat_map(|placed| placed.groups.iter())
+                .any(|g| m.groups.contains(g));
+            if conflict {
+                bail!(
+                    "[[item.mods]] entry {i}: '{}' shares a mod group with another starting mod",
+                    spec.mod_id
+                );
+            }
+
+            // Capacity for the declared rarity (crafted mods occupy a slot too).
+            let open = match m.generation_type {
+                GenerationType::Prefix => item.has_open_prefix(),
+                _ => item.has_open_suffix(),
+            };
+            if !open {
+                bail!(
+                    "[[item.mods]] entry {i}: no open {} slot on a {:?} item",
+                    if m.generation_type == GenerationType::Prefix {
+                        "prefix"
+                    } else {
+                        "suffix"
+                    },
+                    item.rarity
+                );
+            }
+
+            // Roll values: explicit (validated against the mod's ranges) or midpoint.
+            let rolls: Vec<StatRoll> = match &spec.values {
+                Some(values) => {
+                    if values.len() != m.stats.len() {
+                        bail!(
+                            "[[item.mods]] entry {i}: '{}' has {} stats but {} values given",
+                            spec.mod_id,
+                            m.stats.len(),
+                            values.len()
+                        );
+                    }
+                    m.stats
+                        .iter()
+                        .zip(values)
+                        .map(|(s, &v)| {
+                            if v < s.min || v > s.max {
+                                bail!(
+                                    "[[item.mods]] entry {i}: {} = {v} outside [{}, {}]",
+                                    s.id,
+                                    s.min,
+                                    s.max
+                                );
+                            }
+                            Ok(StatRoll {
+                                stat_id: s.id.clone(),
+                                value: v,
+                            })
+                        })
+                        .collect::<Result<_>>()?
+                }
+                None => m
+                    .stats
+                    .iter()
+                    .map(|s| StatRoll {
+                        stat_id: s.id.clone(),
+                        value: s.min + (s.max - s.min) / 2,
+                    })
+                    .collect(),
+            };
+
+            let modifier = Modifier {
+                mod_id: spec.mod_id.clone(),
+                generation_type: m.generation_type.clone(),
+                rolls,
+            };
+            if spec.crafted {
+                item.crafted_mod = Some(modifier);
+            } else if spec.fractured {
+                item.fractured.push(modifier);
+            } else {
+                match m.generation_type {
+                    GenerationType::Prefix => item.prefixes.push(modifier),
+                    _ => item.suffixes.push(modifier),
+                }
+            }
+        }
+        Ok(item)
+    }
 }
 
 /// One desired mod. All specified criteria must hold on a single mod
@@ -103,9 +307,211 @@ pub struct WantSpec {
 pub struct SearchSpec {
     pub beam_width: Option<usize>,
     pub max_steps: Option<usize>,
-    /// Cost penalty per chaos orb in node ranking; tune relative to the sum of
-    /// want weights. 0.0 ignores cost entirely (the search will happily exalt-spam).
+    /// Cost penalty per expected chaos in node ranking; tune relative to the sum
+    /// of want weights. 0.0 ignores cost entirely (the search will happily exalt-spam).
     pub cost_weight: Option<f64>,
+    /// RNG seed for reproducible searches. Omit for a fresh random search per run.
+    pub seed: Option<u64>,
+    /// How many distinct pathways to report (default 1).
+    pub top: Option<usize>,
+}
+
+fn default_bench_cost() -> f64 {
+    2.0
+}
+
+/// One extra crafting method, selected by `type`. Example:
+///
+/// ```toml
+/// [[methods]]
+/// type = "essence"
+/// mod_id = "IncreasedLife5"     # the mod the essence guarantees
+/// name = "Essence of Greed"     # optional display name
+/// cost = 5.0
+///
+/// [[methods]]
+/// type = "harvest"
+/// op = "augment"                # remove | add | remove_add | augment
+/// target = "life"               # attack, caster, speed, life, defences, ...
+/// cost = 30.0
+///
+/// [[methods]]
+/// type = "bench"
+/// mod_id = "EinharMasterAddedLife1"   # any mods.json entry with domain = "crafted"
+///
+/// [[methods]]
+/// type = "fossil"
+/// name = "Pristine Fossil"
+/// cost = 10.0
+/// boosted_tags = ["life"]
+///
+/// [[methods]]
+/// type = "eldritch_chaos"       # or "eldritch_exalt"
+/// god = "exarch"                # exarch | eater
+/// ```
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MethodSpec {
+    /// Guarantees `mod_id`, rerolls the rest (Monte Carlo).
+    Essence {
+        name: Option<String>,
+        mod_id: String,
+        cost: f64,
+    },
+    /// Deterministically adds crafted mod `mod_id` (must have domain = "crafted").
+    Bench {
+        name: Option<String>,
+        mod_id: String,
+        #[serde(default = "default_bench_cost")]
+        cost: f64,
+    },
+    /// Fossil/resonator reroll with modified spawn weights. The flat tag/id
+    /// fields describe a single fossil; add `[[methods.fossils]]` sub-tables
+    /// to socket more fossils into the same resonator.
+    Fossil {
+        name: Option<String>,
+        cost: f64,
+        #[serde(default)]
+        boosted_tags: Vec<String>,
+        #[serde(default)]
+        reduced_tags: Vec<String>,
+        #[serde(default)]
+        blocked_mod_ids: Vec<String>,
+        #[serde(default)]
+        forced_mod_ids: Vec<String>,
+        /// Additional fossils in the same resonator (multi-fossil crafts).
+        #[serde(default)]
+        fossils: Vec<FossilPartSpec>,
+    },
+    /// Targeted harvest craft, e.g. op = "augment", target = "life".
+    Harvest {
+        op: String,
+        target: String,
+        cost: f64,
+    },
+    /// Rerolls the eldritch implicit for `god` ("exarch" | "eater").
+    EldritchChaos { god: String },
+    /// Upgrades the eldritch implicit tier for `god` ("exarch" | "eater").
+    EldritchExalt { god: String },
+}
+
+/// One fossil inside a multi-fossil resonator (`[[methods.fossils]]`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FossilPartSpec {
+    #[serde(default)]
+    pub boosted_tags: Vec<String>,
+    #[serde(default)]
+    pub reduced_tags: Vec<String>,
+    #[serde(default)]
+    pub blocked_mod_ids: Vec<String>,
+    #[serde(default)]
+    pub forced_mod_ids: Vec<String>,
+}
+
+impl MethodSpec {
+    /// Build the runtime `CraftingMethod`, validating references against the DB
+    /// so a typo'd mod ID fails at load time rather than mid-search.
+    pub fn build(&self, db: &GameData) -> Result<Arc<dyn CraftingMethod>> {
+        match self {
+            MethodSpec::Essence { name, mod_id, cost } => {
+                if !db.mods.contains_key(mod_id) {
+                    bail!("[[methods]] essence: mod_id '{mod_id}' not found in mods.json");
+                }
+                Ok(Arc::new(Essence {
+                    display_name: name
+                        .clone()
+                        .unwrap_or_else(|| format!("Essence ({mod_id})")),
+                    guaranteed_mod_id: mod_id.clone(),
+                    cost_chaos: *cost,
+                }))
+            }
+            MethodSpec::Bench { name, mod_id, cost } => {
+                let m = db.mods.get(mod_id).ok_or_else(|| {
+                    anyhow::anyhow!("[[methods]] bench: mod_id '{mod_id}' not found in mods.json")
+                })?;
+                if m.domain != Domain::Crafted {
+                    bail!(
+                        "[[methods]] bench: mod '{mod_id}' has domain {:?}, expected crafted",
+                        m.domain
+                    );
+                }
+                Ok(Arc::new(BenchCraft {
+                    display_name: name
+                        .clone()
+                        .unwrap_or_else(|| format!("Bench Craft ({mod_id})")),
+                    mod_id: mod_id.clone(),
+                    cost_chaos: *cost,
+                }))
+            }
+            MethodSpec::Fossil {
+                name,
+                cost,
+                boosted_tags,
+                reduced_tags,
+                blocked_mod_ids,
+                forced_mod_ids,
+                fossils,
+            } => {
+                // Fossil #1 from the flat fields, plus any [[methods.fossils]] parts.
+                let mut parts = vec![FossilModifier {
+                    boosted_tags: boosted_tags.clone(),
+                    reduced_tags: reduced_tags.clone(),
+                    blocked_mod_ids: blocked_mod_ids.clone(),
+                    forced_mod_ids: forced_mod_ids.clone(),
+                }];
+                parts.extend(fossils.iter().map(|f| FossilModifier {
+                    boosted_tags: f.boosted_tags.clone(),
+                    reduced_tags: f.reduced_tags.clone(),
+                    blocked_mod_ids: f.blocked_mod_ids.clone(),
+                    forced_mod_ids: f.forced_mod_ids.clone(),
+                }));
+                for id in parts
+                    .iter()
+                    .flat_map(|p| p.blocked_mod_ids.iter().chain(p.forced_mod_ids.iter()))
+                {
+                    if !db.mods.contains_key(id) {
+                        bail!("[[methods]] fossil: mod_id '{id}' not found in mods.json");
+                    }
+                }
+                Ok(Arc::new(FossilCraft {
+                    display_name: name.clone().unwrap_or_else(|| "Fossil Craft".to_string()),
+                    cost_chaos: *cost,
+                    fossils: parts,
+                }))
+            }
+            MethodSpec::Harvest { op, target, cost } => {
+                let parsed_op = HarvestOp::parse(op).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[[methods]] harvest: unknown op '{op}' (expected remove, add, remove_add, augment)"
+                    )
+                })?;
+                let parsed_target = HarvestTarget::parse(target).ok_or_else(|| {
+                    anyhow::anyhow!("[[methods]] harvest: unknown target '{target}'")
+                })?;
+                Ok(Arc::new(HarvestCraft {
+                    display_name: format!("Harvest {op} {target}"),
+                    cost_chaos: *cost,
+                    target: parsed_target,
+                    op: parsed_op,
+                }))
+            }
+            MethodSpec::EldritchChaos { god } => Ok(Arc::new(EldritchChaosOrb {
+                god: parse_god(god)?,
+            })),
+            MethodSpec::EldritchExalt { god } => Ok(Arc::new(EldritchExaltedOrb {
+                god: parse_god(god)?,
+            })),
+        }
+    }
+}
+
+fn parse_god(s: &str) -> Result<EldritchGod> {
+    match s {
+        "exarch" => Ok(EldritchGod::SearingExarch),
+        "eater" => Ok(EldritchGod::EaterOfWorlds),
+        other => bail!("[[methods]] eldritch: unknown god '{other}' (expected exarch or eater)"),
+    }
 }
 
 impl GoalSpec {
@@ -143,6 +549,11 @@ impl GoalSpec {
                 bail!("[[wants]] entry {i}: weight must be a positive finite number");
             }
         }
+        for (name, price) in &self.prices {
+            if *price <= 0.0 || !price.is_finite() {
+                bail!("[prices] \"{name}\": price must be a positive finite number");
+            }
+        }
         Ok(())
     }
 
@@ -151,11 +562,7 @@ impl GoalSpec {
     pub fn score(&self, state: &ItemState, db: &GameData) -> f64 {
         self.wants
             .iter()
-            .filter(|w| {
-                state
-                    .all_mods_for_conflict()
-                    .any(|m| want_matches(w, m, db))
-            })
+            .filter(|w| scorable_mods(state).any(|m| want_matches(w, m, db)))
             .map(|w| w.weight)
             .sum()
     }
@@ -166,13 +573,21 @@ impl GoalSpec {
         self.wants
             .iter()
             .map(|w| {
-                let satisfied = state
-                    .all_mods_for_conflict()
-                    .any(|m| want_matches(w, m, db));
+                let satisfied = scorable_mods(state).any(|m| want_matches(w, m, db));
                 (describe_want(w), satisfied)
             })
             .collect()
     }
+}
+
+/// Every mod a want can be satisfied by: affix-slot mods (prefixes, suffixes,
+/// fractured, crafted) plus eldritch implicits — implicits don't participate in
+/// affix conflicts but absolutely count toward goals.
+fn scorable_mods(state: &ItemState) -> impl Iterator<Item = &Modifier> {
+    state
+        .all_mods_for_conflict()
+        .chain(state.exarch_implicit.iter())
+        .chain(state.eater_implicit.iter())
 }
 
 /// True if `modifier` satisfies every criterion `want` specifies.
@@ -258,10 +673,333 @@ mod tests {
     fn db_with_life() -> GameData {
         let mut mods = HashMap::new();
         mods.insert("IncreasedLife5".to_string(), life_mod());
-        GameData {
-            mods,
-            base_items: HashMap::new(),
+        GameData::new(mods, HashMap::new())
+    }
+
+    #[test]
+    fn parses_methods_section_and_builds() {
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+
+            [[wants]]
+            group = "IncreasedLife"
+
+            [[methods]]
+            type = "essence"
+            mod_id = "IncreasedLife5"
+            name = "Essence of Greed"
+            cost = 5.0
+
+            [[methods]]
+            type = "harvest"
+            op = "augment"
+            target = "life"
+            cost = 30.0
+
+            [[methods]]
+            type = "eldritch_chaos"
+            god = "exarch"
+
+            [search]
+            seed = 42
+            "#,
+        )
+        .unwrap();
+        assert_eq!(spec.methods.len(), 3);
+        assert_eq!(spec.search.seed, Some(42));
+
+        let db = db_with_life();
+        let built: Vec<_> = spec.methods.iter().map(|m| m.build(&db).unwrap()).collect();
+        assert_eq!(built[0].name(), "Essence of Greed");
+        assert_eq!(built[1].name(), "Harvest augment life");
+        assert_eq!(built[2].name(), "Eldritch Chaos Orb (Exarch)");
+    }
+
+    #[test]
+    fn method_build_rejects_unknown_mod_id() {
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            group = "IncreasedLife"
+            [[methods]]
+            type = "essence"
+            mod_id = "NoSuchMod"
+            cost = 5.0
+            "#,
+        )
+        .unwrap();
+        let err = spec.methods[0]
+            .build(&db_with_life())
+            .err()
+            .expect("build must fail");
+        assert!(err.to_string().contains("NoSuchMod"), "got: {err}");
+    }
+
+    #[test]
+    fn method_build_rejects_bench_on_non_crafted_mod() {
+        // IncreasedLife5 has domain=item, not crafted — bench must refuse it.
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            group = "IncreasedLife"
+            [[methods]]
+            type = "bench"
+            mod_id = "IncreasedLife5"
+            "#,
+        )
+        .unwrap();
+        let err = spec.methods[0]
+            .build(&db_with_life())
+            .err()
+            .expect("build must fail");
+        assert!(err.to_string().contains("expected crafted"), "got: {err}");
+    }
+
+    #[test]
+    fn method_build_rejects_bad_harvest_op() {
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            group = "IncreasedLife"
+            [[methods]]
+            type = "harvest"
+            op = "explode"
+            target = "life"
+            cost = 30.0
+            "#,
+        )
+        .unwrap();
+        let err = spec.methods[0]
+            .build(&db_with_life())
+            .err()
+            .expect("build must fail");
+        assert!(err.to_string().contains("unknown op"), "got: {err}");
+    }
+
+    #[test]
+    fn build_state_places_starting_mods() {
+        let mut mods = HashMap::new();
+        mods.insert("IncreasedLife5".to_string(), life_mod());
+        let mut fire = life_mod();
+        fire.generation_type = GenerationType::Suffix;
+        fire.groups = vec!["FireResistance".to_string()];
+        fire.stats = vec![ModStat {
+            id: "base_fire_damage_resistance_%".to_string(),
+            min: 30,
+            max: 35,
+        }];
+        mods.insert("FireResist5".to_string(), fire);
+        let mut crafted = life_mod();
+        crafted.domain = Domain::Crafted;
+        crafted.groups = vec!["CraftedMana".to_string()];
+        crafted.generation_type = GenerationType::Suffix;
+        mods.insert("CraftedMana1".to_string(), crafted);
+        let db = GameData::new(mods, HashMap::new());
+
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            item_level = 86
+            rarity = "rare"
+
+            [[item.mods]]
+            mod_id = "IncreasedLife5"
+            values = [75]
+            fractured = true
+
+            [[item.mods]]
+            mod_id = "FireResist5"
+
+            [[item.mods]]
+            mod_id = "CraftedMana1"
+            crafted = true
+
+            [[wants]]
+            group = "IncreasedLife"
+            "#,
+        )
+        .unwrap();
+        let item = spec
+            .item
+            .build_state("chest".to_string(), vec![], &db)
+            .unwrap();
+
+        assert_eq!(item.rarity, Rarity::Rare);
+        assert_eq!(item.fractured.len(), 1);
+        assert_eq!(
+            item.fractured[0].rolls[0].value, 75,
+            "explicit value must be kept"
+        );
+        assert_eq!(item.suffixes.len(), 1);
+        // 30..=35 midpoint = 32 when values are omitted.
+        assert_eq!(item.suffixes[0].rolls[0].value, 32);
+        assert!(item.crafted_mod.is_some());
+        // The fractured life mod satisfies the want immediately.
+        assert_eq!(spec.score(&item, &db), 1.0);
+    }
+
+    #[test]
+    fn build_state_rejects_bad_starting_items() {
+        let db = db_with_life();
+        // Value outside the mod's roll range.
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "x"
+            rarity = "rare"
+            [[item.mods]]
+            mod_id = "IncreasedLife5"
+            values = [999]
+            [[wants]]
+            group = "IncreasedLife"
+            "#,
+        )
+        .unwrap();
+        let err = spec
+            .item
+            .build_state("chest".to_string(), vec![], &db)
+            .unwrap_err();
+        assert!(err.to_string().contains("outside"), "got: {err}");
+
+        // Mods on a Normal-rarity item have no slots.
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "x"
+            [[item.mods]]
+            mod_id = "IncreasedLife5"
+            [[wants]]
+            group = "IncreasedLife"
+            "#,
+        )
+        .unwrap();
+        let err = spec
+            .item
+            .build_state("chest".to_string(), vec![], &db)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no open prefix slot"),
+            "got: {err}"
+        );
+
+        // crafted = true on a non-crafted-domain mod.
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "x"
+            rarity = "rare"
+            [[item.mods]]
+            mod_id = "IncreasedLife5"
+            crafted = true
+            [[wants]]
+            group = "IncreasedLife"
+            "#,
+        )
+        .unwrap();
+        let err = spec
+            .item
+            .build_state("chest".to_string(), vec![], &db)
+            .unwrap_err();
+        assert!(err.to_string().contains("domain"), "got: {err}");
+    }
+
+    #[test]
+    fn wants_match_eldritch_implicits() {
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            group = "IncreasedLife"
+            weight = 10.0
+            "#,
+        )
+        .unwrap();
+        let db = db_with_life();
+        let mut item = ItemState::new_base("chest", vec![], 86);
+        item.rarity = Rarity::Rare;
+        item.exarch_implicit = Some(Modifier {
+            mod_id: "IncreasedLife5".to_string(),
+            generation_type: GenerationType::ExarchImplicit,
+            rolls: vec![],
+        });
+        assert_eq!(
+            spec.score(&item, &db),
+            10.0,
+            "eldritch implicit mods must satisfy wants"
+        );
+    }
+
+    #[test]
+    fn parses_prices_and_rejects_nonpositive() {
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            group = "IncreasedLife"
+            [prices]
+            "Divine Orb" = 220.0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(spec.prices.get("Divine Orb"), Some(&220.0));
+
+        let err = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            group = "IncreasedLife"
+            [prices]
+            "Chaos Orb" = -1.0
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("positive"), "got: {err}");
+    }
+
+    #[test]
+    fn parses_multi_fossil_resonator() {
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            group = "IncreasedLife"
+            [[methods]]
+            type = "fossil"
+            name = "Pristine + Dense"
+            cost = 25.0
+            boosted_tags = ["life"]
+            [[methods.fossils]]
+            boosted_tags = ["defences"]
+            "#,
+        )
+        .unwrap();
+        match &spec.methods[0] {
+            MethodSpec::Fossil {
+                fossils,
+                boosted_tags,
+                ..
+            } => {
+                assert_eq!(boosted_tags, &["life".to_string()]);
+                assert_eq!(fossils.len(), 1, "one [[methods.fossils]] sub-table");
+                assert_eq!(fossils[0].boosted_tags, vec!["defences".to_string()]);
+            }
+            other => panic!("expected fossil method, got {other:?}"),
         }
+        // Builds into a two-fossil resonator without error.
+        spec.methods[0].build(&db_with_life()).unwrap();
     }
 
     fn item_with_life(value: i32) -> ItemState {

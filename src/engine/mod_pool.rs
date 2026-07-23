@@ -44,12 +44,10 @@ pub fn eligible_mods<'a>(
         .chain(extra_tags.iter().map(|t| t.as_str()))
         .collect();
 
-    db.mods
-        .iter()
+    // craftable_mods() is pre-filtered to is_craftable() and iterates in
+    // sorted-ID order, which seeded searches rely on for reproducibility.
+    db.craftable_mods()
         .filter_map(|(id, m)| {
-            if !m.is_craftable() {
-                return None;
-            }
             if m.required_level > item.item_level {
                 return None;
             }
@@ -68,14 +66,14 @@ pub fn eligible_mods<'a>(
                 GenerationType::Suffix if !item.has_open_suffix() => return None,
                 _ => {}
             }
-            Some((id.as_str(), m, weight))
+            Some((id, m, weight))
         })
         .collect()
 }
 
 /// Picks one mod from `pool` using weighted random selection.
 /// Returns `None` only if `pool` is empty.
-pub fn weighted_pick<'a, R: Rng>(
+pub fn weighted_pick<'a, R: Rng + ?Sized>(
     pool: &[(&'a str, &'a crate::data::mods::Mod, u32)],
     rng: &mut R,
 ) -> Option<(&'a str, &'a crate::data::mods::Mod)> {
@@ -95,7 +93,7 @@ pub fn weighted_pick<'a, R: Rng>(
 }
 
 /// Rolls random stat values (uniform in [min, max]) for a slice of `ModStat`.
-pub fn random_rolls_pub<R: Rng>(stats: &[ModStat], rng: &mut R) -> Vec<StatRoll> {
+pub fn random_rolls_pub<R: Rng + ?Sized>(stats: &[ModStat], rng: &mut R) -> Vec<StatRoll> {
     stats
         .iter()
         .map(|s| {
@@ -112,25 +110,164 @@ pub fn random_rolls_pub<R: Rng>(stats: &[ModStat], rng: &mut R) -> Vec<StatRoll>
         .collect()
 }
 
+/// Groups occupied by all affix-slot mods on `item` (prefixes, suffixes,
+/// fractured, crafted) — the starting point for incremental conflict tracking.
+pub fn conflict_groups(item: &ItemState, db: &GameData) -> std::collections::HashSet<String> {
+    item.all_mods_for_conflict()
+        .filter_map(|m| db.mods.get(&m.mod_id))
+        .flat_map(|m| m.groups.iter().cloned())
+        .collect()
+}
+
+/// Precomputed candidate pool for iterative mod rolling — the hot path of every
+/// Monte Carlo reroll method (Chaos, Alchemy, Alteration, Essence, Fossil).
+///
+/// Construction scans the craftable index ONCE, caching each candidate's
+/// base-tag spawn weight (with fossil generation-weight multipliers already
+/// applied). Each pick then only checks group conflicts and slot capacity —
+/// unless `extra_tags` from placed mods' `adds_tags` are in play, in which case
+/// weights are recomputed (adds_tags can flip a spawn weight from 0 to nonzero
+/// and vice versa because spawn_weights are first-match-wins).
+///
+/// Pool iteration order follows the sorted craftable index, so seeded searches
+/// stay deterministic. Produces pools identical to `eligible_mods` /
+/// `eligible_mods_fossil` (verified by unit test).
+pub struct RollPool<'a> {
+    entries: Vec<PoolEntry<'a>>,
+    base_tags: Vec<String>,
+}
+
+struct PoolEntry<'a> {
+    id: &'a str,
+    m: &'a crate::data::mods::Mod,
+    /// Spawn weight under base tags x fossil multiplier (cached fast path).
+    cached_weight: u32,
+    /// Fossil generation-weight multiplier (1.0 outside fossil crafts).
+    mult: f64,
+}
+
+impl<'a> RollPool<'a> {
+    /// Pool for plain rerolls (no fossil modifiers).
+    pub fn new(item: &ItemState, db: &'a GameData) -> Self {
+        Self::with_fossils(item, &[], &[], db)
+    }
+
+    /// Pool with fossil-specific modifications (blocked IDs excluded, boosted /
+    /// reduced tags baked into the multiplier).
+    pub fn with_fossils(
+        item: &ItemState,
+        blocked_mod_ids: &[String],
+        fossil_gen_tags: &[&str],
+        db: &'a GameData,
+    ) -> Self {
+        let base_tags: Vec<String> = item.base_tags.clone();
+        let tag_refs: Vec<&str> = base_tags.iter().map(|t| t.as_str()).collect();
+        let entries = db
+            .craftable_mods()
+            .filter_map(|(id, m)| {
+                if m.required_level > item.item_level {
+                    return None;
+                }
+                if blocked_mod_ids.iter().any(|b| b == id) {
+                    return None;
+                }
+                let mult: f64 = m
+                    .generation_weights
+                    .iter()
+                    .filter(|gw| fossil_gen_tags.contains(&gw.tag.as_str()))
+                    .fold(1.0_f64, |acc, gw| acc * gw.weight as f64 / 100.0);
+                let cached_weight =
+                    (m.spawn_weight_for_tags(&tag_refs) as f64 * mult).round() as u32;
+                Some(PoolEntry {
+                    id,
+                    m,
+                    cached_weight,
+                    mult,
+                })
+            })
+            .collect();
+        Self { entries, base_tags }
+    }
+
+    /// The currently eligible pool, given the occupied groups and the item's
+    /// slot state. `extra_tags` non-empty triggers the slow reweigh path.
+    pub fn eligible(
+        &self,
+        item: &ItemState,
+        existing_groups: &std::collections::HashSet<String>,
+        extra_tags: &[String],
+    ) -> Vec<(&'a str, &'a crate::data::mods::Mod, u32)> {
+        let effective: Vec<&str> = if extra_tags.is_empty() {
+            Vec::new()
+        } else {
+            self.base_tags
+                .iter()
+                .chain(extra_tags.iter())
+                .map(|t| t.as_str())
+                .collect()
+        };
+        self.entries
+            .iter()
+            .filter_map(|e| {
+                let weight = if extra_tags.is_empty() {
+                    e.cached_weight
+                } else {
+                    (e.m.spawn_weight_for_tags(&effective) as f64 * e.mult).round() as u32
+                };
+                if weight == 0 {
+                    return None;
+                }
+                if e.m.groups.iter().any(|g| existing_groups.contains(g)) {
+                    return None;
+                }
+                match e.m.generation_type {
+                    GenerationType::Prefix if !item.has_open_prefix() => return None,
+                    GenerationType::Suffix if !item.has_open_suffix() => return None,
+                    _ => {}
+                }
+                Some((e.id, e.m, weight))
+            })
+            .collect()
+    }
+}
+
 /// Rolls up to `count` mods onto `item` iteratively, re-computing the eligible
 /// pool after each pick so that `adds_tags` from placed mods are respected.
 ///
 /// Stops early if the eligible pool is exhausted before `count` is reached
 /// (partial rolls are valid PoE behaviour).
-pub fn roll_mods<R: Rng>(
+pub fn roll_mods<R: Rng + ?Sized>(
     item: &mut ItemState,
     count: usize,
     db: &GameData,
     rng: &mut R,
 ) -> Result<()> {
+    let pool = RollPool::new(item, db);
+    roll_mods_from_pool(item, count, &pool, db, rng)
+}
+
+/// The pick-place loop behind `roll_mods`, reusing a prebuilt `RollPool` so
+/// Monte Carlo callers pay the pool-construction scan once per `apply`, not
+/// once per pick per sample.
+pub fn roll_mods_from_pool<R: Rng + ?Sized>(
+    item: &mut ItemState,
+    count: usize,
+    pool: &RollPool<'_>,
+    db: &GameData,
+    rng: &mut R,
+) -> Result<()> {
+    // Seed occupied groups from the item (fractured/crafted/forced mods live
+    // outside the pool, so this must go through the db), then track
+    // incrementally instead of rescanning the item per pick.
+    let mut existing_groups = conflict_groups(item, db);
     let mut extra_tags: Vec<String> = Vec::new();
 
     for _ in 0..count {
-        let pool = eligible_mods(item, &extra_tags, db);
-        if pool.is_empty() {
+        let candidates = pool.eligible(item, &existing_groups, &extra_tags);
+        if candidates.is_empty() {
             break;
         }
-        let (mod_id, picked) = weighted_pick(&pool, rng)
+        let (mod_id, picked) = weighted_pick(&candidates, rng)
             .ok_or_else(|| anyhow::anyhow!("weighted_pick returned None on non-empty pool"))?;
 
         let rolls = random_rolls_pub(&picked.stats, rng);
@@ -146,6 +283,7 @@ pub fn roll_mods<R: Rng>(
             _ => bail!("weighted_pick returned a non-prefix/suffix mod: {mod_id}"),
         }
 
+        existing_groups.extend(picked.groups.iter().cloned());
         extra_tags.extend(picked.adds_tags.iter().cloned());
     }
 
@@ -178,12 +316,8 @@ pub fn eligible_mods_fossil<'a>(
         .chain(extra_tags.iter().map(|t| t.as_str()))
         .collect();
 
-    db.mods
-        .iter()
+    db.craftable_mods()
         .filter_map(|(id, m)| {
-            if !m.is_craftable() {
-                return None;
-            }
             if m.required_level > item.item_level {
                 return None;
             }
@@ -215,7 +349,7 @@ pub fn eligible_mods_fossil<'a>(
             if effective_weight == 0 {
                 return None;
             }
-            Some((id.as_str(), m, effective_weight))
+            Some((id, m, effective_weight))
         })
         .collect()
 }
@@ -229,7 +363,8 @@ pub fn eligible_mods_eldritch<'a>(
     db: &'a GameData,
 ) -> Vec<(&'a str, &'a crate::data::mods::Mod, u32)> {
     let effective_tags: Vec<&str> = item.base_tags.iter().map(|t| t.as_str()).collect();
-    db.mods
+    let mut pool: Vec<(&str, &crate::data::mods::Mod, u32)> = db
+        .mods
         .iter()
         .filter_map(|(id, m)| {
             if &m.generation_type != gen_type {
@@ -244,7 +379,11 @@ pub fn eligible_mods_eldritch<'a>(
             }
             Some((id.as_str(), m, weight))
         })
-        .collect()
+        .collect();
+    // Eldritch mods bypass the craftable index (different domain), so sort here
+    // to keep pool order deterministic for seeded searches.
+    pool.sort_by_key(|(id, _, _)| *id);
+    pool
 }
 
 /// Returns mods eligible for harvest add/augment operations, filtered to only
@@ -260,12 +399,8 @@ pub fn eligible_mods_harvest_tag<'a>(
         .flat_map(|m| m.groups.iter().map(|g| g.as_str()))
         .collect();
     let effective_tags: Vec<&str> = item.base_tags.iter().map(|t| t.as_str()).collect();
-    db.mods
-        .iter()
+    db.craftable_mods()
         .filter_map(|(id, m)| {
-            if !m.is_craftable() {
-                return None;
-            }
             if m.required_level > item.item_level {
                 return None;
             }
@@ -287,7 +422,7 @@ pub fn eligible_mods_harvest_tag<'a>(
                 GenerationType::Suffix if !item.has_open_suffix() => return None,
                 _ => {}
             }
-            Some((id.as_str(), m, weight))
+            Some((id, m, weight))
         })
         .collect()
 }
@@ -343,10 +478,7 @@ mod tests {
     fn one_mod_db(id: &str, m: Mod) -> GameData {
         let mut mods = HashMap::new();
         mods.insert(id.to_string(), m);
-        GameData {
-            mods,
-            base_items: HashMap::new(),
-        }
+        GameData::new(mods, HashMap::new())
     }
 
     fn sword_item(item_level: u32) -> ItemState {
@@ -526,10 +658,7 @@ mod tests {
                 make_mod(GenerationType::Suffix, 1, &format!("ST{i}"), "sword", 100),
             );
         }
-        let db = GameData {
-            mods,
-            base_items: HashMap::new(),
-        };
+        let db = GameData::new(mods, HashMap::new());
         let mut item = rare_sword(84);
 
         roll_mods(&mut item, 4, &db, &mut rng()).unwrap();
@@ -551,10 +680,7 @@ mod tests {
                 make_mod(gen, 1, &format!("Type{i}"), "sword", 100),
             );
         }
-        let db = GameData {
-            mods,
-            base_items: HashMap::new(),
-        };
+        let db = GameData::new(mods, HashMap::new());
         let mut item = rare_sword(84);
 
         roll_mods(&mut item, 6, &db, &mut rng()).unwrap();
@@ -585,14 +711,101 @@ mod tests {
             "S0".to_string(),
             make_mod(GenerationType::Suffix, 1, "ST0", "sword", 100),
         );
-        let db = GameData {
-            mods,
-            base_items: HashMap::new(),
-        };
+        let db = GameData::new(mods, HashMap::new());
         let mut item = rare_sword(84);
 
         roll_mods(&mut item, 6, &db, &mut rng()).unwrap();
         // Should have at most 2 mods total, no panic.
         assert!(item.prefixes.len() + item.suffixes.len() <= 2);
+    }
+
+    // ── RollPool (hot-path cache) ────────────────────────────────────────────
+
+    fn ids_and_weights<'a>(pool: &[(&'a str, &'a Mod, u32)]) -> Vec<(&'a str, u32)> {
+        pool.iter().map(|(id, _, w)| (*id, *w)).collect()
+    }
+
+    #[test]
+    fn roll_pool_matches_eligible_mods() {
+        // Mixed db: eligible, ilvl-gated, and wrong-tag mods.
+        let mut mods = HashMap::new();
+        mods.insert(
+            "A".to_string(),
+            make_mod(GenerationType::Prefix, 1, "TA", "sword", 100),
+        );
+        mods.insert(
+            "B".to_string(),
+            make_mod(GenerationType::Suffix, 1, "TB", "sword", 200),
+        );
+        mods.insert(
+            "C".to_string(),
+            make_mod(GenerationType::Prefix, 90, "TC", "sword", 100),
+        );
+        mods.insert(
+            "D".to_string(),
+            make_mod(GenerationType::Prefix, 1, "TD", "axe", 100),
+        );
+        let db = GameData::new(mods, HashMap::new());
+        let item = rare_sword(84);
+
+        let pool = RollPool::new(&item, &db);
+        let via_pool = pool.eligible(&item, &conflict_groups(&item, &db), &[]);
+        let direct = eligible_mods(&item, &[], &db);
+        assert_eq!(
+            ids_and_weights(&via_pool),
+            ids_and_weights(&direct),
+            "RollPool must produce the same pool (and order) as eligible_mods"
+        );
+        assert_eq!(via_pool.len(), 2, "only A and B are eligible");
+    }
+
+    #[test]
+    fn roll_pool_reweighs_with_extra_tags() {
+        // "D" only has weight for tag "axe" — dormant until adds_tags provide it.
+        let db = one_mod_db("D", make_mod(GenerationType::Prefix, 1, "TD", "axe", 100));
+        let item = rare_sword(84);
+        let pool = RollPool::new(&item, &db);
+        let groups = conflict_groups(&item, &db);
+
+        assert!(pool.eligible(&item, &groups, &[]).is_empty());
+
+        let extra = vec!["axe".to_string()];
+        let awakened = pool.eligible(&item, &groups, &extra);
+        let direct = eligible_mods(&item, &extra, &db);
+        assert_eq!(
+            ids_and_weights(&awakened),
+            ids_and_weights(&direct),
+            "extra-tag reweigh must match eligible_mods"
+        );
+        assert_eq!(awakened.len(), 1);
+    }
+
+    #[test]
+    fn roll_pool_fossil_matches_eligible_mods_fossil() {
+        use crate::data::mods::GenerationWeight;
+        // "A" gets a 3x generation-weight boost from the "life" fossil tag;
+        // "B" is blocked outright.
+        let mut a = make_mod(GenerationType::Prefix, 1, "TA", "sword", 100);
+        a.generation_weights = vec![GenerationWeight {
+            tag: "life".to_string(),
+            weight: 300,
+        }];
+        let mut mods = HashMap::new();
+        mods.insert("A".to_string(), a);
+        mods.insert(
+            "B".to_string(),
+            make_mod(GenerationType::Suffix, 1, "TB", "sword", 50),
+        );
+        let db = GameData::new(mods, HashMap::new());
+        let item = rare_sword(84);
+        let blocked = vec!["B".to_string()];
+        let fossil_tags = ["life"];
+
+        let pool = RollPool::with_fossils(&item, &blocked, &fossil_tags, &db);
+        let via_pool = pool.eligible(&item, &conflict_groups(&item, &db), &[]);
+        let direct = eligible_mods_fossil(&item, &[], &blocked, &fossil_tags, &db);
+        assert_eq!(ids_and_weights(&via_pool), ids_and_weights(&direct));
+        assert_eq!(via_pool.len(), 1);
+        assert_eq!(via_pool[0].2, 300, "100 base x 3.0 fossil multiplier");
     }
 }

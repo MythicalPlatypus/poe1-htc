@@ -19,22 +19,32 @@ This project is currently in active development. The core data model, mod-pool f
   - mod groups
   - spawn weights
 - Implements a shared `CraftingMethod` trait for currency behavior
-- Includes early implementations for:
-  - Orb of Scouring
-  - Orb of Annulment
-  - Orb of Alchemy
-  - Chaos Orb
-  - Exalted Orb
-  - Essences
-  - Fossils
-  - Harvest crafts
-  - Eldritch crafts
+- Implements the full basic-orb progression plus configured crafts:
+  - Orb of Scouring, Transmutation, Alteration, Augmentation
+  - Regal Orb, Orb of Alchemy, Chaos Orb, Exalted Orb, Orb of Annulment, Divine Orb
+  - Crafting bench mods (any `domain = "crafted"` mod from mods.json)
+  - Essences, Fossils, Harvest crafts, Eldritch orbs
   - Influence application
 - Uses Rayon-backed parallel expansion in beam search
 - TOML goal specification (target mods by group, mod ID, or stat with roll thresholds)
-- Goal-driven CLI: prints the best path, cost, final item, and goal satisfaction
+- Extra methods per goal file: essences, fossils (including multi-fossil
+  resonators), harvest crafts, bench crafts, eldritch orbs — configured in
+  `[[methods]]` entries
+- Expected-cost model: reroll steps are priced at `cost / hit-chance`
+  ("reroll until it hits"), one-shot steps report their hit probability, and a
+  restart-on-miss estimate brackets the pessimistic side
+- League-price overrides per goal file (`[prices] "Divine Orb" = 220.0`)
+- Goal wants match eldritch implicits as well as affixes
+- Start from a mid-craft item: `[item] rarity` + `[[item.mods]]` describe an
+  existing rare/magic with exact rolls, fractured mods, and crafted mods
+- Multiple pathways per run: `--top N` / `[search] top` reports the N best
+  distinct method sequences, best first
+- Seedable RNG for fully reproducible searches (`--seed` / `[search] seed`)
+- Goal-driven CLI: prints the best path with per-step retry economics, expected
+  cost, final item, and goal satisfaction
 - Unit tests for data loading, mod-pool behavior, and goal parsing/scoring
-- Integration tests for beam ranking, probability invariants, and forced-mod legality
+- Integration tests for beam ranking, probability invariants, forced-mod
+  legality, the orb progression, expected-cost math, and reproducibility
 
 ## Current Status
 
@@ -42,24 +52,26 @@ This is not production-ready yet.
 
 Working:
 
-- RePoE data loading
+- RePoE data loading (with a precomputed craftable-mod index for hot loops)
 - Core item state model
 - Mod pool filtering
 - Weighted mod selection
-- Currency trait and several currency implementations
-- Beam search with cost-aware ranking
+- Full basic-orb progression (Transmute/Alt/Aug/Regal/Alch/Chaos/Exalt/Annul/Divine/Scour)
+- Bench crafts, essences, fossils, harvest, and eldritch via goal-file `[[methods]]`
+- Beam search ranked by expected cost (reroll-until-hit pricing)
 - TOML goal specification and scoring
+- Seedable, reproducible searches
 - End-to-end optimizer CLI (`--goal file.toml`)
-- Unit tests for mod-pool rules and goal parsing/scoring
-- Integration tests for beam ranking, probability sums, and Essence/Fossil legality
+- 55 tests: mod-pool rules, goal parsing/scoring, beam ranking, probability
+  sums, Essence/Fossil legality, orb progression, expected-cost math,
+  seeded reproducibility
 
 Still in progress:
 
-- Exposing essences, fossils, harvest, and eldritch methods through the goal file
-  (implemented as `CraftingMethod`s but they need per-instance configuration)
+- The true cost of a plan sits between the reported optimistic bound (one-shot
+  steps paid once) and the restart-on-miss bound (any miss scraps the item);
+  smarter recovery policies (e.g. re-alt after a missed aug) would tighten it
 - More exact probability modeling for full rerolls (currently Monte Carlo sampled)
-- Expected-cost estimation across repeated attempts (current cost is per-path)
-- Deterministic RNG hooks for reproducible runs
 
 ## Requirements
 
@@ -79,11 +91,12 @@ git clone <your-repo-url>
 cd PoE1_HTC
 ```
 
-Add RePoE data files:
+Add RePoE data files from the maintained [repoe-fork](https://repoe-fork.github.io/) export
+(the original brather1ng/RePoE is no longer updated):
 
-```text
-data/mods.json
-data/base_items.json
+```bash
+curl -o data/mods.json https://repoe-fork.github.io/mods.json
+curl -o data/base_items.json https://repoe-fork.github.io/base_items.json
 ```
 
 Build the project:
@@ -128,30 +141,81 @@ stat = "base_maximum_life"
 min_value = 90            # only satisfied by a T2+ roll
 weight = 5.0
 
+[[methods]]               # optional: extra crafts beyond the default orbs
+type = "harvest"           # essence | bench | fossil | harvest | eldritch_chaos | eldritch_exalt
+op = "augment"
+target = "life"
+cost = 30.0
+
 [search]
 beam_width = 20
 max_steps = 8
-cost_weight = 0.05        # chaos-cost penalty per point of score
+cost_weight = 0.05        # penalty per point of EXPECTED chaos spent
+# seed = 42               # set for a reproducible search
+```
+
+To start from an item you already own instead of a fresh base, describe it in
+`[item]` (see `goals/finish_fractured_chest.toml` for a full example):
+
+```toml
+[item]
+base = "Astral Plate"
+item_level = 86
+rarity = "rare"
+
+[[item.mods]]
+mod_id = "IncreasedLife9"   # RePoE mod ID
+values = [95]               # actual roll; omit for midpoint
+fractured = true            # survives rerolls
 ```
 
 Then run the optimizer (release mode recommended — the mod pool is large):
 
 ```bash
 cargo run --release -- --goal goals/example_life_chest.toml
+cargo run --release -- --goal goals/mirror_tier_chest.toml --top 4   # several pathways
 ```
 
-Output shows the best path found, its estimated chaos cost, the final item's
-mods, and a checklist of which wants were satisfied. CLI flags
-(`--beam-width`, `--max-steps`, `--cost-weight`, `--base-item`) override the
-goal file's values.
+Bundled example goals: `example_life_chest.toml` (budget craft),
+`finish_fractured_chest.toml` (mid-craft rescue), `mirror_tier_chest.toml`
+(six-T1 stress test — watch the cost bounds diverge).
+
+Output shows the best path with per-step retry economics, the expected total
+cost, the final item's mods, and a checklist of which wants were satisfied.
+CLI flags (`--beam-width`, `--max-steps`, `--cost-weight`, `--base-item`,
+`--seed`) override the goal file's values.
 
 Without `--goal` the binary just verifies that the data files load.
 
-Note on probabilities: paths containing full-reroll steps (Chaos, Alchemy,
-Essence, Fossil) are Monte Carlo sampled — the reported path weight for those
-is a sample weight, not a hit chance, and the printed path is one
-representative outcome. Paths built only from exact-enumeration steps
-(Exalted, Annulment, Harvest, Scouring) report true probabilities.
+### How costs and probabilities are reported
+
+For each step the engine computes the chance that a single application scores
+at least as well as the outcome on the printed path:
+
+- **Repeatable steps** (Transmutation, Alteration, Alchemy, Chaos, Essence,
+  Fossil, Divine) can be rerolled on a miss, so they are priced at
+  `cost / hit-chance` and always "succeed" eventually.
+- **One-shot steps** (Augmentation, Regal, Exalted, Annulment, Harvest, bench)
+  change the item on a miss; they are priced once and the path reports the
+  combined chance that all of them land this well.
+
+When a path contains one-shot randomness, a second figure is printed: the
+expected cost under a **restart-on-miss** policy (any one-shot miss scraps the
+item and the plan restarts from the base). The truth lies between the two
+bounds — a real crafter often recovers more cheaply than a full restart.
+
+Probabilities for full-reroll methods are Monte Carlo estimates with
+resolution 1/50 (marked `~` in the output); exact-enumeration methods report
+true probabilities.
+
+To use your league's prices instead of the built-in approximations, add a
+`[prices]` table to the goal file keyed by method display name:
+
+```toml
+[prices]
+"Divine Orb" = 220.0
+"Exalted Orb" = 45.0
+```
 
 ## Architecture
 
@@ -189,11 +253,17 @@ pub trait CraftingMethod: Send + Sync {
     fn name(&self) -> &str;
     fn cost_chaos(&self) -> f64;
     fn can_apply(&self, item: &ItemState, db: &GameData) -> bool;
-    fn apply(&self, item: &ItemState, db: &GameData) -> Result<Vec<(ItemState, f64)>>;
+    fn apply(&self, item: &ItemState, db: &GameData, rng: &mut dyn RngCore)
+        -> Result<Vec<(ItemState, f64)>>;
+    fn weights_are_probabilities(&self) -> bool; // false for Monte Carlo methods
+    fn repeatable_on_failure(&self) -> bool;     // true for reroll methods
 }
 ```
 
-`apply` returns successor item states with probabilities. Deterministic crafts return one successor. Probabilistic crafts may enumerate exact outcomes or use sampled outcomes where exact enumeration is too large.
+`apply` returns successor item states with probabilities. Deterministic crafts
+return one successor. Probabilistic crafts may enumerate exact outcomes or use
+sampled outcomes where exact enumeration is too large. All randomness flows
+through the injected `rng`, which is what makes seeded searches reproducible.
 
 ## Important Implementation Rules
 
@@ -216,11 +286,11 @@ cargo fmt
 
 ## Roadmap
 
-- Expose essences, fossils, harvest, and eldritch crafts through the goal file
+- Smarter recovery policies between the optimistic and restart-on-miss cost
+  bounds (a missed aug realistically loops back through Alteration)
 - Improve probability handling for full rerolls (exact where practical)
-- Estimate expected total cost over repeated attempts, not just per-path cost
+- Metamods (prefixes-cannot-be-changed) and Awakener's Orb mod transfer
 - Add benchmark fixtures for large RePoE mod pools
-- Add deterministic RNG hooks for reproducible tests
 
 ## Disclaimer
 

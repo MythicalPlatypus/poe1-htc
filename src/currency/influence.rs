@@ -5,6 +5,7 @@ use super::CraftingMethod;
 use crate::data::GameData;
 use crate::item::{state::Rarity, ItemState};
 use anyhow::{bail, Result};
+use rand::RngCore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Influence {
@@ -34,7 +35,12 @@ impl CraftingMethod for ApplyInfluence {
         item.is_craftable() && item.rarity == Rarity::Normal
     }
 
-    fn apply(&self, item: &ItemState, db: &GameData) -> Result<Vec<(ItemState, f64)>> {
+    fn apply(
+        &self,
+        item: &ItemState,
+        db: &GameData,
+        _rng: &mut dyn RngCore,
+    ) -> Result<Vec<(ItemState, f64)>> {
         if !self.can_apply(item, db) {
             bail!("Cannot apply influence to this item");
         }
@@ -66,7 +72,12 @@ impl CraftingMethod for AwakenersOrb {
         item.is_craftable() && item.rarity == Rarity::Normal
     }
 
-    fn apply(&self, item: &ItemState, db: &GameData) -> Result<Vec<(ItemState, f64)>> {
+    fn apply(
+        &self,
+        item: &ItemState,
+        db: &GameData,
+        _rng: &mut dyn RngCore,
+    ) -> Result<Vec<(ItemState, f64)>> {
         if !self.can_apply(item, db) {
             bail!("Cannot apply Awakener's Orb");
         }
