@@ -4,7 +4,7 @@
 //! Costs are rough chaos-equivalent market values and only need to be right
 //! relative to each other; tune per league via a price source if desired.
 
-use super::{CraftingMethod, MONTE_CARLO_SAMPLES};
+use super::{random_rare_affix_count, CraftingMethod, RerollKind, MONTE_CARLO_SAMPLES};
 use crate::data::mods::{GenerationType, ModStat};
 use crate::data::GameData;
 use crate::engine::mod_pool::{eligible_mods, random_rolls_pub, roll_mods};
@@ -157,6 +157,9 @@ impl CraftingMethod for OrbOfTransmutation {
     fn weights_are_probabilities(&self) -> bool {
         false
     }
+    fn reroll_initializer_kind(&self) -> Option<RerollKind> {
+        Some(RerollKind::MagicExplicit)
+    }
     fn can_apply(&self, item: &ItemState, db: &GameData) -> bool {
         item.is_craftable()
             && item.rarity == Rarity::Normal
@@ -206,6 +209,12 @@ impl CraftingMethod for OrbOfAlteration {
         false
     }
     fn repeatable_on_failure(&self) -> bool {
+        true
+    }
+    fn reroll_kind(&self) -> Option<RerollKind> {
+        Some(RerollKind::MagicExplicit)
+    }
+    fn consumes_reroll_initializer(&self) -> bool {
         true
     }
 
@@ -338,6 +347,9 @@ impl CraftingMethod for OrbOfAlchemy {
     fn weights_are_probabilities(&self) -> bool {
         false
     }
+    fn reroll_initializer_kind(&self) -> Option<RerollKind> {
+        Some(RerollKind::RareExplicit)
+    }
     fn can_apply(&self, item: &ItemState, db: &GameData) -> bool {
         item.is_craftable()
             && item.rarity == Rarity::Normal
@@ -360,7 +372,7 @@ impl CraftingMethod for OrbOfAlchemy {
         for _ in 0..MONTE_CARLO_SAMPLES {
             let mut next = item.clone();
             next.rarity = Rarity::Rare;
-            let count = rand::Rng::random_range(&mut *rng, 4..=6);
+            let count = random_rare_affix_count(rng);
             roll_to_total_affixes(&mut next, count, db, rng)?;
             outcomes.push((next, prob));
         }
@@ -386,6 +398,12 @@ impl CraftingMethod for ChaosOrb {
         false
     }
     fn repeatable_on_failure(&self) -> bool {
+        true
+    }
+    fn reroll_kind(&self) -> Option<RerollKind> {
+        Some(RerollKind::RareExplicit)
+    }
+    fn consumes_reroll_initializer(&self) -> bool {
         true
     }
 
@@ -416,7 +434,7 @@ impl CraftingMethod for ChaosOrb {
             next.prefixes.clear();
             next.suffixes.clear();
             next.crafted_mod = None;
-            let count = rand::Rng::random_range(&mut *rng, 4..=6);
+            let count = random_rare_affix_count(rng);
             roll_to_total_affixes(&mut next, count, db, rng)?;
             outcomes.push((next, prob));
         }

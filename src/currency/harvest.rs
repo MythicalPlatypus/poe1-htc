@@ -9,9 +9,9 @@
 //!   non-influenced item.
 
 use anyhow::{bail, Result};
-use rand::{Rng, RngCore};
+use rand::RngCore;
 
-use super::{CraftingMethod, MONTE_CARLO_SAMPLES};
+use super::{random_rare_affix_count, CraftingMethod, RerollKind, MONTE_CARLO_SAMPLES};
 use crate::data::mods::GenerationType;
 use crate::data::GameData;
 use crate::engine::mod_pool::{
@@ -145,6 +145,12 @@ impl CraftingMethod for HarvestCraft {
     fn repeatable_on_failure(&self) -> bool {
         self.op == HarvestOp::Reforge
     }
+    fn reroll_kind(&self) -> Option<RerollKind> {
+        (self.op == HarvestOp::Reforge).then_some(RerollKind::RareExplicit)
+    }
+    fn consumes_reroll_initializer(&self) -> bool {
+        self.op == HarvestOp::Reforge
+    }
 
     fn can_apply(&self, item: &ItemState, _db: &GameData) -> bool {
         if !item.is_craftable() || item.rarity != Rarity::Rare {
@@ -211,7 +217,7 @@ fn harvest_reforge(
             .ok_or_else(|| anyhow::anyhow!("no eligible '{tag}' modifier for Harvest reforge"))?;
         add_modifier(&mut next, mod_id, picked, rng)?;
 
-        let desired_total: usize = rng.random_range(4..=6);
+        let desired_total = random_rare_affix_count(rng);
         let remaining = desired_total.saturating_sub(next.mod_count());
         roll_mods(&mut next, remaining, db, rng)?;
         outcomes.push((next, sample_weight));

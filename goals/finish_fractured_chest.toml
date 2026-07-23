@@ -1,7 +1,8 @@
 # "Finish my craft" example: you already own a rare Astral Plate with a
-# fractured T1 life prefix (rolled 95) and a junk strength suffix. Find the
+# fractured T1 life prefix (rolled 180) and a junk strength suffix. Find the
 # cheapest way to turn it into a life + tri-res chest WITHOUT losing the
-# fracture (fractured mods survive rerolls; Scouring is blocked on them).
+# fracture (fractured mods survive rerolls; Scouring leaves the fracture and
+# changes a one-fracture item to Magic rarity).
 #
 #   cargo run --release -- --goal goals/finish_fractured_chest.toml --top 3
 
@@ -12,8 +13,8 @@ rarity = "rare"
 
 # The mod we're protecting — fractured, with its actual roll.
 [[item.mods]]
-mod_id = "IncreasedLife9"
-values = [95]
+mod_id = "IncreasedLife12"
+values = [180]
 fractured = true
 
 # Junk that came with the item (values omitted = midpoint roll).
@@ -23,7 +24,7 @@ mod_id = "Strength4"
 # Keep the life (already satisfied by the fracture — anchors the score).
 [[wants]]
 stat = "base_maximum_life"
-min_value = 90
+min_value = 175
 weight = 10.0
 
 [[wants]]
@@ -45,4 +46,5 @@ weight = 8.0
 beam_width = 25
 max_steps = 8
 cost_weight = 0.05
+restart_cost = 1.0
 top = 3

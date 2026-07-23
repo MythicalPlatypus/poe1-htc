@@ -46,7 +46,8 @@ name = "Bench: +# to maximum Life"
 mod_id = "EinharMasterIncreasedLife5_"
 cost = 3.0
 
-# Harvest "augment life" — adds a life mod if the item has none.
+# Current Harvest augment — adds a life mod and removes another random mod.
+# It only applies to a non-influenced Rare item.
 [[methods]]
 type = "harvest"
 op = "augment"
@@ -57,19 +58,19 @@ cost = 30.0
 
 [[methods]]                     # Essence that guarantees a specific mod
 type = "essence"
-name = "Deafening Essence of Greed"
-mod_id = "IncreasedLife8"       # the guaranteed mod's RePoE ID
+essence = "Deafening Essence of Greed"
 cost = 5.0
 
-[[methods]]                     # Fossil reroll biased toward life mods
+[[methods]]                     # Catalog supplies exact weights and blocked tags
 type = "fossil"
-name = "Pristine Fossil"
+fossil = "Pristine Fossil"
 cost = 10.0
-boosted_tags = ["life"]
 
-[[methods]]                     # Eldritch implicit reroll (rare + eldritch base only)
-type = "eldritch_chaos"
-god = "exarch"                  # exarch | eater
+# Eldritch currency needs an existing dominant implicit. To model a mid-craft,
+# set [item].exarch_implicit / eater_implicit to RePoE mod IDs, then enable:
+# [[methods]]
+# type = "eldritch_chaos"
+# god = "exarch"                # the currently dominant side
 
 # Search parameters. cost_weight is the penalty per point of EXPECTED chaos
 # spent (reroll steps are priced at cost / hit-chance): with want weights
@@ -79,4 +80,5 @@ god = "exarch"                  # exarch | eater
 beam_width = 40
 max_steps = 30
 cost_weight = 0.02
+restart_cost = 1.0
 #seed = 42

@@ -133,68 +133,12 @@ pub enum GenerationType {
     Blight,
     Monster,
     Tempest,
-    #[serde(
-        rename = "searing_exarch_implicit",
-        alias = "exarch_implicit"
-    )]
+    #[serde(rename = "searing_exarch_implicit", alias = "exarch_implicit")]
     ExarchImplicit,
-    #[serde(
-        rename = "eater_of_worlds_implicit",
-        alias = "eater_implicit"
-    )]
+    #[serde(rename = "eater_of_worlds_implicit", alias = "eater_implicit")]
     EaterImplicit,
     #[serde(other)]
     Unknown,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_current_repoe_eldritch_and_implicit_tags() {
-        let parsed: Mod = serde_json::from_str(
-            r#"{
-                "name": "",
-                "generation_type": "searing_exarch_implicit",
-                "required_level": 75,
-                "stats": [],
-                "spawn_weights": [{"tag":"gloves","weight":1000}],
-                "generation_weights": [],
-                "adds_tags": [],
-                "implicit_tags": ["attack", "speed"],
-                "domain": "item",
-                "type": "IncreasedAttackSpeed",
-                "groups": ["IncreasedAttackSpeed"],
-                "is_essence_only": false
-            }"#,
-        )
-        .expect("current RePoE mod shape should parse");
-
-        assert_eq!(parsed.generation_type, GenerationType::ExarchImplicit);
-        assert_eq!(parsed.tags, ["attack", "speed"]);
-    }
-
-    #[test]
-    fn accepts_legacy_generation_and_tag_names() {
-        let parsed: Mod = serde_json::from_str(
-            r#"{
-                "name": "",
-                "generation_type": "eater_implicit",
-                "required_level": 1,
-                "stats": [],
-                "spawn_weights": [],
-                "tags": ["cold"],
-                "domain": "item",
-                "type": "Cold",
-                "groups": []
-            }"#,
-        )
-        .expect("legacy fixture shape should parse");
-
-        assert_eq!(parsed.generation_type, GenerationType::EaterImplicit);
-        assert_eq!(parsed.tags, ["cold"]);
-    }
 }
 
 impl Mod {
@@ -248,5 +192,55 @@ impl Mod {
             .find(|sw| sw.tag == "default")
             .map(|sw| sw.weight)
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_current_repoe_eldritch_and_implicit_tags() {
+        let parsed: Mod = serde_json::from_str(
+            r#"{
+                "name": "",
+                "generation_type": "searing_exarch_implicit",
+                "required_level": 75,
+                "stats": [],
+                "spawn_weights": [{"tag":"gloves","weight":1000}],
+                "generation_weights": [],
+                "adds_tags": [],
+                "implicit_tags": ["attack", "speed"],
+                "domain": "item",
+                "type": "IncreasedAttackSpeed",
+                "groups": ["IncreasedAttackSpeed"],
+                "is_essence_only": false
+            }"#,
+        )
+        .expect("current RePoE mod shape should parse");
+
+        assert_eq!(parsed.generation_type, GenerationType::ExarchImplicit);
+        assert_eq!(parsed.tags, ["attack", "speed"]);
+    }
+
+    #[test]
+    fn accepts_legacy_generation_and_tag_names() {
+        let parsed: Mod = serde_json::from_str(
+            r#"{
+                "name": "",
+                "generation_type": "eater_implicit",
+                "required_level": 1,
+                "stats": [],
+                "spawn_weights": [],
+                "tags": ["cold"],
+                "domain": "item",
+                "type": "Cold",
+                "groups": []
+            }"#,
+        )
+        .expect("legacy fixture shape should parse");
+
+        assert_eq!(parsed.generation_type, GenerationType::EaterImplicit);
+        assert_eq!(parsed.tags, ["cold"]);
     }
 }

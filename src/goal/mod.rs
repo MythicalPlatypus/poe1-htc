@@ -48,15 +48,19 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::currency::{
+    beastcraft::{BestiaryAffixSwapCraft, BestiaryAffixSwapKind},
     bench::BenchCraft,
     eldritch::{EldritchChaosOrb, EldritchExaltedOrb, EldritchGod, EldritchOrbOfAnnulment},
     essences::Essence,
     fossils::{FossilCraft, FossilModifier},
     harvest::{HarvestCraft, HarvestOp, HarvestTarget},
+    influence::{ConquerorExaltedOrb, Influence},
     CraftingMethod,
 };
+use crate::data::base_items::BaseItem;
 use crate::data::mods::{Domain, GenerationType};
 use crate::data::GameData;
+use crate::engine::mod_pool::FossilWeightRule;
 use crate::item::modifier::StatRoll;
 use crate::item::state::Rarity;
 use crate::item::{ItemState, Modifier};
@@ -67,6 +71,51 @@ fn default_item_level() -> u32 {
 
 fn default_weight() -> f64 {
     1.0
+}
+
+fn repoe_influence_pool_tag(base_tags: &[String], influence: &str) -> Option<String> {
+    let class = if base_tags.iter().any(|tag| tag == "two_hand_weapon") {
+        ["axe", "mace", "sword"]
+            .into_iter()
+            .find(|class| base_tags.iter().any(|tag| tag == class))
+            .map(|class| format!("2h_{class}"))
+    } else {
+        [
+            "body_armour",
+            "rune_dagger",
+            "warstaff",
+            "amulet",
+            "belt",
+            "boots",
+            "bow",
+            "claw",
+            "dagger",
+            "gloves",
+            "helmet",
+            "quiver",
+            "ring",
+            "sceptre",
+            "shield",
+            "staff",
+            "wand",
+            "axe",
+            "mace",
+            "sword",
+        ]
+        .into_iter()
+        .find(|class| base_tags.iter().any(|tag| tag == class))
+        .map(str::to_string)
+    }?;
+    let suffix = match influence {
+        "shaper" => "shaper",
+        "elder" => "elder",
+        "crusader" => "crusader",
+        "hunter" => "basilisk",
+        "redeemer" => "eyrie",
+        "warlord" => "adjudicator",
+        _ => return None,
+    };
+    Some(format!("{class}_{suffix}"))
 }
 
 /// Top-level goal file.
@@ -98,6 +147,7 @@ pub struct GoalSpec {
 /// base = "Astral Plate"
 /// item_level = 86
 /// rarity = "rare"                  # normal (default) | magic | rare
+/// influences = ["hunter"]          # up to two existing influences
 /// exarch_implicit = "ExampleEldritchImplicit3"
 /// eater_implicit = "OtherEldritchImplicit4"
 ///
@@ -125,6 +175,10 @@ pub struct ItemSpec {
     /// Mods already on the item when crafting starts.
     #[serde(default)]
     pub mods: Vec<StartingModSpec>,
+    /// Existing item influences: shaper, elder, crusader, hunter, redeemer,
+    /// or warlord. At most two may be present.
+    #[serde(default)]
+    pub influences: Vec<String>,
     /// Existing Searing Exarch implicit mod ID, for starting from a mid-craft.
     pub exarch_implicit: Option<String>,
     /// Existing Eater of Worlds implicit mod ID, for starting from a mid-craft.
@@ -167,6 +221,40 @@ impl ItemSpec {
             Some(other) => bail!("[item] rarity '{other}' (expected normal, magic, or rare)"),
         };
 
+        if self.influences.len() > 2 {
+            bail!("[item] influences may contain at most two entries");
+        }
+        let mut influence_tags = std::collections::HashSet::new();
+        for influence in &self.influences {
+            let tag = match influence.as_str() {
+                "shaper" => "shaper_item",
+                "elder" => "elder_item",
+                "crusader" => "crusader_item",
+                "hunter" => "hunter_item",
+                "redeemer" => "redeemer_item",
+                "warlord" => "warlord_item",
+                other => bail!(
+                    "[item] unknown influence '{other}' (expected shaper, elder, crusader, hunter, redeemer, or warlord)"
+                ),
+            };
+            if !influence_tags.insert(tag) {
+                bail!("[item] duplicate influence '{influence}'");
+            }
+            item.base_tags.push(tag.to_string());
+            let pool_tag =
+                repoe_influence_pool_tag(&item.base_tags, influence).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[item] influence '{influence}' is unsupported for this base item class"
+                    )
+                })?;
+            item.base_tags.push(pool_tag);
+        }
+        if !self.influences.is_empty()
+            && (self.exarch_implicit.is_some() || self.eater_implicit.is_some())
+        {
+            bail!("[item] influenced items cannot have Eldritch implicits");
+        }
+
         item.exarch_implicit = self.build_eldritch_implicit(
             self.exarch_implicit.as_deref(),
             GenerationType::ExarchImplicit,
@@ -191,6 +279,9 @@ impl ItemSpec {
             })?;
             if spec.fractured && spec.crafted {
                 bail!("[[item.mods]] entry {i}: a mod cannot be both fractured and crafted");
+            }
+            if spec.fractured && !self.influences.is_empty() {
+                bail!("[[item.mods]] entry {i}: influenced items cannot be fractured");
             }
             if !matches!(
                 m.generation_type,
@@ -395,6 +486,8 @@ pub struct SearchSpec {
     /// Cost penalty per expected chaos in node ranking; tune relative to the sum
     /// of want weights. 0.0 ignores cost entirely (the search will happily exalt-spam).
     pub cost_weight: Option<f64>,
+    /// Cost to restore or replace the starting base after a failed one-shot path.
+    pub restart_cost: Option<f64>,
     /// RNG seed for reproducible searches. Omit for a fresh random search per run.
     pub seed: Option<u64>,
     /// How many distinct pathways to report (default 1).
@@ -410,8 +503,7 @@ fn default_bench_cost() -> f64 {
 /// ```toml
 /// [[methods]]
 /// type = "essence"
-/// mod_id = "IncreasedLife5"     # the mod the essence guarantees
-/// name = "Essence of Greed"     # optional display name
+/// essence = "Deafening Essence of Greed" # metadata ID also accepted
 /// cost = 5.0
 ///
 /// [[methods]]
@@ -426,13 +518,22 @@ fn default_bench_cost() -> f64 {
 ///
 /// [[methods]]
 /// type = "fossil"
-/// name = "Pristine Fossil"
+/// fossil = "Pristine Fossil"    # metadata ID also accepted
 /// cost = 10.0
-/// boosted_tags = ["life"]
 ///
 /// [[methods]]
 /// type = "eldritch_chaos"       # or "eldritch_exalt" / "eldritch_annul"
 /// god = "exarch"                # exarch | eater
+///
+/// [[methods]]
+/// type = "conqueror_exalt"
+/// influence = "hunter"          # crusader | hunter | redeemer | warlord
+///
+/// [[methods]]
+/// type = "bestiary_swap"
+/// add = "prefix"                # prefix | suffix
+/// beast_level = 83
+/// cost = 12.0
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -440,7 +541,13 @@ pub enum MethodSpec {
     /// Guarantees `mod_id`, rerolls the rest (Monte Carlo).
     Essence {
         name: Option<String>,
-        mod_id: String,
+        /// RePoE essence metadata ID or case-insensitive display name.
+        #[serde(default)]
+        essence: Option<String>,
+        /// Legacy escape hatch. Catalog-backed runs validate it against the
+        /// selected base class; prefer `essence`.
+        #[serde(default)]
+        mod_id: Option<String>,
         cost: f64,
     },
     /// Deterministically adds crafted mod `mod_id` (must have domain = "crafted").
@@ -455,6 +562,9 @@ pub enum MethodSpec {
     /// to socket more fossils into the same resonator.
     Fossil {
         name: Option<String>,
+        /// RePoE fossil metadata ID or case-insensitive display name.
+        #[serde(default)]
+        fossil: Option<String>,
         cost: f64,
         #[serde(default)]
         boosted_tags: Vec<String>,
@@ -480,12 +590,23 @@ pub enum MethodSpec {
     EldritchExalt { god: String },
     /// Removes an explicit prefix/suffix selected by Eldritch dominance.
     EldritchAnnul { god: String },
+    /// Adds one Conqueror-exclusive affix and applies that influence.
+    ConquerorExalt { influence: String },
+    /// Bestiary: remove a random opposite-side affix and add the requested side.
+    BestiarySwap {
+        add: String,
+        beast_level: u32,
+        cost: f64,
+    },
 }
 
 /// One fossil inside a multi-fossil resonator (`[[methods.fossils]]`).
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FossilPartSpec {
+    /// RePoE fossil metadata ID or case-insensitive display name.
+    #[serde(default)]
+    pub fossil: Option<String>,
     #[serde(default)]
     pub boosted_tags: Vec<String>,
     #[serde(default)]
@@ -502,27 +623,92 @@ impl MethodSpec {
             Self::Essence { cost, .. }
             | Self::Bench { cost, .. }
             | Self::Fossil { cost, .. }
-            | Self::Harvest { cost, .. } => Some(*cost),
+            | Self::Harvest { cost, .. }
+            | Self::BestiarySwap { cost, .. } => Some(*cost),
             Self::EldritchChaos { .. }
             | Self::EldritchExalt { .. }
-            | Self::EldritchAnnul { .. } => None,
+            | Self::EldritchAnnul { .. }
+            | Self::ConquerorExalt { .. } => None,
         }
     }
 
     /// Build the runtime `CraftingMethod`, validating references against the DB
     /// so a typo'd mod ID fails at load time rather than mid-search.
     pub fn build(&self, db: &GameData) -> Result<Arc<dyn CraftingMethod>> {
+        self.build_with_item(db, None)
+    }
+
+    /// Build with the selected base context, enabling class-aware validation
+    /// and named essence/fossil resolution from the optional RePoE catalogs.
+    pub fn build_for_item(
+        &self,
+        db: &GameData,
+        base: &BaseItem,
+        _item_level: u32,
+    ) -> Result<Arc<dyn CraftingMethod>> {
+        self.build_with_item(db, Some(base))
+    }
+
+    fn build_with_item(
+        &self,
+        db: &GameData,
+        base: Option<&BaseItem>,
+    ) -> Result<Arc<dyn CraftingMethod>> {
         match self {
-            MethodSpec::Essence { name, mod_id, cost } => {
-                if !db.mods.contains_key(mod_id) {
-                    bail!("[[methods]] essence: mod_id '{mod_id}' not found in mods.json");
+            MethodSpec::Essence {
+                name,
+                essence,
+                mod_id,
+                cost,
+            } => {
+                let mut catalog_name = None;
+                let mut maximum_item_level = None;
+                let mut can_reforge_rare = true;
+                let guaranteed_mod_id = match (essence, mod_id) {
+                    (Some(selector), None) => {
+                        let catalog = db.essences.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "[[methods]] essence: named essences require data/essences.json"
+                            )
+                        })?;
+                        let base = base.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "[[methods]] essence: named essence requires base-item context"
+                            )
+                        })?;
+                        let resolved =
+                            catalog.resolve_guaranteed_mod(selector, &base.item_class)?;
+                        catalog_name = Some(resolved.essence.name.clone());
+                        maximum_item_level = resolved.essence.item_level_restriction;
+                        can_reforge_rare = resolved.essence.item_level_restriction.is_none();
+                        resolved.guaranteed_mod_id.to_string()
+                    }
+                    (None, Some(mod_id)) => {
+                        if let (Some(catalog), Some(base)) = (&db.essences, base) {
+                            let resolved =
+                                catalog.resolve_by_guaranteed_mod(mod_id, &base.item_class)?;
+                            catalog_name = Some(resolved.essence.name.clone());
+                            maximum_item_level = resolved.essence.item_level_restriction;
+                            can_reforge_rare = resolved.essence.item_level_restriction.is_none();
+                        }
+                        mod_id.clone()
+                    }
+                    _ => bail!("[[methods]] essence: specify exactly one of 'essence' or 'mod_id'"),
+                };
+                if !db.mods.contains_key(&guaranteed_mod_id) {
+                    bail!(
+                        "[[methods]] essence: mod_id '{guaranteed_mod_id}' not found in mods.json"
+                    );
                 }
                 Ok(Arc::new(Essence {
                     display_name: name
                         .clone()
-                        .unwrap_or_else(|| format!("Essence ({mod_id})")),
-                    guaranteed_mod_id: mod_id.clone(),
+                        .or(catalog_name)
+                        .unwrap_or_else(|| format!("Essence ({guaranteed_mod_id})")),
+                    guaranteed_mod_id,
                     cost_chaos: *cost,
+                    max_item_level: maximum_item_level,
+                    can_reforge_rare,
                 }))
             }
             MethodSpec::Bench { name, mod_id, cost } => {
@@ -535,6 +721,9 @@ impl MethodSpec {
                         m.domain
                     );
                 }
+                if let (Some(catalog), Some(base)) = (&db.crafting_bench, base) {
+                    catalog.validate_add_explicit_mod(mod_id, &base.item_class)?;
+                }
                 Ok(Arc::new(BenchCraft {
                     display_name: name
                         .clone()
@@ -545,6 +734,7 @@ impl MethodSpec {
             }
             MethodSpec::Fossil {
                 name,
+                fossil,
                 cost,
                 boosted_tags,
                 reduced_tags,
@@ -552,29 +742,108 @@ impl MethodSpec {
                 forced_mod_ids,
                 fossils,
             } => {
-                // Fossil #1 from the flat fields, plus any [[methods.fossils]] parts.
-                let mut parts = vec![FossilModifier {
-                    boosted_tags: boosted_tags.clone(),
-                    reduced_tags: reduced_tags.clone(),
-                    blocked_mod_ids: blocked_mod_ids.clone(),
-                    forced_mod_ids: forced_mod_ids.clone(),
-                }];
-                parts.extend(fossils.iter().map(|f| FossilModifier {
-                    boosted_tags: f.boosted_tags.clone(),
-                    reduced_tags: f.reduced_tags.clone(),
-                    blocked_mod_ids: f.blocked_mod_ids.clone(),
-                    forced_mod_ids: f.forced_mod_ids.clone(),
+                let mut parts = Vec::with_capacity(1 + fossils.len());
+                let mut catalog_names = Vec::new();
+                let mut catalog_ids = std::collections::HashSet::new();
+                let raw_parts = std::iter::once((
+                    fossil.as_deref(),
+                    boosted_tags,
+                    reduced_tags,
+                    blocked_mod_ids,
+                    forced_mod_ids,
+                ))
+                .chain(fossils.iter().map(|part| {
+                    (
+                        part.fossil.as_deref(),
+                        &part.boosted_tags,
+                        &part.reduced_tags,
+                        &part.blocked_mod_ids,
+                        &part.forced_mod_ids,
+                    )
                 }));
-                for id in parts
-                    .iter()
-                    .flat_map(|p| p.blocked_mod_ids.iter().chain(p.forced_mod_ids.iter()))
-                {
+                for (selector, boosted, reduced, blocked, forced) in raw_parts {
+                    if let Some(selector) = selector {
+                        let catalog = db.fossils.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "[[methods]] fossil: named fossils require data/fossils.json"
+                            )
+                        })?;
+                        let resolved = catalog.resolve(selector)?;
+                        resolved.fossil.validate_supported_behavior()?;
+                        if !catalog_ids.insert(resolved.metadata_id) {
+                            bail!(
+                                "[[methods]] fossil: duplicate fossil '{}' in one resonator",
+                                resolved.fossil.name
+                            );
+                        }
+                        if let Some(base) = base {
+                            let tags: Vec<&str> = base.tags.iter().map(String::as_str).collect();
+                            if !resolved.fossil.is_allowed_for_item_tags(&tags) {
+                                bail!(
+                                    "[[methods]] fossil: '{}' cannot be used on item class '{}'",
+                                    resolved.fossil.name,
+                                    base.item_class
+                                );
+                            }
+                        }
+                        catalog_names.push(resolved.fossil.name.clone());
+                        let tag_weights = resolved
+                            .fossil
+                            .positive_mod_weights
+                            .iter()
+                            .chain(&resolved.fossil.negative_mod_weights)
+                            .map(|rule| FossilWeightRule {
+                                tag: rule.tag.clone(),
+                                weight: rule.weight,
+                            })
+                            .collect();
+                        parts.push(FossilModifier {
+                            boosted_tags: vec![],
+                            reduced_tags: vec![],
+                            blocked_mod_ids: vec![],
+                            forced_mod_ids: resolved.fossil.forced_mods.clone(),
+                            added_mod_ids: resolved.fossil.added_mods.clone(),
+                            tag_weights,
+                        });
+                    } else {
+                        if boosted.is_empty()
+                            && reduced.is_empty()
+                            && blocked.is_empty()
+                            && forced.is_empty()
+                        {
+                            bail!(
+                                "[[methods]] fossil: each resonator slot must name a fossil \
+                                 or define at least one manual effect"
+                            );
+                        }
+                        parts.push(FossilModifier {
+                            boosted_tags: boosted.clone(),
+                            reduced_tags: reduced.clone(),
+                            blocked_mod_ids: blocked.clone(),
+                            forced_mod_ids: forced.clone(),
+                            added_mod_ids: vec![],
+                            tag_weights: vec![],
+                        });
+                    }
+                }
+                for id in parts.iter().flat_map(|p| {
+                    p.blocked_mod_ids
+                        .iter()
+                        .chain(&p.forced_mod_ids)
+                        .chain(&p.added_mod_ids)
+                }) {
                     if !db.mods.contains_key(id) {
                         bail!("[[methods]] fossil: mod_id '{id}' not found in mods.json");
                     }
                 }
                 Ok(Arc::new(FossilCraft {
-                    display_name: name.clone().unwrap_or_else(|| "Fossil Craft".to_string()),
+                    display_name: name.clone().unwrap_or_else(|| {
+                        if catalog_names.is_empty() {
+                            "Fossil Craft".to_string()
+                        } else {
+                            catalog_names.join(" + ")
+                        }
+                    }),
                     cost_chaos: *cost,
                     fossils: parts,
                 }))
@@ -604,6 +873,28 @@ impl MethodSpec {
             MethodSpec::EldritchAnnul { god } => Ok(Arc::new(EldritchOrbOfAnnulment {
                 god: parse_god(god)?,
             })),
+            MethodSpec::ConquerorExalt { influence } => Ok(Arc::new(ConquerorExaltedOrb {
+                influence: parse_conqueror_influence(influence)?,
+            })),
+            MethodSpec::BestiarySwap {
+                add,
+                beast_level,
+                cost,
+            } => {
+                let kind = match add.as_str() {
+                    "prefix" => BestiaryAffixSwapKind::AddPrefixRemoveSuffix,
+                    "suffix" => BestiaryAffixSwapKind::AddSuffixRemovePrefix,
+                    other => bail!(
+                        "[[methods]] bestiary_swap: unknown add side '{other}' \
+                         (expected prefix or suffix)"
+                    ),
+                };
+                Ok(Arc::new(BestiaryAffixSwapCraft::new(
+                    kind,
+                    *beast_level,
+                    *cost,
+                )?))
+            }
         }
     }
 }
@@ -613,6 +904,18 @@ fn parse_god(s: &str) -> Result<EldritchGod> {
         "exarch" => Ok(EldritchGod::SearingExarch),
         "eater" => Ok(EldritchGod::EaterOfWorlds),
         other => bail!("[[methods]] eldritch: unknown god '{other}' (expected exarch or eater)"),
+    }
+}
+
+fn parse_conqueror_influence(s: &str) -> Result<Influence> {
+    match s {
+        "crusader" => Ok(Influence::Crusader),
+        "hunter" => Ok(Influence::Hunter),
+        "redeemer" => Ok(Influence::Redeemer),
+        "warlord" => Ok(Influence::Warlord),
+        other => bail!(
+            "[[methods]] conqueror_exalt: unknown influence '{other}' (expected crusader, hunter, redeemer, or warlord)"
+        ),
     }
 }
 
@@ -665,7 +968,21 @@ impl GoalSpec {
                     bail!("[[methods]] entry {i}: cost must be a positive finite number");
                 }
             }
+            if let MethodSpec::Essence {
+                essence, mod_id, ..
+            } = method
+            {
+                if essence.is_some() == mod_id.is_some() {
+                    bail!(
+                        "[[methods]] entry {i}: essence requires exactly one of \
+                         'essence' or 'mod_id'"
+                    );
+                }
+            }
             if let MethodSpec::Fossil {
+                fossil,
+                boosted_tags,
+                reduced_tags,
                 blocked_mod_ids,
                 forced_mod_ids,
                 fossils,
@@ -674,6 +991,28 @@ impl GoalSpec {
             {
                 if fossils.len() > 3 {
                     bail!("[[methods]] entry {i}: a resonator can contain at most 4 fossils");
+                }
+                if fossil.is_some()
+                    && (!boosted_tags.is_empty()
+                        || !reduced_tags.is_empty()
+                        || !blocked_mod_ids.is_empty()
+                        || !forced_mod_ids.is_empty())
+                {
+                    bail!(
+                        "[[methods]] entry {i}: named fossil cannot also use manual tag/mod fields"
+                    );
+                }
+                if let Some(part) = fossils.iter().find(|part| {
+                    part.fossil.is_some()
+                        && (!part.boosted_tags.is_empty()
+                            || !part.reduced_tags.is_empty()
+                            || !part.blocked_mod_ids.is_empty()
+                            || !part.forced_mod_ids.is_empty())
+                }) {
+                    bail!(
+                        "[[methods]] entry {i}: named fossil '{}' cannot also use manual tag/mod fields",
+                        part.fossil.as_deref().unwrap_or_default()
+                    );
                 }
                 let blocked = blocked_mod_ids
                     .iter()
@@ -687,6 +1026,11 @@ impl GoalSpec {
                     bail!(
                         "[[methods]] entry {i}: fossil mod '{id}' cannot be both blocked and forced"
                     );
+                }
+            }
+            if let MethodSpec::BestiarySwap { beast_level, .. } = method {
+                if !(1..=100).contains(beast_level) {
+                    bail!("[[methods]] entry {i}: beast_level must be between 1 and 100");
                 }
             }
         }
@@ -705,6 +1049,13 @@ impl GoalSpec {
             .is_some_and(|weight| weight < 0.0 || !weight.is_finite())
         {
             bail!("[search] cost_weight must be a non-negative finite number");
+        }
+        if self
+            .search
+            .restart_cost
+            .is_some_and(|cost| cost < 0.0 || !cost.is_finite())
+        {
+            bail!("[search] restart_cost must be a non-negative finite number");
         }
         Ok(())
     }
@@ -843,6 +1194,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::data::crafting_catalogs::{parse_essences, parse_fossils};
     use crate::data::mods::{Domain, GenerationType, Mod, ModStat, SpawnWeight};
     use crate::item::modifier::StatRoll;
     use crate::item::state::Rarity;
@@ -916,6 +1268,80 @@ mod tests {
         assert_eq!(built[0].name(), "Essence of Greed");
         assert_eq!(built[1].name(), "Harvest augment life");
         assert_eq!(built[2].name(), "Eldritch Chaos Orb (Exarch)");
+    }
+
+    #[test]
+    fn named_catalog_methods_resolve_for_the_selected_item_class() {
+        let mut mods = HashMap::new();
+        mods.insert("ChestEssenceLife".to_string(), life_mod());
+        let essences = parse_essences(
+            r#"{
+                "EssenceGreed7": {
+                    "name": "Deafening Essence of Greed",
+                    "level": 7,
+                    "item_level_restriction": null,
+                    "type": {"tier": 1, "is_corruption_only": false},
+                    "mods": {"Body Armour": "ChestEssenceLife"}
+                }
+            }"#,
+        )
+        .unwrap();
+        let fossils = parse_fossils(
+            r#"{
+                "FossilLife": {
+                    "name": "Pristine Fossil",
+                    "positive_mod_weights": [{"tag": "life", "weight": 1000}],
+                    "negative_mod_weights": [{"tag": "defences", "weight": 0}]
+                }
+            }"#,
+        )
+        .unwrap();
+        let db = GameData::new(mods, HashMap::new()).with_crafting_catalogs(
+            None,
+            Some(essences),
+            Some(fossils),
+        );
+        let base = BaseItem {
+            name: "Test Plate".to_string(),
+            item_class: "Body Armour".to_string(),
+            tags: vec!["body_armour".to_string()],
+            implicits: vec![],
+            drop_level: 1,
+            inventory_height: 3,
+            inventory_width: 2,
+        };
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Test Plate"
+            item_level = 86
+            [[wants]]
+            group = "IncreasedLife"
+            [[methods]]
+            type = "essence"
+            essence = "Deafening Essence of Greed"
+            cost = 5.0
+            [[methods]]
+            type = "fossil"
+            fossil = "Pristine Fossil"
+            cost = 10.0
+            [[methods]]
+            type = "bestiary_swap"
+            add = "prefix"
+            beast_level = 83
+            cost = 12.0
+            "#,
+        )
+        .unwrap();
+
+        let built = spec
+            .methods
+            .iter()
+            .map(|method| method.build_for_item(&db, &base, 86).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(built[0].name(), "Deafening Essence of Greed");
+        assert_eq!(built[1].name(), "Pristine Fossil");
+        assert_eq!(built[2].name(), "Add a Prefix, Remove a Random Suffix");
     }
 
     #[test]

@@ -40,7 +40,10 @@ use poe1_htc::item::{
     modifier::{Modifier, StatRoll},
     state::{ItemState, Rarity},
 };
-use poe1_htc::search::beam::{expected_cost_with_restarts, BeamConfig, BeamSearch, PathStep};
+use poe1_htc::search::beam::{
+    expected_cost_with_restarts, expected_cost_with_restarts_and_reset, BeamConfig, BeamSearch,
+    PathStep,
+};
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -221,6 +224,7 @@ fn stamp_search(cost_weight: f64) -> BeamSearch<'static> {
             beam_width: 10,
             max_steps: 3,
             cost_weight,
+            restart_cost: 0.0,
             seed: None,
         },
         empty_db(),
@@ -286,6 +290,7 @@ fn beam_search_builds_multistep_path() {
             beam_width: 4,
             max_steps: 5,
             cost_weight: 0.0,
+            restart_cost: 0.0,
             seed: None,
         },
         empty_db(),
@@ -434,6 +439,8 @@ fn essence_blocked_by_fractured_group_conflict() {
         display_name: "Essence of Conflict".to_string(),
         guaranteed_mod_id: "P0alt".to_string(),
         cost_chaos: 5.0,
+        max_item_level: None,
+        can_reforge_rare: true,
     };
     let err = essence
         .apply(&item_with_fractured_pt0(), &db, &mut test_rng())
@@ -459,6 +466,8 @@ fn essence_blocked_when_fractured_mods_fill_slots() {
         display_name: "Essence of Overflow".to_string(),
         guaranteed_mod_id: "NewPrefix".to_string(),
         cost_chaos: 5.0,
+        max_item_level: None,
+        can_reforge_rare: true,
     };
     let err = essence.apply(&item, &db, &mut test_rng()).unwrap_err();
     assert!(
@@ -474,6 +483,8 @@ fn essence_places_guaranteed_mod_in_every_outcome() {
         display_name: "Essence of Testing".to_string(),
         guaranteed_mod_id: "P2".to_string(),
         cost_chaos: 5.0,
+        max_item_level: None,
+        can_reforge_rare: true,
     };
     let outcomes = essence.apply(&rare_sword(), &db, &mut test_rng()).unwrap();
     assert_weights_sum_to_one(&outcomes, "Essence");
@@ -499,6 +510,8 @@ fn fossil_forced_mod_blocked_by_fractured_group_conflict() {
             reduced_tags: vec![],
             blocked_mod_ids: vec![],
             forced_mod_ids: vec!["P0alt".to_string()],
+            added_mod_ids: vec![],
+            tag_weights: vec![],
         }],
     };
     let err = craft
@@ -529,6 +542,8 @@ fn fossil_forced_mod_blocked_by_slot_overflow() {
             reduced_tags: vec![],
             blocked_mod_ids: vec![],
             forced_mod_ids: vec!["NewPrefix".to_string()],
+            added_mod_ids: vec![],
+            tag_weights: vec![],
         }],
     };
     let err = craft.apply(&item, &db, &mut test_rng()).unwrap_err();
@@ -553,6 +568,8 @@ fn fossil_forced_mods_conflict_with_each_other() {
             reduced_tags: vec![],
             blocked_mod_ids: vec![],
             forced_mod_ids: vec!["X1".to_string(), "X2".to_string()],
+            added_mod_ids: vec![],
+            tag_weights: vec![],
         }],
     };
     let err = craft
@@ -585,7 +602,7 @@ fn transmutation_makes_magic_with_one_or_two_mods() {
 }
 
 #[test]
-fn alteration_rerolls_magic_and_is_blocked_by_crafted_mod() {
+fn alteration_rerolls_magic_and_removes_crafted_mod() {
     let db = varied_db();
     let mut item = sword(Rarity::Magic);
     item.prefixes.push(marker("P0", GenerationType::Prefix));
@@ -599,10 +616,12 @@ fn alteration_rerolls_magic_and_is_blocked_by_crafted_mod() {
     }
 
     item.crafted_mod = Some(marker("C0", GenerationType::Suffix));
-    assert!(
-        !OrbOfAlteration.can_apply(&item, &db),
-        "alteration must be blocked while a crafted mod is present"
-    );
+    let outcomes = OrbOfAlteration
+        .apply(&item, &db, &mut test_rng())
+        .expect("Alteration should reroll the crafted modifier away");
+    assert!(outcomes
+        .iter()
+        .all(|(state, _)| state.crafted_mod.is_none()));
 }
 
 #[test]
@@ -785,6 +804,7 @@ fn run_coin_flip(repeatable: bool) -> poe1_htc::search::beam::SearchResult {
             beam_width: 4,
             max_steps: 1,
             cost_weight: 0.0,
+            restart_cost: 0.0,
             seed: None,
         },
         empty_db(),
@@ -835,17 +855,18 @@ fn step(cost: f64, p_at_least: f64, repeatable: bool) -> PathStep {
         cost,
         p_at_least,
         repeatable,
-        mc_estimate: false,
+        probability_estimate: false,
     }
 }
 
 #[test]
 fn run_k_returns_distinct_pathways_best_first() {
     let results = stamp_search(0.0).run_k(rare_sword(), stamp_score, 5);
-    // Only two distinct method sequences exist: ["pricey"] and ["cheap"].
-    assert_eq!(results.len(), 2);
+    // Two craft sequences plus the valid no-op starting-state pathway.
+    assert_eq!(results.len(), 3);
     assert_eq!(results[0].steps[0].method, "pricey", "best pathway first");
     assert_eq!(results[1].steps[0].method, "cheap");
+    assert!(results[2].steps.is_empty());
     assert_eq!(results[0].score, 6.0);
     assert_eq!(results[1].score, 5.0);
 }
@@ -856,6 +877,10 @@ fn restart_cost_formula_matches_hand_computation() {
     // One run costs 2 + 8 = 10 and completes half the time -> 20 expected.
     let steps = vec![step(2.0, 1.0, false), step(8.0, 0.5, false)];
     assert!((expected_cost_with_restarts(&steps) - 20.0).abs() < 1e-9);
+    assert!(
+        (expected_cost_with_restarts_and_reset(&steps, 3.0) - 23.0).abs() < 1e-9,
+        "one expected failed run pays one configured reset"
+    );
 
     // Reroll stage (1c at 25% -> 4c expected per run), then the same slam.
     // One run costs 4 + 8 = 12, completes half the time -> 24 expected.
@@ -901,6 +926,7 @@ fn seeded_searches_are_reproducible() {
                 beam_width: 5,
                 max_steps: 3,
                 cost_weight: 0.01,
+                restart_cost: 0.0,
                 seed: Some(7),
             },
             &db,

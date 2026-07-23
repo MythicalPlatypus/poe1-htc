@@ -58,6 +58,101 @@ fn effective_mod_weight(m: &Mod, tags: &[&str]) -> u32 {
     scaled.min(u64::from(u32::MAX)) as u32
 }
 
+/// Fossil semantic tags for one socketed fossil.
+///
+/// A fossil contributes at most one boost and one reduction to a mod, even
+/// when several tags in one list match. Separate fossils compose.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FossilTagSet {
+    pub boosted_tags: Vec<String>,
+    pub reduced_tags: Vec<String>,
+    /// Exact RePoE fossil generation-weight rules. A weight of 100 is neutral,
+    /// 1000 is 10x, 15 is 0.15x, and 0 blocks matching mods.
+    pub weight_rules: Vec<FossilWeightRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FossilWeightRule {
+    pub tag: String,
+    pub weight: u32,
+}
+
+/// Each matching fossil makes a tagged mod ten times as likely.
+pub const FOSSIL_BOOST_MULTIPLIER: u32 = 10;
+/// Each matching fossil makes a tagged mod one tenth as likely.
+pub const FOSSIL_REDUCTION_DIVISOR: u32 = 10;
+
+fn mod_matches_any_tag(m: &Mod, tags: &[String]) -> bool {
+    tags.iter()
+        .any(|fossil_tag| m.tags.iter().any(|mod_tag| mod_tag == fossil_tag))
+}
+
+/// Applies all fossil tag sets as an order-independent power-of-ten adjustment.
+///
+/// Equal boost and reduction counts cancel. Positive base weights remain
+/// positive after reductions, while boosts saturate at `u32::MAX`.
+fn apply_fossil_adjustment(base_weight: u32, m: &Mod, fossil_tag_sets: &[FossilTagSet]) -> u32 {
+    if base_weight == 0 {
+        return 0;
+    }
+
+    let boost_count = fossil_tag_sets
+        .iter()
+        .filter(|set| mod_matches_any_tag(m, &set.boosted_tags))
+        .count();
+    let reduction_count = fossil_tag_sets
+        .iter()
+        .filter(|set| mod_matches_any_tag(m, &set.reduced_tags))
+        .count();
+
+    let legacy_adjusted = if boost_count >= reduction_count {
+        let mut adjusted = u64::from(base_weight);
+        for _ in 0..(boost_count - reduction_count) {
+            if adjusted > u64::from(u32::MAX) / u64::from(FOSSIL_BOOST_MULTIPLIER) {
+                adjusted = u64::from(u32::MAX);
+                break;
+            }
+            adjusted *= u64::from(FOSSIL_BOOST_MULTIPLIER);
+        }
+        adjusted as u32
+    } else {
+        let mut divisor = 1_u64;
+        for _ in 0..(reduction_count - boost_count) {
+            divisor = match divisor.checked_mul(u64::from(FOSSIL_REDUCTION_DIVISOR)) {
+                Some(next) => next,
+                None => return 1,
+            };
+            if divisor > u64::from(base_weight) * 2 {
+                return 1;
+            }
+        }
+        ((u64::from(base_weight) + divisor / 2) / divisor).max(1) as u32
+    };
+
+    let matching_rules = fossil_tag_sets
+        .iter()
+        .flat_map(|set| &set.weight_rules)
+        .filter(|rule| m.tags.iter().any(|mod_tag| mod_tag == &rule.tag));
+    let mut numerator = u128::from(legacy_adjusted);
+    let mut denominator = 1_u128;
+    let mut matched = false;
+    for rule in matching_rules {
+        if rule.weight == 0 {
+            return 0;
+        }
+        matched = true;
+        numerator = numerator.saturating_mul(u128::from(rule.weight));
+        denominator = denominator.saturating_mul(100);
+    }
+    if !matched {
+        return legacy_adjusted;
+    }
+
+    ((numerator + denominator / 2) / denominator)
+        .max(1)
+        .min(u128::from(u32::MAX)) as u32
+}
+
 /// Returns all mods eligible to be added to `item`, given the current tags
 /// (base_tags + any `adds_tags` accumulated during an in-progress roll session).
 ///
@@ -161,11 +256,12 @@ pub fn conflict_groups(item: &ItemState, db: &GameData) -> std::collections::Has
 /// Monte Carlo reroll method (Chaos, Alchemy, Alteration, Essence, Fossil).
 ///
 /// Construction scans the craftable index ONCE, caching each candidate's
-/// base-tag spawn weight (with fossil generation-weight multipliers already
-/// applied). Each pick then only checks group conflicts and slot capacity —
-/// unless `extra_tags` from placed mods' `adds_tags` are in play, in which case
-/// weights are recomputed (adds_tags can flip a spawn weight from 0 to nonzero
-/// and vice versa because spawn_weights are first-match-wins).
+/// base-tag spawn and ordered generation weight, followed by explicit fossil
+/// semantic-tag adjustments. Each pick then only checks group conflicts and
+/// slot capacity — unless `extra_tags` from placed mods' `adds_tags` are in
+/// play, in which case weights are recomputed (adds_tags can flip a spawn
+/// weight from 0 to nonzero and vice versa because spawn_weights are
+/// first-match-wins).
 ///
 /// Pool iteration order follows the sorted craftable index, so seeded searches
 /// stay deterministic. Produces pools identical to `eligible_mods` /
@@ -173,7 +269,7 @@ pub fn conflict_groups(item: &ItemState, db: &GameData) -> std::collections::Has
 pub struct RollPool<'a> {
     entries: Vec<PoolEntry<'a>>,
     base_tags: Vec<String>,
-    generation_tags: Vec<String>,
+    fossil_tag_sets: Vec<FossilTagSet>,
 }
 
 struct PoolEntry<'a> {
@@ -189,34 +285,56 @@ impl<'a> RollPool<'a> {
         Self::with_fossils(item, &[], &[], db)
     }
 
-    /// Pool with fossil-specific modifications (blocked IDs excluded, boosted /
-    /// reduced tags baked into the multiplier).
+    /// Pool with fossil-specific modifications.
+    ///
+    /// Blocked IDs are excluded. Each fossil's semantic tags are applied after
+    /// normal ordered RePoE spawn and generation weights.
     pub fn with_fossils(
         item: &ItemState,
         blocked_mod_ids: &[String],
-        fossil_gen_tags: &[&str],
+        fossil_tag_sets: &[FossilTagSet],
+        db: &'a GameData,
+    ) -> Self {
+        Self::with_fossil_added_mods(item, blocked_mod_ids, fossil_tag_sets, &[], db)
+    }
+
+    /// Catalog-backed fossil pool, including Delve-domain mods explicitly
+    /// unlocked by `fossils.json`.
+    pub fn with_fossil_added_mods(
+        item: &ItemState,
+        blocked_mod_ids: &[String],
+        fossil_tag_sets: &[FossilTagSet],
+        added_mod_ids: &[String],
         db: &'a GameData,
     ) -> Self {
         let base_tags: Vec<String> = item.base_tags.clone();
-        let generation_tags: Vec<String> = fossil_gen_tags
-            .iter()
-            .map(|tag| (*tag).to_string())
-            .collect();
-        let tag_refs: Vec<&str> = base_tags
-            .iter()
-            .chain(generation_tags.iter())
-            .map(String::as_str)
-            .collect();
-        let entries = db
-            .craftable_mods()
+        let tag_refs: Vec<&str> = base_tags.iter().map(String::as_str).collect();
+        let mut candidates: Vec<(&str, &Mod)> = db.craftable_mods().collect();
+        candidates.extend(added_mod_ids.iter().filter_map(|id| {
+            db.mods
+                .get_key_value(id)
+                .map(|(stored_id, m)| (stored_id.as_str(), m))
+        }));
+        candidates.sort_by_key(|(id, _)| *id);
+        candidates.dedup_by_key(|(id, _)| *id);
+
+        let entries = candidates
+            .into_iter()
             .filter_map(|(id, m)| {
+                if !matches!(
+                    m.generation_type,
+                    GenerationType::Prefix | GenerationType::Suffix
+                ) {
+                    return None;
+                }
                 if m.required_level > item.item_level {
                     return None;
                 }
                 if blocked_mod_ids.iter().any(|b| b == id) {
                     return None;
                 }
-                let cached_weight = effective_mod_weight(m, &tag_refs);
+                let cached_weight =
+                    apply_fossil_adjustment(effective_mod_weight(m, &tag_refs), m, fossil_tag_sets);
                 Some(PoolEntry {
                     id,
                     m,
@@ -227,7 +345,7 @@ impl<'a> RollPool<'a> {
         Self {
             entries,
             base_tags,
-            generation_tags,
+            fossil_tag_sets: fossil_tag_sets.to_vec(),
         }
     }
 
@@ -243,7 +361,6 @@ impl<'a> RollPool<'a> {
             .base_tags
             .iter()
             .chain(extra_tags.iter())
-            .chain(self.generation_tags.iter())
             .map(String::as_str)
             .collect();
         self.entries
@@ -252,7 +369,11 @@ impl<'a> RollPool<'a> {
                 let weight = if extra_tags.is_empty() {
                     e.cached_weight
                 } else {
-                    effective_mod_weight(e.m, &effective)
+                    apply_fossil_adjustment(
+                        effective_mod_weight(e.m, &effective),
+                        e.m,
+                        &self.fossil_tag_sets,
+                    )
                 };
                 if weight == 0 {
                     return None;
@@ -338,13 +459,13 @@ pub fn roll_mods_from_pool<R: Rng + ?Sized>(
 
 /// Like `eligible_mods` but applies fossil-specific modifications:
 ///   - `blocked_mod_ids`: mod IDs completely excluded from the pool.
-///   - `fossil_gen_tags`: fossil generation tags; used to apply `generation_weights`
-///     multipliers on each mod (`weight * gw.weight / 100` for each matching tag).
+///   - `fossil_tag_sets`: one semantic boost/reduction rule per socketed fossil,
+///     applied to `Mod::tags` after normal ordered RePoE weighting.
 pub fn eligible_mods_fossil<'a>(
     item: &ItemState,
     extra_tags: &[String],
     blocked_mod_ids: &[String],
-    fossil_gen_tags: &[&str],
+    fossil_tag_sets: &[FossilTagSet],
     db: &'a GameData,
 ) -> Vec<(&'a str, &'a crate::data::mods::Mod, u32)> {
     let existing_groups: HashSet<&str> = item
@@ -353,8 +474,7 @@ pub fn eligible_mods_fossil<'a>(
         .flat_map(|m| m.groups.iter().map(|g| g.as_str()))
         .collect();
 
-    let mut effective_tags = effective_item_tags(item, extra_tags, db);
-    effective_tags.extend(fossil_gen_tags.iter().copied());
+    let effective_tags = effective_item_tags(item, extra_tags, db);
 
     db.craftable_mods()
         .filter_map(|(id, m)| {
@@ -364,7 +484,11 @@ pub fn eligible_mods_fossil<'a>(
             if blocked_mod_ids.iter().any(|b| b == id) {
                 return None;
             }
-            let effective_weight = effective_mod_weight(m, &effective_tags);
+            let effective_weight = apply_fossil_adjustment(
+                effective_mod_weight(m, &effective_tags),
+                m,
+                fossil_tag_sets,
+            );
             if effective_weight == 0 {
                 return None;
             }
@@ -1043,13 +1167,27 @@ mod tests {
 
     #[test]
     fn roll_pool_fossil_matches_eligible_mods_fossil() {
-        // "A" gets a 3x generation-weight boost from the "life" fossil tag;
-        // "B" is blocked outright.
+        // RePoE generation weighting remains item-tag driven (50% for sword),
+        // then the fossil's semantic "life" match applies a separate 10x boost.
         let mut a = make_mod(GenerationType::Prefix, 1, "TA", "sword", 100);
-        a.generation_weights = vec![GenerationWeight {
-            tag: "life".to_string(),
-            weight: 300,
-        }];
+        a.tags = vec!["life".to_string()];
+        a.spawn_weights.insert(
+            0,
+            SpawnWeight {
+                tag: "axe".to_string(),
+                weight: 200,
+            },
+        );
+        a.generation_weights = vec![
+            GenerationWeight {
+                tag: "life".to_string(),
+                weight: 300,
+            },
+            GenerationWeight {
+                tag: "sword".to_string(),
+                weight: 50,
+            },
+        ];
         let mut mods = HashMap::new();
         mods.insert("A".to_string(), a);
         mods.insert(
@@ -1059,42 +1197,159 @@ mod tests {
         let db = GameData::new(mods, HashMap::new());
         let item = rare_sword(84);
         let blocked = vec!["B".to_string()];
-        let fossil_tags = ["life"];
+        let fossils = vec![FossilTagSet {
+            boosted_tags: vec!["life".to_string()],
+            reduced_tags: vec![],
+            weight_rules: vec![],
+        }];
 
-        let pool = RollPool::with_fossils(&item, &blocked, &fossil_tags, &db);
+        let pool = RollPool::with_fossils(&item, &blocked, &fossils, &db);
         let via_pool = pool.eligible(&item, &conflict_groups(&item, &db), &[]);
-        let direct = eligible_mods_fossil(&item, &[], &blocked, &fossil_tags, &db);
+        let direct = eligible_mods_fossil(&item, &[], &blocked, &fossils, &db);
         assert_eq!(ids_and_weights(&via_pool), ids_and_weights(&direct));
         assert_eq!(via_pool.len(), 1);
-        assert_eq!(via_pool[0].2, 300, "100 base x 3.0 fossil multiplier");
+        assert_eq!(
+            via_pool[0].2, 500,
+            "100 spawn x 0.5 ordered item generation x 10 fossil boost"
+        );
+
+        let extra_tags = vec!["axe".to_string()];
+        let reweighted_cached = pool.eligible(&item, &conflict_groups(&item, &db), &extra_tags);
+        let reweighted_direct = eligible_mods_fossil(&item, &extra_tags, &blocked, &fossils, &db);
+        assert_eq!(
+            ids_and_weights(&reweighted_cached),
+            ids_and_weights(&reweighted_direct),
+            "cached fossil reweighting must retain the semantic adjustment"
+        );
+        assert_eq!(reweighted_cached[0].2, 1000);
     }
 
     #[test]
-    fn fossil_generation_weights_are_first_match_not_multiplicative() {
-        let mut m = make_mod(GenerationType::Prefix, 1, "T", "sword", 100);
-        m.generation_weights = vec![
-            GenerationWeight {
-                tag: "life".to_string(),
-                weight: 200,
-            },
-            GenerationWeight {
-                tag: "attack".to_string(),
-                weight: 300,
-            },
-        ];
+    fn fossil_reduction_lowers_weight_without_blocking_positive_mods() {
+        let mut m = make_mod(GenerationType::Prefix, 1, "T", "sword", 105);
+        m.tags = vec!["attack".to_string()];
         let db = one_mod_db("M", m);
         let item = rare_sword(84);
-        let fossil_tags = ["life", "attack"];
+        let fossils = vec![FossilTagSet {
+            boosted_tags: vec![],
+            reduced_tags: vec!["attack".to_string()],
+            weight_rules: vec![],
+        }];
 
-        let direct = eligible_mods_fossil(&item, &[], &[], &fossil_tags, &db);
-        let cached = RollPool::with_fossils(&item, &[], &fossil_tags, &db).eligible(
+        let direct = eligible_mods_fossil(&item, &[], &[], &fossils, &db);
+        let cached = RollPool::with_fossils(&item, &[], &fossils, &db).eligible(
             &item,
             &conflict_groups(&item, &db),
             &[],
         );
 
-        assert_eq!(direct[0].2, 200);
+        assert_eq!(direct[0].2, 11, "105 x 0.1 rounds to 11");
         assert_eq!(ids_and_weights(&cached), ids_and_weights(&direct));
+
+        let mut tiny = make_mod(GenerationType::Prefix, 1, "Tiny", "sword", 1);
+        tiny.tags = vec!["attack".to_string()];
+        let tiny_db = one_mod_db("tiny", tiny);
+        assert_eq!(
+            eligible_mods_fossil(&item, &[], &[], &fossils, &tiny_db)[0].2,
+            1,
+            "a reduction must not silently become a block"
+        );
+    }
+
+    #[test]
+    fn multiple_fossils_compose_once_per_fossil_and_order_independently() {
+        let mut m = make_mod(GenerationType::Prefix, 1, "T", "sword", 100);
+        m.tags = vec!["life".to_string(), "attack".to_string()];
+        let db = one_mod_db("M", m);
+        let item = rare_sword(84);
+        let fossils = vec![
+            FossilTagSet {
+                boosted_tags: vec!["life".to_string(), "attack".to_string()],
+                reduced_tags: vec![],
+                weight_rules: vec![],
+            },
+            FossilTagSet {
+                boosted_tags: vec!["life".to_string()],
+                reduced_tags: vec![],
+                weight_rules: vec![],
+            },
+            FossilTagSet {
+                boosted_tags: vec![],
+                reduced_tags: vec!["attack".to_string()],
+                weight_rules: vec![],
+            },
+        ];
+
+        let direct = eligible_mods_fossil(&item, &[], &[], &fossils, &db);
+        let cached = RollPool::with_fossils(&item, &[], &fossils, &db).eligible(
+            &item,
+            &conflict_groups(&item, &db),
+            &[],
+        );
+        assert_eq!(
+            direct[0].2, 1000,
+            "two fossil boosts and one reduction compose to one net 10x boost"
+        );
+        assert_eq!(ids_and_weights(&cached), ids_and_weights(&direct));
+
+        let reversed: Vec<FossilTagSet> = fossils.iter().cloned().rev().collect();
+        assert_eq!(
+            ids_and_weights(&eligible_mods_fossil(&item, &[], &[], &reversed, &db)),
+            ids_and_weights(&direct),
+            "socket order must not change fossil weights"
+        );
+    }
+
+    #[test]
+    fn catalog_fossil_rules_use_raw_weights_and_zero_blocks() {
+        let mut life = make_mod(GenerationType::Prefix, 1, "Life", "sword", 100);
+        life.tags = vec!["life".to_string()];
+        let mut defences = make_mod(GenerationType::Suffix, 1, "Defences", "sword", 100);
+        defences.tags = vec!["defences".to_string()];
+        let db = GameData::new(
+            [
+                ("life".to_string(), life),
+                ("defences".to_string(), defences),
+            ]
+            .into_iter()
+            .collect(),
+            HashMap::new(),
+        );
+        let item = rare_sword(84);
+        let fossils = vec![FossilTagSet {
+            boosted_tags: vec![],
+            reduced_tags: vec![],
+            weight_rules: vec![
+                FossilWeightRule {
+                    tag: "life".to_string(),
+                    weight: 600,
+                },
+                FossilWeightRule {
+                    tag: "defences".to_string(),
+                    weight: 0,
+                },
+            ],
+        }];
+
+        let pool = eligible_mods_fossil(&item, &[], &[], &fossils, &db);
+        assert_eq!(ids_and_weights(&pool), vec![("life", 600)]);
+    }
+
+    #[test]
+    fn catalog_fossil_pool_includes_explicitly_added_delve_mods() {
+        let mut delve = make_mod(GenerationType::Suffix, 1, "Delve", "sword", 200);
+        delve.domain = Domain::Delve;
+        let db = one_mod_db("delve", delve);
+        let item = rare_sword(84);
+        assert!(RollPool::new(&item, &db)
+            .eligible(&item, &conflict_groups(&item, &db), &[])
+            .is_empty());
+
+        let pool = RollPool::with_fossil_added_mods(&item, &[], &[], &["delve".to_string()], &db);
+        assert_eq!(
+            ids_and_weights(&pool.eligible(&item, &conflict_groups(&item, &db), &[])),
+            vec![("delve", 200)]
+        );
     }
 
     // ── Harvest and eldritch special pools ──────────────────────────────────

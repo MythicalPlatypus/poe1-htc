@@ -4,26 +4,32 @@
 use std::collections::HashSet;
 
 use anyhow::{bail, Result};
-use rand::{Rng, RngCore};
+use rand::RngCore;
 
-use super::{CraftingMethod, MONTE_CARLO_SAMPLES};
+use super::{random_rare_affix_count, CraftingMethod, RerollKind, MONTE_CARLO_SAMPLES};
 use crate::data::mods::GenerationType;
 use crate::data::GameData;
-use crate::engine::mod_pool::{random_rolls_pub, roll_mods_from_pool, RollPool};
+use crate::engine::mod_pool::{
+    random_rolls_pub, roll_mods_from_pool, FossilTagSet, FossilWeightRule, RollPool,
+};
 use crate::item::modifier::Modifier;
 use crate::item::{state::Rarity, ItemState};
 
 /// Describes how a fossil modifies the mod pool.
 #[derive(Debug, Clone)]
 pub struct FossilModifier {
-    /// Tags whose mods receive a positive generation_weight multiplier.
+    /// Semantic `Mod::tags` whose mods receive a 10x weight multiplier.
     pub boosted_tags: Vec<String>,
-    /// Tags whose mods receive a negative generation_weight multiplier.
+    /// Semantic `Mod::tags` whose mods receive a 0.1x weight multiplier.
     pub reduced_tags: Vec<String>,
     /// Specific mod IDs completely blocked from the pool.
     pub blocked_mod_ids: Vec<String>,
     /// Specific mod IDs forced onto the item before random rolling.
     pub forced_mod_ids: Vec<String>,
+    /// Delve-domain mods added to the ordinary candidate pool by this fossil.
+    pub added_mod_ids: Vec<String>,
+    /// Exact raw RePoE tag weights (100 is neutral, 0 blocks).
+    pub tag_weights: Vec<FossilWeightRule>,
 }
 
 /// A resonator + fossil combination applied as one crafting operation.
@@ -31,6 +37,26 @@ pub struct FossilCraft {
     pub display_name: String,
     pub cost_chaos: f64,
     pub fossils: Vec<FossilModifier>,
+}
+
+fn pool_configuration(fossils: &[FossilModifier]) -> (Vec<String>, Vec<FossilTagSet>, Vec<String>) {
+    let blocked_mod_ids = fossils
+        .iter()
+        .flat_map(|f| f.blocked_mod_ids.iter().cloned())
+        .collect();
+    let fossil_tag_sets = fossils
+        .iter()
+        .map(|f| FossilTagSet {
+            boosted_tags: f.boosted_tags.clone(),
+            reduced_tags: f.reduced_tags.clone(),
+            weight_rules: f.tag_weights.clone(),
+        })
+        .collect();
+    let added_mod_ids = fossils
+        .iter()
+        .flat_map(|f| f.added_mod_ids.iter().cloned())
+        .collect();
+    (blocked_mod_ids, fossil_tag_sets, added_mod_ids)
 }
 
 impl CraftingMethod for FossilCraft {
@@ -48,6 +74,9 @@ impl CraftingMethod for FossilCraft {
     fn repeatable_on_failure(&self) -> bool {
         true
     }
+    fn reroll_kind(&self) -> Option<RerollKind> {
+        Some(RerollKind::RareExplicit)
+    }
 
     fn can_apply(&self, item: &ItemState, _db: &GameData) -> bool {
         item.is_craftable() && matches!(item.rarity, Rarity::Normal | Rarity::Magic | Rarity::Rare)
@@ -63,22 +92,9 @@ impl CraftingMethod for FossilCraft {
             bail!("Cannot apply {}", self.display_name);
         }
 
-        // Collect blocked mod IDs and fossil generation tags once (shared across samples).
-        let blocked_mod_ids: Vec<String> = self
-            .fossils
-            .iter()
-            .flat_map(|f| f.blocked_mod_ids.iter().cloned())
-            .collect();
-        let fossil_gen_tags: Vec<&str> = self
-            .fossils
-            .iter()
-            .flat_map(|f| {
-                f.boosted_tags
-                    .iter()
-                    .map(|s| s.as_str())
-                    .chain(f.reduced_tags.iter().map(|s| s.as_str()))
-            })
-            .collect();
+        // Keep each fossil's semantic tag rules separate: one fossil contributes
+        // at most one boost and one reduction, while multiple fossils compose.
+        let (blocked_mod_ids, fossil_tag_sets, added_mod_ids) = pool_configuration(&self.fossils);
 
         // Validate all forced mods before sampling: existence, type, group conflicts, slot capacity.
         // After apply, prefixes/suffixes/crafted_mod are cleared; fractured mods remain.
@@ -153,7 +169,13 @@ impl CraftingMethod for FossilCraft {
 
         // Build the fossil-modified candidate pool once; each sample only pays
         // the cheap per-pick filtering inside roll_mods_from_pool.
-        let pool = RollPool::with_fossils(item, &blocked_mod_ids, &fossil_gen_tags, db);
+        let pool = RollPool::with_fossil_added_mods(
+            item,
+            &blocked_mod_ids,
+            &fossil_tag_sets,
+            &added_mod_ids,
+            db,
+        );
 
         let prob = 1.0 / MONTE_CARLO_SAMPLES as f64;
         let mut outcomes = Vec::with_capacity(MONTE_CARLO_SAMPLES);
@@ -194,13 +216,59 @@ impl CraftingMethod for FossilCraft {
             }
 
             // Roll remaining mods from the fossil-modified pool (4–6 total).
-            let forced_count = next.prefixes.len() + next.suffixes.len();
-            let total: usize = rng.random_range(4..=6);
-            let remaining = total.saturating_sub(forced_count);
+            let total = random_rare_affix_count(rng);
+            let remaining = total.saturating_sub(next.mod_count());
             roll_mods_from_pool(&mut next, remaining, &pool, db, rng)?;
             outcomes.push((next, prob));
         }
 
         Ok(outcomes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_configuration_preserves_fossil_boundaries_and_polarity() {
+        let fossils = vec![
+            FossilModifier {
+                boosted_tags: vec!["life".to_string()],
+                reduced_tags: vec!["attack".to_string()],
+                blocked_mod_ids: vec!["blocked_a".to_string()],
+                forced_mod_ids: vec![],
+                added_mod_ids: vec![],
+                tag_weights: vec![],
+            },
+            FossilModifier {
+                boosted_tags: vec!["defences".to_string()],
+                reduced_tags: vec!["caster".to_string()],
+                blocked_mod_ids: vec!["blocked_b".to_string()],
+                forced_mod_ids: vec![],
+                added_mod_ids: vec![],
+                tag_weights: vec![],
+            },
+        ];
+
+        let (blocked, tag_sets, added) = pool_configuration(&fossils);
+
+        assert_eq!(blocked, ["blocked_a", "blocked_b"]);
+        assert!(added.is_empty());
+        assert_eq!(
+            tag_sets,
+            [
+                FossilTagSet {
+                    boosted_tags: vec!["life".to_string()],
+                    reduced_tags: vec!["attack".to_string()],
+                    weight_rules: vec![],
+                },
+                FossilTagSet {
+                    boosted_tags: vec!["defences".to_string()],
+                    reduced_tags: vec!["caster".to_string()],
+                    weight_rules: vec![],
+                },
+            ]
+        );
     }
 }
