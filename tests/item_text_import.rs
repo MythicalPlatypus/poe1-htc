@@ -158,6 +158,92 @@ fn active_repoe_item_domains_do_not_collapse_to_unknown() {
 }
 
 #[test]
+fn specialized_domains_cannot_outrank_the_correct_abyss_jewel_affix() {
+    let abyss_resistance = test_mod(
+        GenerationType::Suffix,
+        Domain::AbyssJewel,
+        1,
+        "+(8-10)% to all Elemental Resistances",
+        &[("base_resist_all_elements_%", 8, 10)],
+        "default",
+        "AbyssAllResistances",
+        &["elemental", "resistance"],
+    );
+    let sanctum_resistance = test_mod(
+        GenerationType::Suffix,
+        Domain::SanctumRelic,
+        75,
+        "+(10-15)% to all Elemental Resistances",
+        &[("base_resist_all_elements_%", 10, 15)],
+        "default",
+        "SanctumAllResistances",
+        &["elemental", "resistance"],
+    );
+    let mut abyss_jewel = base_item("Murderous Eye Jewel");
+    abyss_jewel.item_class = "AbyssJewel".to_string();
+    abyss_jewel.tags = vec![
+        "abyss_jewel_melee".to_string(),
+        "abyss_jewel".to_string(),
+        "default".to_string(),
+    ];
+    let db = game_data_with_base(
+        "Metadata/Items/Jewels/JewelAbyssMelee",
+        abyss_jewel,
+        vec![
+            ("AbyssAllResistancesJewel1", abyss_resistance),
+            ("SanctumSpecialAllResistances", sanctum_resistance),
+        ],
+    );
+
+    let imported = import_item_text(
+        "Rarity: Rare\nVivid Gaze\nMurderous Eye Jewel\nItem Level: 86\n\
+         +10% to all Elemental Resistances",
+        &db,
+        strict_options(None),
+    )
+    .expect("a foreign Sanctum Relic domain must be excluded from an Abyss Jewel");
+
+    assert_eq!(imported.explicit_mods.len(), 1);
+    assert_eq!(
+        imported.explicit_mods[0].mod_id,
+        "AbyssAllResistancesJewel1"
+    );
+}
+
+#[test]
+fn unknown_explicit_domains_fail_closed() {
+    let unknown = test_mod(
+        GenerationType::Prefix,
+        Domain::Unknown,
+        1,
+        "+(10-15) to maximum Life",
+        &[("base_maximum_life", 10, 15)],
+        "default",
+        "UnsupportedDomainLife",
+        &["life"],
+    );
+    let db = game_data(
+        TEST_BASE_ID,
+        "Test Vest",
+        vec![("UnsupportedDomainLife1", unknown)],
+    );
+    let error = import_item_text(
+        "Rarity: Rare\nUnmapped Ward\nTest Vest\nItem Level: 86\n\
+         +12 to maximum Life",
+        &db,
+        strict_options(None),
+    )
+    .expect_err("an unmodeled RePoE domain must never be guessed as an item affix");
+
+    assert!(
+        error
+            .to_string()
+            .contains("could not resolve explicit modifier"),
+        "got: {error:#}"
+    );
+}
+
+#[test]
 fn malformed_clipboard_text_reports_context_instead_of_guessing() {
     let db = game_data(TEST_BASE_ID, "Test Vest", Vec::new());
     let error = import_item_text(
@@ -339,6 +425,94 @@ fn duplicate_base_names_use_the_displayed_base_implicit() {
         "FireAndColdResistImplicitBoots1_"
     );
     assert!(imported
+        .warnings
+        .iter()
+        .any(|warning| warning.code == "base_implicit_disambiguation"));
+}
+
+#[test]
+fn duplicate_base_names_use_the_displayed_implicit_roll_range() {
+    let legacy_life_on_hit = test_mod(
+        GenerationType::Unique,
+        Domain::Item,
+        1,
+        "Gain (3-4) Life per Enemy Hit with Attacks",
+        &[("base_life_gain_per_target", 3, 4)],
+        "quiver",
+        "LegacyQuiverImplicit",
+        &["life"],
+    );
+    let current_life_on_hit = test_mod(
+        GenerationType::Unique,
+        Domain::Item,
+        1,
+        "Gain (6-8) Life per Enemy Hit with Attacks",
+        &[("base_life_gain_per_target", 6, 8)],
+        "quiver",
+        "CurrentQuiverImplicit",
+        &["life"],
+    );
+    let mut legacy = base_item("Sharktooth Arrow Quiver");
+    legacy.item_class = "Quiver".to_string();
+    legacy.tags = vec!["quiver".to_string(), "default".to_string()];
+    legacy.implicits = vec!["LocalLifeGainPerTargetImplicit1".to_string()];
+    let mut current = legacy.clone();
+    current.implicits = vec!["LocalLifeGainPerTargetImplicit2".to_string()];
+    let db = GameData::new(
+        HashMap::from([
+            (
+                "LocalLifeGainPerTargetImplicit1".to_string(),
+                legacy_life_on_hit,
+            ),
+            (
+                "LocalLifeGainPerTargetImplicit2".to_string(),
+                current_life_on_hit,
+            ),
+        ]),
+        HashMap::from([
+            ("Metadata/Items/Weapons/Quivers/Quiver8".to_string(), legacy),
+            (
+                "Metadata/Items/Weapons/Quivers/QuiverNew3".to_string(),
+                current,
+            ),
+        ]),
+    );
+
+    let imported = import_item_text(
+        "Rarity: Rare\nViper Skewer\nSharktooth Arrow Quiver\nItem Level: 86\n\
+         Gain 7 Life per Enemy Hit with Attacks (implicit)",
+        &db,
+        strict_options(None),
+    )
+    .expect("the displayed implicit roll must select the base whose range contains it");
+
+    assert_eq!(
+        imported.base_name,
+        "Metadata/Items/Weapons/Quivers/QuiverNew3"
+    );
+    assert_eq!(
+        imported.implicit_mods[0].mod_id,
+        "LocalLifeGainPerTargetImplicit2"
+    );
+    assert!(imported
+        .warnings
+        .iter()
+        .any(|warning| warning.code == "base_implicit_disambiguation"));
+
+    let magic = import_item_text(
+        "Rarity: Magic\nGleaming Sharktooth Arrow Quiver of Testing\nItem Level: 86\n\
+         Gain 7 Life per Enemy Hit with Attacks (implicit)",
+        &db,
+        strict_options(None),
+    )
+    .expect("magic combined names must use the same implicit-range disambiguation");
+
+    assert_eq!(magic.base_name, "Metadata/Items/Weapons/Quivers/QuiverNew3");
+    assert_eq!(
+        magic.implicit_mods[0].mod_id,
+        "LocalLifeGainPerTargetImplicit2"
+    );
+    assert!(magic
         .warnings
         .iter()
         .any(|warning| warning.code == "base_implicit_disambiguation"));
@@ -602,7 +776,7 @@ fn genuinely_ambiguous_explicit_modifier_lists_sorted_candidates() {
     let ambiguous_z = test_mod(
         GenerationType::Prefix,
         Domain::Item,
-        1,
+        50,
         "+(10-20) to maximum Life",
         &[("base_maximum_life", 10, 20)],
         "body_armour",
@@ -622,7 +796,7 @@ fn genuinely_ambiguous_explicit_modifier_lists_sorted_candidates() {
         &db,
         strict_options(None),
     )
-    .expect_err("equally viable explicit modifiers must not be guessed");
+    .expect_err("required level alone must not break a clipboard-visible ambiguity");
 
     let message = error.to_string();
     let alpha = message
@@ -683,7 +857,7 @@ fn a_normal_base_prefers_its_item_domain_over_foreign_default_weights() {
 fn a_jewel_default_weight_beats_zero_weight_item_lookalikes() {
     let jewel_leech = test_mod(
         GenerationType::Suffix,
-        Domain::Unknown,
+        Domain::Misc,
         1,
         "(0.2-0.4)% of Physical Attack Damage Leeched as Life",
         &[("life_leech_from_physical_attack_damage_permyriad", 20, 40)],
@@ -816,6 +990,7 @@ fn hybrid_versus_separate_modifier_segmentation_is_rejected() {
     assert!(message.contains("ambiguous explicit modifier segmentation"));
     assert!(message.contains("ArmourLifeHybrid1"));
     assert!(message.contains("LocalArmour1"));
+    assert!(message.contains("MaximumLife1"));
 }
 
 #[test]

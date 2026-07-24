@@ -599,10 +599,10 @@ fn resolve_base<'a>(
                     .cmp(&left.name.len())
                     .then_with(|| left_id.cmp(right_id))
             });
-            let Some((id, base)) = matches.first().copied() else {
+            let Some((first_id, first_base)) = matches.first().copied() else {
                 continue;
             };
-            let longest = base.name.len();
+            let longest = first_base.name.len();
             let same_length = matches
                 .iter()
                 .take_while(|(_, candidate)| candidate.name.len() == longest)
@@ -610,10 +610,34 @@ fn resolve_base<'a>(
             if same_length > 1
                 && !matches[..same_length]
                     .iter()
-                    .all(|(_, candidate)| case_insensitive_eq(&candidate.name, &base.name))
+                    .all(|(_, candidate)| case_insensitive_eq(&candidate.name, &first_base.name))
             {
                 continue;
             }
+            let mut resolved = (first_id, first_base);
+            if same_length > 1 {
+                let implicit_matches =
+                    bases_matching_displayed_implicit(&matches[..same_length], lines, db);
+                if implicit_matches.len() == 1 {
+                    resolved = implicit_matches[0];
+                    warnings.push(ImportWarning {
+                        code: "base_implicit_disambiguation".to_string(),
+                        message: format!(
+                            "resolved duplicate inferred base name '{}' to metadata ID '{}' from its displayed implicit",
+                            resolved.1.name, resolved.0
+                        ),
+                    });
+                } else {
+                    warnings.push(ImportWarning {
+                        code: "ambiguous_base_name".to_string(),
+                        message: format!(
+                            "{} bases share inferred display name '{}'; using metadata ID '{}' deterministically",
+                            same_length, first_base.name, first_id
+                        ),
+                    });
+                }
+            }
+            let (id, base) = resolved;
             warnings.push(ImportWarning {
                 code: "inferred_base_name".to_string(),
                 message: format!(
@@ -709,11 +733,10 @@ fn bases_matching_displayed_implicit<'a>(
         .copied()
         .filter(|(_, base)| {
             base.implicits.iter().any(|id| {
-                let Some(text) = db
-                    .mods
-                    .get(id)
-                    .and_then(|modifier| modifier.text.as_deref())
-                else {
+                let Some(modifier) = db.mods.get(id) else {
+                    return false;
+                };
+                let Some(text) = modifier.text.as_deref() else {
                     return false;
                 };
                 let templates: Vec<&str> = text
@@ -723,9 +746,14 @@ fn bases_matching_displayed_implicit<'a>(
                     .collect();
                 !templates.is_empty()
                     && observed.windows(templates.len()).any(|window| {
-                        templates.iter().zip(window).all(|(template, displayed)| {
-                            capture_line(template, displayed).is_some()
-                        })
+                        let mut captures = Vec::new();
+                        for (template, displayed) in templates.iter().zip(window) {
+                            let Some(mut line_captures) = capture_line(template, displayed) else {
+                                return false;
+                            };
+                            captures.append(&mut line_captures);
+                        }
+                        !map_values(modifier, &captures, 0).is_empty()
                     })
             })
         })
@@ -844,7 +872,7 @@ fn match_sequence(
         .collect();
     if kind == SectionKind::Explicit && segmentations.len() > 1 {
         let solution_refs: Vec<&Solution> = solutions.iter().collect();
-        let candidates = ambiguous_ids(&solution_refs);
+        let candidates = all_solution_ids(&solution_refs);
         let message = format!(
             "genuinely ambiguous explicit modifier segmentation beginning at line {} (layouts: {}; candidates: {})",
             lines[0].source_line,
@@ -1105,7 +1133,11 @@ fn candidates_at(
         }
 
         for mapping in mappings {
-            let mut score = i64::from(modifier.required_level);
+            // Required level limits whether a modifier could exist, but it is
+            // not observable evidence of which overlapping tier was copied.
+            // Favoring the higher level here would silently choose between
+            // otherwise indistinguishable RePoE identities.
+            let mut score = 0;
             score += i64::try_from(mapping.matched_slots).unwrap_or(0) * 5;
             score += i64::try_from(templates.len()).unwrap_or(1) * 2_000;
             if mapping.values.is_empty() && !modifier.stats.is_empty() {
@@ -1207,43 +1239,87 @@ fn section_compatible(modifier: &Mod, kind: SectionKind, crafted: bool, base: &B
 fn explicit_domain_compatible(domain: &Domain, base: &BaseItem) -> bool {
     match domain {
         Domain::Chest | Domain::Synthesis => false,
-        Domain::Abyss => base.item_class == "AbyssJewel",
+        Domain::Abyss | Domain::AbyssJewel => {
+            base.item_class == "AbyssJewel" && base.tags.iter().any(|tag| tag == "abyss_jewel")
+        }
         Domain::Affliction => matches!(base.item_class.as_str(), "AnimalCharm" | "Jewel"),
-        Domain::Sanctum => base.item_class.contains("Relic"),
+        Domain::AfflictionCharm => {
+            base.item_class == "AnimalCharm" && base.tags.iter().any(|tag| tag == "animal_charm")
+        }
+        Domain::AfflictionJewel => {
+            base.item_class == "Jewel"
+                && base
+                    .tags
+                    .iter()
+                    .any(|tag| tag.starts_with("expansion_jewel_"))
+        }
+        Domain::Flask => base.tags.iter().any(|tag| tag == "flask"),
+        Domain::Sanctum => matches!(base.item_class.as_str(), "Relic" | "SanctumSpecialRelic"),
+        Domain::SanctumRelic => {
+            base.item_class == "SanctumSpecialRelic"
+                && base.tags.iter().any(|tag| {
+                    matches!(
+                        tag.as_str(),
+                        "str_special_relic" | "dex_special_relic" | "int_special_relic"
+                    )
+                })
+        }
         Domain::HeistEquipment => base.item_class.starts_with("HeistEquipment"),
-        Domain::Trinket => base.tags.iter().any(|tag| tag.contains("trinket")),
+        Domain::HeistNpc => {
+            base.item_class.starts_with("HeistEquipment")
+                && base.tags.iter().any(|tag| tag == "heist_equipment")
+        }
+        Domain::Trinket | Domain::HeistTrinket => {
+            matches!(base.item_class.as_str(), "Trinket" | "HeistTrinket")
+                || base
+                    .tags
+                    .iter()
+                    .any(|tag| matches!(tag.as_str(), "trinket" | "heist_trinket"))
+        }
+        Domain::Misc => {
+            base.item_class == "Jewel"
+                && base.tags.iter().any(|tag| tag == "jewel")
+                && !base
+                    .tags
+                    .iter()
+                    .any(|tag| tag.starts_with("expansion_jewel_"))
+        }
+        Domain::Tincture => {
+            base.item_class == "Tincture" && base.tags.iter().any(|tag| tag == "tincture")
+        }
+        Domain::Unknown => false,
         _ => true,
     }
 }
 
 fn domain_score(domain: &Domain, kind: SectionKind, base: &BaseItem) -> i64 {
-    let specialized_unknown_domain = matches!(
+    let specialized_base = matches!(
         base.item_class.as_str(),
-        "AbyssJewel" | "Tincture" | "AnimalCharm"
-    ) || base.item_class.starts_with("HeistEquipment");
+        "AbyssJewel" | "AnimalCharm" | "Jewel" | "Relic" | "SanctumSpecialRelic" | "Tincture"
+    ) || base.item_class.ends_with("Flask")
+        || base.item_class.starts_with("HeistEquipment")
+        || base.item_class.contains("Trinket");
     match (kind, domain) {
-        (SectionKind::Explicit, Domain::Item) if specialized_unknown_domain => 50,
+        (SectionKind::Explicit, Domain::Item) if specialized_base => 50,
         (SectionKind::Explicit, Domain::Item | Domain::Crafted) => 500,
         (SectionKind::Explicit, Domain::Delve | Domain::Veiled) => 400,
-        (SectionKind::Explicit, Domain::Abyss) if base.item_class == "AbyssJewel" => 500,
-        (SectionKind::Explicit, Domain::Affliction)
-            if matches!(base.item_class.as_str(), "AnimalCharm" | "Jewel") =>
-        {
-            500
-        }
-        (SectionKind::Explicit, Domain::Sanctum) if base.item_class.contains("Relic") => 500,
-        (SectionKind::Explicit, Domain::HeistEquipment)
-            if base.item_class.starts_with("HeistEquipment") =>
-        {
-            500
-        }
-        (SectionKind::Explicit, Domain::Trinket)
-            if base.tags.iter().any(|tag| tag.contains("trinket")) =>
-        {
-            500
-        }
-        (SectionKind::Explicit, Domain::Unknown) if specialized_unknown_domain => 500,
-        (SectionKind::Explicit, Domain::Unknown) => 0,
+        (
+            SectionKind::Explicit,
+            Domain::Abyss
+            | Domain::AbyssJewel
+            | Domain::Affliction
+            | Domain::AfflictionCharm
+            | Domain::AfflictionJewel
+            | Domain::Flask
+            | Domain::HeistEquipment
+            | Domain::HeistNpc
+            | Domain::HeistTrinket
+            | Domain::Misc
+            | Domain::Sanctum
+            | Domain::SanctumRelic
+            | Domain::Tincture
+            | Domain::Trinket,
+        ) if explicit_domain_compatible(domain, base) => 500,
         (_, Domain::Item) => 20,
         _ => 0,
     }
@@ -1869,6 +1945,21 @@ fn ambiguous_ids(solutions: &[&Solution]) -> Vec<String> {
     ids.into_iter().collect()
 }
 
+fn all_solution_ids(solutions: &[&Solution]) -> Vec<String> {
+    solutions
+        .iter()
+        .flat_map(|solution| &solution.candidates)
+        .map(|candidate| {
+            format!(
+                "{} {:?}",
+                candidate.imported.mod_id, candidate.imported.values
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn parse_annotation(raw: &str) -> Result<(String, SectionKind, bool, bool)> {
     let mut text = raw.trim().to_string();
     let mut kind = SectionKind::Explicit;
@@ -2104,6 +2195,98 @@ fn section_label(kind: SectionKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn domain_test_base(item_class: &str, tags: &[&str]) -> BaseItem {
+        BaseItem {
+            name: format!("Synthetic {item_class}"),
+            item_class: item_class.to_string(),
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            implicits: Vec::new(),
+            drop_level: 1,
+            inventory_height: 1,
+            inventory_width: 1,
+        }
+    }
+
+    #[test]
+    fn specialized_explicit_domains_are_base_specific() {
+        let compatible = [
+            (
+                Domain::AbyssJewel,
+                domain_test_base("AbyssJewel", &["abyss_jewel", "default"]),
+            ),
+            (
+                Domain::Flask,
+                domain_test_base("UtilityFlask", &["flask", "default"]),
+            ),
+            (
+                Domain::HeistNpc,
+                domain_test_base("HeistEquipmentTool", &["heist_equipment", "default"]),
+            ),
+            (
+                Domain::HeistTrinket,
+                domain_test_base("HeistTrinket", &["heist_trinket", "default"]),
+            ),
+            (
+                Domain::Misc,
+                domain_test_base("Jewel", &["jewel", "default"]),
+            ),
+            (
+                Domain::AfflictionCharm,
+                domain_test_base("AnimalCharm", &["animal_charm", "default"]),
+            ),
+            (
+                Domain::AfflictionJewel,
+                domain_test_base("Jewel", &["jewel", "expansion_jewel_large", "default"]),
+            ),
+            (
+                Domain::SanctumRelic,
+                domain_test_base("SanctumSpecialRelic", &["str_special_relic", "default"]),
+            ),
+            (
+                Domain::Tincture,
+                domain_test_base("Tincture", &["tincture", "default"]),
+            ),
+        ];
+        for (domain, base) in compatible {
+            assert!(
+                explicit_domain_compatible(&domain, &base),
+                "{domain:?} should be compatible with class {} and tags {:?}",
+                base.item_class,
+                base.tags
+            );
+            assert_eq!(
+                domain_score(&domain, SectionKind::Explicit, &base),
+                500,
+                "{domain:?} should receive the full matching-domain score"
+            );
+        }
+
+        let ordinary_jewel = domain_test_base("Jewel", &["jewel", "default"]);
+        let cluster_jewel =
+            domain_test_base("Jewel", &["jewel", "expansion_jewel_small", "default"]);
+        let ordinary_relic = domain_test_base("Relic", &["small_sanctum_relic", "default"]);
+        let atlas_relic = domain_test_base("AtlasRelic", &["atlas_relic", "default"]);
+        let ordinary_item = domain_test_base("Body Armour", &["body_armour", "default"]);
+
+        assert!(!explicit_domain_compatible(
+            &Domain::AfflictionJewel,
+            &ordinary_jewel
+        ));
+        assert!(!explicit_domain_compatible(&Domain::Misc, &cluster_jewel));
+        assert!(!explicit_domain_compatible(
+            &Domain::SanctumRelic,
+            &ordinary_relic
+        ));
+        assert!(!explicit_domain_compatible(
+            &Domain::SanctumRelic,
+            &atlas_relic
+        ));
+        assert!(!explicit_domain_compatible(
+            &Domain::Unknown,
+            &ordinary_item
+        ));
+    }
 
     #[test]
     fn parses_rendered_ranges_and_placeholders() {
