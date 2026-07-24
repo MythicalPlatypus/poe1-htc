@@ -143,9 +143,12 @@ impl ItemState {
             .chain(self.crafted_mod.iter())
     }
 
-    /// Total mod count (explicit + crafted bench mod).
+    /// Total affix-slot mod count, including fractured and crafted modifiers.
     pub fn mod_count(&self) -> usize {
-        self.prefixes.len() + self.suffixes.len() + self.crafted_mod.as_ref().map_or(0, |_| 1)
+        self.prefixes.len()
+            + self.suffixes.len()
+            + self.fractured.len()
+            + self.crafted_mod.as_ref().map_or(0, |_| 1)
     }
 
     /// Whether the item can currently be crafted on (not corrupted/mirrored).

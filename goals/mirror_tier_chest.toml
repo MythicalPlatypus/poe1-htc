@@ -1,0 +1,45 @@
+# Stress-test goal: a "mirror-tier" Astral Plate — six specific high-tier mods.
+# This is intentionally at the edge of what the model can plan: the final slams
+# are one-shot Exalts, so watch the success probability and the two cost bounds
+# diverge. Run with a seed to compare parameter tweaks fairly:
+#   cargo run --release -- --goal goals/mirror_tier_chest.toml --seed 1
+
+[item]
+base = "Astral Plate"
+item_level = 86
+
+# Prefixes: T1 life, T1 armour%, plus any flat armour.
+[[wants]]
+group = "IncreasedLife"
+stat = "base_maximum_life"
+min_value = 100          # T1 (IncreasedLife10) only
+weight = 10.0
+
+[[wants]]
+group = "DefencesPercent"
+weight = 8.0
+
+[[wants]]
+group = "BaseLocalDefences"    # flat armour
+weight = 6.0
+
+# Suffixes: near-T1 tri-res.
+[[wants]]
+stat = "base_fire_damage_resistance_%"
+min_value = 40
+weight = 8.0
+
+[[wants]]
+stat = "base_cold_damage_resistance_%"
+min_value = 40
+weight = 8.0
+
+[[wants]]
+stat = "base_lightning_damage_resistance_%"
+min_value = 40
+weight = 8.0
+
+[search]
+beam_width = 30
+max_steps = 12
+cost_weight = 0.005      # want weights sum to 48; tolerate ~200c per point

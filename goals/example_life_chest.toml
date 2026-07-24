@@ -4,14 +4,15 @@
 #   cargo run --release -- --goal goals/example_life_chest.toml
 #
 # Field reference (see src/goal/mod.rs for full semantics):
-#   [item]    base       — base item display name or RePoE metadata ID
-#             item_level — gates which mods can roll (default 84)
-#   [[wants]] mod_id     — exact RePoE mod ID (e.g. "IncreasedLife7")
-#             group      — RePoE mod group, matches any tier (e.g. "IncreasedLife")
-#             stat       — RePoE stat ID (e.g. "base_maximum_life")
-#             min_value  — minimum rolled value for `stat` (requires `stat`)
-#             weight     — score when satisfied (default 1.0, must be > 0)
-#   [search]  optional overrides; CLI flags take precedence over these
+#   [item]      base       — base item display name or RePoE metadata ID
+#               item_level — gates which mods can roll (default 84)
+#   [[wants]]   mod_id     — exact RePoE mod ID (e.g. "IncreasedLife7")
+#               group      — RePoE mod group, matches any tier (e.g. "IncreasedLife")
+#               stat       — RePoE stat ID (e.g. "base_maximum_life")
+#               min_value  — minimum rolled value for `stat` (requires `stat`)
+#               weight     — score when satisfied (default 1.0, must be > 0)
+#   [[methods]] extra crafting methods on top of the default orbs; see below
+#   [search]    optional overrides; CLI flags take precedence over these
 
 [item]
 base = "Astral Plate"
@@ -33,10 +34,51 @@ weight = 5.0
 group = "FireResistance"
 weight = 8.0
 
-# Search parameters. cost_weight is the chaos-cost penalty per point of score:
-# with weights summing to 23, a cost_weight of 0.05 means the search will spend
-# up to ~20 chaos to gain 1 point of score.
+# --- Extra crafting methods -------------------------------------------------
+# The search always has the default orbs (Scour, Transmute, Alteration,
+# Augmentation, Regal, Alchemy, Chaos, Exalt, Annulment, Divine). [[methods]]
+# entries add configured crafts on top.
+
+# Bench craft: +(71-85) to maximum Life (mods.json domain = "crafted" entry).
+[[methods]]
+type = "bench"
+name = "Bench: +# to maximum Life"
+mod_id = "EinharMasterIncreasedLife5_"
+cost = 3.0
+
+# Current Harvest augment — adds a life mod and removes another random mod.
+# It only applies to a non-influenced Rare item.
+[[methods]]
+type = "harvest"
+op = "augment"
+target = "life"
+cost = 30.0
+
+# More examples (uncomment to enable):
+
+[[methods]]                     # Essence that guarantees a specific mod
+type = "essence"
+essence = "Deafening Essence of Greed"
+cost = 5.0
+
+[[methods]]                     # Catalog supplies exact weights and blocked tags
+type = "fossil"
+fossil = "Pristine Fossil"
+cost = 10.0
+
+# Eldritch currency needs an existing dominant implicit. To model a mid-craft,
+# set [item].exarch_implicit / eater_implicit to RePoE mod IDs, then enable:
+# [[methods]]
+# type = "eldritch_chaos"
+# god = "exarch"                # the currently dominant side
+
+# Search parameters. cost_weight is the penalty per point of EXPECTED chaos
+# spent (reroll steps are priced at cost / hit-chance): with want weights
+# summing to 23, cost_weight 0.05 means the search will spend up to ~20
+# expected chaos to gain 1 point of score. Set `seed` for reproducible runs.
 [search]
-beam_width = 20
-max_steps = 8
-cost_weight = 0.05
+beam_width = 40
+max_steps = 30
+cost_weight = 0.02
+restart_cost = 1.0
+#seed = 42

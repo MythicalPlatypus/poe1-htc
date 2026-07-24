@@ -36,8 +36,11 @@ pub struct Mod {
     #[serde(default)]
     pub adds_tags: Vec<String>,
 
-    /// Tags required on the item for this mod to be eligible.
-    #[serde(default)]
+    /// Semantic modifier tags used by Harvest and related crafts.
+    ///
+    /// Current RePoE exports this field as `implicit_tags`; `tags` remains an
+    /// accepted alias for older fixtures and exports.
+    #[serde(default, rename = "implicit_tags", alias = "tags")]
     pub tags: Vec<String>,
 
     /// The domain this mod belongs to (controls which items it can appear on).
@@ -130,9 +133,9 @@ pub enum GenerationType {
     Blight,
     Monster,
     Tempest,
-    #[serde(rename = "exarch_implicit")]
+    #[serde(rename = "searing_exarch_implicit", alias = "exarch_implicit")]
     ExarchImplicit,
-    #[serde(rename = "eater_implicit")]
+    #[serde(rename = "eater_of_worlds_implicit", alias = "eater_implicit")]
     EaterImplicit,
     #[serde(other)]
     Unknown,
@@ -150,6 +153,30 @@ impl Mod {
             )
     }
 
+    /// Eldritch implicit tier of this mod, if it is an eldritch implicit.
+    ///
+    /// RePoE encodes the tier via a zero-weight gating tag
+    /// `no_tier_<N>_eldritch_implicit` on each implicit: the mod gated by
+    /// `no_tier_1_...` is the tier-1 (strongest) version. Tier 1 is best and
+    /// tier 6 is worst, matching in-game tier numbering. Embers/Ichors grant
+    /// tiers 6 (Lesser) through 3 (Exceptional); tiers 2 and 1 come only from
+    /// Orb of Conflict, which is not modeled.
+    pub fn eldritch_tier(&self) -> Option<u8> {
+        if !matches!(
+            self.generation_type,
+            GenerationType::ExarchImplicit | GenerationType::EaterImplicit
+        ) {
+            return None;
+        }
+        self.spawn_weights.iter().find_map(|sw| {
+            sw.tag
+                .strip_prefix("no_tier_")?
+                .strip_suffix("_eldritch_implicit")?
+                .parse::<u8>()
+                .ok()
+        })
+    }
+
     /// Returns the effective spawn weight for a given set of item tags.
     /// Iterates `spawn_weights` in order; first matching tag wins.
     /// Falls back to the "default" entry, or 0 if none found.
@@ -165,5 +192,55 @@ impl Mod {
             .find(|sw| sw.tag == "default")
             .map(|sw| sw.weight)
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_current_repoe_eldritch_and_implicit_tags() {
+        let parsed: Mod = serde_json::from_str(
+            r#"{
+                "name": "",
+                "generation_type": "searing_exarch_implicit",
+                "required_level": 75,
+                "stats": [],
+                "spawn_weights": [{"tag":"gloves","weight":1000}],
+                "generation_weights": [],
+                "adds_tags": [],
+                "implicit_tags": ["attack", "speed"],
+                "domain": "item",
+                "type": "IncreasedAttackSpeed",
+                "groups": ["IncreasedAttackSpeed"],
+                "is_essence_only": false
+            }"#,
+        )
+        .expect("current RePoE mod shape should parse");
+
+        assert_eq!(parsed.generation_type, GenerationType::ExarchImplicit);
+        assert_eq!(parsed.tags, ["attack", "speed"]);
+    }
+
+    #[test]
+    fn accepts_legacy_generation_and_tag_names() {
+        let parsed: Mod = serde_json::from_str(
+            r#"{
+                "name": "",
+                "generation_type": "eater_implicit",
+                "required_level": 1,
+                "stats": [],
+                "spawn_weights": [],
+                "tags": ["cold"],
+                "domain": "item",
+                "type": "Cold",
+                "groups": []
+            }"#,
+        )
+        .expect("legacy fixture shape should parse");
+
+        assert_eq!(parsed.generation_type, GenerationType::EaterImplicit);
+        assert_eq!(parsed.tags, ["cold"]);
     }
 }

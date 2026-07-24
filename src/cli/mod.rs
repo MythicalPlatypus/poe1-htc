@@ -8,18 +8,23 @@ use anyhow::{bail, Result};
 use clap::Parser;
 
 use crate::currency::{
-    orbs::{ChaosOrb, ExaltedOrb, OrbOfAlchemy, OrbOfAnnulment, OrbOfScouring},
-    CraftingMethod,
+    bench::RemoveCraftedMods,
+    fracturing::FracturingOrb,
+    orbs::{
+        ChaosOrb, DivineOrb, ExaltedOrb, OrbOfAlchemy, OrbOfAlteration, OrbOfAnnulment,
+        OrbOfAugmentation, OrbOfScouring, OrbOfTransmutation, RegalOrb,
+    },
+    CraftingMethod, Repriced,
 };
 use crate::data::GameData;
 use crate::goal::GoalSpec;
-use crate::item::ItemState;
 use crate::search::beam::{BeamConfig, BeamSearch, SearchResult};
 
 // Built-in defaults, lowest precedence (CLI flag > goal [search] > these).
 const DEFAULT_BEAM_WIDTH: usize = 50;
 const DEFAULT_MAX_STEPS: usize = 10;
 const DEFAULT_COST_WEIGHT: f64 = 0.0;
+const DEFAULT_RESTART_COST: f64 = 1.0;
 
 #[derive(Parser, Debug)]
 #[command(name = "poe1_htc", about = "Path of Exile 1 crafting path optimizer")]
@@ -47,10 +52,24 @@ pub struct Args {
     #[arg(long)]
     pub max_steps: Option<usize>,
 
-    /// Cost penalty per chaos orb in node ranking (see BeamConfig::cost_weight).
+    /// Cost penalty per expected chaos in node ranking (see BeamConfig::cost_weight).
     /// Overrides the goal file's [search] cost_weight.
     #[arg(long)]
     pub cost_weight: Option<f64>,
+
+    /// Cost to restore or replace the starting base after a failed one-shot path.
+    #[arg(long)]
+    pub restart_cost: Option<f64>,
+
+    /// RNG seed for a reproducible search.
+    /// Overrides the goal file's [search] seed.
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    /// Number of distinct crafting pathways to report (best first).
+    /// Overrides the goal file's [search] top.
+    #[arg(long)]
+    pub top: Option<usize>,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -63,6 +82,27 @@ pub fn run(args: Args) -> Result<()> {
         db.base_items.len(),
         args.data_dir
     );
+    let available_catalogs = [
+        db.crafting_bench
+            .as_ref()
+            .map(|catalog| format!("{} bench recipes", catalog.0.len())),
+        db.essences
+            .as_ref()
+            .map(|catalog| format!("{} essences", catalog.0.len())),
+        db.fossils
+            .as_ref()
+            .map(|catalog| format!("{} fossils", catalog.0.len())),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if available_catalogs.is_empty() {
+        println!(
+            "Warning: optional crafting catalogs are absent; named craft validation is unavailable"
+        );
+    } else {
+        println!("Crafting catalogs: {}", available_catalogs.join(", "));
+    }
 
     let Some(goal_path) = &args.goal else {
         println!("\nNo --goal file given; data check complete.");
@@ -72,6 +112,7 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     let goal = GoalSpec::load(goal_path)?;
+    goal.validate_against_db(&db)?;
 
     // CLI --base-item overrides the goal file's [item] base.
     let base_query = args.base_item.as_deref().unwrap_or(&goal.item.base);
@@ -94,43 +135,170 @@ pub fn run(args: Args) -> Result<()> {
             .cost_weight
             .or(goal.search.cost_weight)
             .unwrap_or(DEFAULT_COST_WEIGHT),
+        restart_cost: args
+            .restart_cost
+            .or(goal.search.restart_cost)
+            .unwrap_or(DEFAULT_RESTART_COST),
+        seed: args.seed.or(goal.search.seed),
     };
+    if config.beam_width == 0 {
+        bail!("beam_width must be greater than 0");
+    }
+    if config.max_steps == 0 {
+        bail!("max_steps must be greater than 0");
+    }
+    if config.cost_weight < 0.0 || !config.cost_weight.is_finite() {
+        bail!("cost_weight must be a non-negative finite number");
+    }
+    if config.restart_cost < 0.0 || !config.restart_cost.is_finite() {
+        bail!("restart_cost must be a non-negative finite number");
+    }
     println!(
-        "Search: beam_width={}, max_steps={}, cost_weight={}",
-        config.beam_width, config.max_steps, config.cost_weight
+        "Search: beam_width={}, max_steps={}, cost_weight={}, restart_cost={}c{}",
+        config.beam_width,
+        config.max_steps,
+        config.cost_weight,
+        config.restart_cost,
+        match config.seed {
+            Some(s) => format!(", seed={s}"),
+            None => String::new(),
+        }
     );
 
-    let methods = default_methods();
-    // Names of methods whose outcome weights are Monte Carlo sample weights —
-    // used below to label the path weight honestly.
-    let mc_names: Vec<String> = methods
-        .iter()
-        .filter(|m| !m.weights_are_probabilities())
-        .map(|m| m.name().to_string())
+    // Default orbs + any extra methods declared in the goal file.
+    let mut methods = default_methods();
+    for spec in &goal.methods {
+        methods.push(spec.build_for_item(&db, base, goal.item.item_level)?);
+    }
+    let mut method_names = std::collections::HashSet::new();
+    for method in &methods {
+        if !method_names.insert(method.name()) {
+            bail!(
+                "Duplicate crafting method name '{}'; give configured methods unique names",
+                method.name()
+            );
+        }
+    }
+    if !goal.methods.is_empty() {
+        let names: Vec<&str> = methods[methods.len() - goal.methods.len()..]
+            .iter()
+            .map(|m| m.name())
+            .collect();
+        println!("Goal methods: {}", names.join(", "));
+    }
+
+    // Apply [prices] cost overrides by display name.
+    let mut unmatched_prices: Vec<&String> = goal.prices.keys().collect();
+    let methods: Vec<Arc<dyn CraftingMethod>> = methods
+        .into_iter()
+        .map(|m| match goal.prices.get(m.name()) {
+            Some(&cost) => {
+                unmatched_prices.retain(|n| n.as_str() != m.name());
+                println!("Price override: {} = {cost} chaos", m.name());
+                Arc::new(Repriced { inner: m, cost }) as Arc<dyn CraftingMethod>
+            }
+            None => m,
+        })
         .collect();
+    for name in unmatched_prices {
+        println!("Warning: [prices] \"{name}\" matches no method name — ignored");
+    }
 
-    let initial = ItemState::new_base(base_id.clone(), base.tags.clone(), goal.item.item_level);
+    let initial = goal
+        .item
+        .build_state(base_id.clone(), base.tags.clone(), &db)?;
+    if !goal.item.mods.is_empty() {
+        println!(
+            "Starting item: {:?} with {} existing mod(s) ({} fractured, crafted: {})",
+            initial.rarity,
+            initial.prefixes.len() + initial.suffixes.len() + initial.fractured.len(),
+            initial.fractured.len(),
+            initial.crafted_mod.is_some()
+        );
+    }
+    let starting_score = goal.score(&initial, &db);
+
+    let top = args.top.or(goal.search.top).unwrap_or(1);
+    if top == 0 {
+        bail!("top must be greater than 0");
+    }
     let search = BeamSearch::new(config, &db, methods);
-    let result = search.run(initial, |s| goal.score(s, &db));
+    let results = search.run_k_to_target(initial, |s| goal.score(s, &db), top, goal.max_score());
 
-    match result {
-        Some(r) => print_result(&r, &goal, &db, &mc_names),
+    match results.first() {
+        Some(best) => {
+            if !best.warnings.is_empty() {
+                println!("\nSearch warnings (affected branches were skipped):");
+                for warning in &best.warnings {
+                    println!("  - {warning}");
+                }
+            }
+            print_result(best, &goal, &db);
+            for (i, alt) in results.iter().enumerate().skip(1) {
+                let raw_score = goal.score(&alt.state, &db);
+                let satisfied = goal.satisfied_count(&alt.state, &db);
+                let risk = if alt.steps.iter().any(|step| !step.repeatable) {
+                    format!("one-shot odds {}", fmt_prob(alt.success_prob))
+                } else {
+                    "rerolls only".to_string()
+                };
+                println!(
+                    "\n--- Alternative pathway #{} (goal {:.1}/{:.1}, {}/{} wants, ranking {:.3}, retry ~{:.1}c, restart ~{:.1}c, {}) ---",
+                    i + 1,
+                    raw_score,
+                    goal.max_score(),
+                    satisfied,
+                    goal.wants.len(),
+                    alt.score,
+                    alt.expected_cost,
+                    alt.restart_cost,
+                    risk
+                );
+                let names: Vec<&str> = alt.steps.iter().map(|s| s.method.as_str()).collect();
+                println!("  {}", names.join(", then "));
+            }
+            let best_raw_score = goal.score(&best.state, &db);
+            if starting_score >= best_raw_score {
+                println!(
+                    "\nNote: the starting item already scores {starting_score:.1}; \
+                     no found path improves its raw goal score."
+                );
+            }
+        }
         None => println!("\nNo crafting path found — no method was applicable to the base item."),
     }
     Ok(())
 }
 
-/// The default set of crafting methods offered to the search.
-/// Essences, fossils, harvest, and eldritch methods need per-instance
-/// configuration (which essence, which fossils, …) and are not yet exposed
-/// through the goal file.
+/// Human-readable probability: percentages down to 0.1%, then "~1 in N" so
+/// mirror-tier lottery odds don't collapse to "0.0%".
+fn fmt_prob(p: f64) -> String {
+    if p >= 0.999_999 {
+        "certain".to_string()
+    } else if p >= 0.001 {
+        format!("{:.1}%", p * 100.0)
+    } else {
+        format!("~1 in {:.0}", 1.0 / p)
+    }
+}
+
+/// The default orb set offered to every search. Essences, fossils, harvest,
+/// bench, and eldritch methods need per-instance configuration and are added
+/// via the goal file's [[methods] ] entries.
 fn default_methods() -> Vec<Arc<dyn CraftingMethod>> {
     vec![
         Arc::new(OrbOfScouring),
+        Arc::new(OrbOfTransmutation),
+        Arc::new(OrbOfAlteration),
+        Arc::new(OrbOfAugmentation),
+        Arc::new(RegalOrb),
         Arc::new(OrbOfAlchemy),
         Arc::new(ChaosOrb),
         Arc::new(ExaltedOrb),
         Arc::new(OrbOfAnnulment),
+        Arc::new(DivineOrb),
+        Arc::new(FracturingOrb),
+        Arc::new(RemoveCraftedMods),
     ]
 }
 
@@ -167,29 +335,75 @@ fn resolve_base_item<'db>(
     Ok((id.clone(), base))
 }
 
-/// Pretty-print the winning path, final item, and goal satisfaction.
-fn print_result(result: &SearchResult, goal: &GoalSpec, db: &GameData, mc_names: &[String]) {
-    println!("\n=== Best crafting path (score {:.1}) ===", result.score);
-    if result.path.is_empty() {
+/// Pretty-print the winning path with retry economics, the final item, and
+/// goal satisfaction.
+fn print_result(result: &SearchResult, goal: &GoalSpec, db: &GameData) {
+    let raw_score = goal.score(&result.state, db);
+    let satisfied = goal.satisfied_count(&result.state, db);
+    let status = if goal.is_complete(&result.state, db) {
+        "COMPLETE"
+    } else {
+        "INCOMPLETE"
+    };
+    println!(
+        "\n=== Best crafting path: target {status} ({satisfied}/{} wants, goal score {:.1}/{:.1}, ranking score {:.3}) ===",
+        goal.wants.len(),
+        raw_score,
+        goal.max_score(),
+        result.score
+    );
+    if result.steps.is_empty() {
         println!("(the unmodified base item already scores best)");
     }
-    for (i, step) in result.path.iter().enumerate() {
-        println!("  {}. {step}", i + 1);
-    }
-    println!("Estimated cost: {:.0} chaos", result.total_cost);
-
-    // path_weight is only a true probability when no Monte Carlo step is on the path.
-    let has_mc_step = result.path.iter().any(|s| mc_names.contains(s));
-    if has_mc_step {
+    let mut any_estimate = false;
+    for (i, step) in result.steps.iter().enumerate() {
+        any_estimate |= step.probability_estimate;
+        let odds = fmt_prob(step.p_at_least);
+        let est = if step.probability_estimate { "~" } else { "" };
+        let economics = if step.repeatable {
+            format!(
+                "{est}{odds} per try, reroll until hit -> ~{:.1}c expected",
+                step.expected_cost()
+            )
+        } else if step.probability_estimate && step.p_at_least >= 0.999_999 {
+            "sampled roll; true hit chance unresolved".to_string()
+        } else if step.p_at_least >= 0.999_999 {
+            "deterministic".to_string()
+        } else {
+            format!("one-shot, {est}{odds} chance of >= this result")
+        };
         println!(
-            "Path weight: {:.3e} (contains Monte Carlo steps — NOT a true probability; \
-             treat this path as one representative outcome)",
-            result.path_weight
+            "  {}. {} — {:.2}c per application; {economics}",
+            i + 1,
+            step.method,
+            step.cost
         );
-    } else {
+    }
+
+    println!(
+        "\nCost if every step hits first try: {:.1} chaos",
+        result.total_cost
+    );
+    println!(
+        "Expected cost (rerolling repeatable steps until they hit): ~{:.1} chaos",
+        result.expected_cost
+    );
+    if result.success_prob < 0.999_999 {
         println!(
-            "Path probability: {:.3e} (exact — all steps enumerate true outcomes)",
-            result.path_weight
+            "Chance all one-shot steps land at least this well: {}",
+            fmt_prob(result.success_prob)
+        );
+        println!(
+            "Expected cost if a one-shot miss scraps the item and you restart: \
+             ~{:.1} chaos (includes configured reset cost)",
+            result.restart_cost
+        );
+    }
+    if any_estimate {
+        println!(
+            "(~ marks estimated probabilities from sampled rolls; full rerolls \
+             use {} Monte Carlo samples)",
+            crate::currency::MONTE_CARLO_SAMPLES
         );
     }
 
@@ -201,6 +415,49 @@ fn print_result(result: &SearchResult, goal: &GoalSpec, db: &GameData, mc_names:
     }
     if let Some(c) = &result.state.crafted_mod {
         print_mod_list("Crafted", std::slice::from_ref(c), db);
+    }
+    let exarch_tier = result
+        .state
+        .exarch_implicit
+        .as_ref()
+        .and_then(|modifier| db.mods.get(&modifier.mod_id))
+        .and_then(|modifier| modifier.eldritch_tier());
+    let eater_tier = result
+        .state
+        .eater_implicit
+        .as_ref()
+        .and_then(|modifier| db.mods.get(&modifier.mod_id))
+        .and_then(|modifier| modifier.eldritch_tier());
+    if let Some(implicit) = &result.state.exarch_implicit {
+        print_mod_list(
+            &format!(
+                "Searing Exarch implicit{}",
+                exarch_tier.map_or_else(String::new, |tier| format!(" (tier {tier})"))
+            ),
+            std::slice::from_ref(implicit),
+            db,
+        );
+    }
+    if let Some(implicit) = &result.state.eater_implicit {
+        print_mod_list(
+            &format!(
+                "Eater of Worlds implicit{}",
+                eater_tier.map_or_else(String::new, |tier| format!(" (tier {tier})"))
+            ),
+            std::slice::from_ref(implicit),
+            db,
+        );
+    }
+    let dominance = match (exarch_tier, eater_tier) {
+        (Some(exarch), Some(eater)) if exarch < eater => Some("Searing Exarch"),
+        (Some(exarch), Some(eater)) if eater < exarch => Some("Eater of Worlds"),
+        (Some(_), Some(_)) => Some("equal (no dominant side)"),
+        (Some(_), None) => Some("Searing Exarch"),
+        (None, Some(_)) => Some("Eater of Worlds"),
+        (None, None) => None,
+    };
+    if let Some(dominance) = dominance {
+        println!("Eldritch dominance: {dominance}");
     }
 
     println!("\n--- Goal satisfaction ---");

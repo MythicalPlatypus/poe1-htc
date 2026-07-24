@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 use super::base_items::BaseItem;
+use super::crafting_catalogs::{parse_crafting_bench_options, parse_essences, parse_fossils};
 use super::mods::Mod;
 use super::GameData;
 
@@ -12,7 +13,29 @@ pub fn load_all(data_dir: &str) -> Result<GameData> {
     let mods = load_mods(dir)?;
     let base_items = load_base_items(dir)?;
 
-    Ok(GameData { mods, base_items })
+    let crafting_bench = load_optional_catalog(dir, "crafting_bench_options.json", |raw| {
+        parse_crafting_bench_options(raw)
+    })?;
+    let essences = load_optional_catalog(dir, "essences.json", parse_essences)?;
+    let fossils = load_optional_catalog(dir, "fossils.json", parse_fossils)?;
+
+    Ok(GameData::new(mods, base_items).with_crafting_catalogs(crafting_bench, essences, fossils))
+}
+
+fn load_optional_catalog<T>(
+    dir: &Path,
+    filename: &str,
+    parse: impl FnOnce(&str) -> Result<T>,
+) -> Result<Option<T>> {
+    let path = dir.join(filename);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    parse(&raw)
+        .with_context(|| format!("Failed to load {}", path.display()))
+        .map(Some)
 }
 
 fn load_mods(dir: &Path) -> Result<std::collections::HashMap<String, Mod>> {
