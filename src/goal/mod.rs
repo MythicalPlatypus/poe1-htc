@@ -459,6 +459,255 @@ impl ItemSpec {
     }
 }
 
+/// Build stat rolls for an imported mod: explicit values are validated against
+/// the mod's roll ranges. Unlike `[[item.mods]]` (where omitted values mean
+/// midpoint rolls), the import path requires one value per stat — the importer
+/// captured the real rolls from the clipboard text, so a missing value is a
+/// bug or a truncated paste, never a request for a default.
+fn imported_rolls(
+    label: &str,
+    mod_id: &str,
+    m: &crate::data::mods::Mod,
+    values: &[i32],
+) -> Result<Vec<StatRoll>> {
+    if values.len() != m.stats.len() {
+        bail!(
+            "{label}: '{mod_id}' has {} stats but {} values were imported",
+            m.stats.len(),
+            values.len()
+        );
+    }
+    m.stats
+        .iter()
+        .zip(values)
+        .map(|(s, &v)| {
+            if v < s.min || v > s.max {
+                bail!(
+                    "{label}: '{mod_id}' {} = {v} outside [{}, {}]",
+                    s.id,
+                    s.min,
+                    s.max
+                );
+            }
+            Ok(StatRoll {
+                stat_id: s.id.clone(),
+                value: v,
+            })
+        })
+        .collect()
+}
+
+/// Build a validated `ItemState` from a clipboard-imported item.
+///
+/// Mirrors the `[[item.mods]]` validation in [`ItemSpec::build_state`] —
+/// strict about prefix/suffix generation type, item level, roll ranges,
+/// prefix/suffix capacity, group conflicts, fractured-versus-crafted
+/// exclusivity, and the single crafted-mod slot — with one deliberate
+/// relaxation: an imported **existing** modifier does not need a positive
+/// current spawn weight for the base. Fractured, recombinated, Delve,
+/// unveiled, legacy, or otherwise transferred modifiers are valid existing
+/// state even when they can no longer roll naturally. This relaxation applies
+/// only here; normal crafting pools and TOML starting-item validation are
+/// unchanged, so such mods still never appear in random rolls.
+///
+/// Quality, the socket description, and the displayed Energy Shield total are
+/// preserved as descriptive metadata only — crafting probabilities and goal
+/// math do not model socket crafting or derived total defences.
+pub fn build_imported_state(
+    imported: &crate::import::ImportedItem,
+    base_id: String,
+    base_tags: Vec<String>,
+    db: &GameData,
+) -> Result<ItemState> {
+    let item_level = imported
+        .item_level
+        .ok_or_else(|| anyhow::anyhow!("imported item: item level is required to validate mods"))?;
+    if item_level == 0 || item_level > 100 {
+        bail!("imported item: item level {item_level} must be between 1 and 100");
+    }
+
+    let mut item = ItemState::new_base(base_id, base_tags, item_level);
+    item.rarity = match imported.rarity {
+        Rarity::Normal => Rarity::Normal,
+        Rarity::Magic => Rarity::Magic,
+        Rarity::Rare => Rarity::Rare,
+        Rarity::Unique => bail!("imported item: unique items cannot be crafted on"),
+    };
+    item.corrupted = imported.corrupted;
+    item.mirrored = imported.mirrored;
+    if let Some(quality) = imported.quality {
+        item.quality = u8::try_from(quality)
+            .ok()
+            .filter(|q| *q <= 100)
+            .ok_or_else(|| {
+                anyhow::anyhow!("imported item: quality {quality}% outside the plausible 0-100%")
+            })?;
+    }
+    item.sockets = imported.sockets.clone();
+    item.displayed_energy_shield = imported
+        .displayed_energy_shield
+        .map(|es| {
+            u32::try_from(es).map_err(|_| {
+                anyhow::anyhow!("imported item: displayed Energy Shield {es} cannot be negative")
+            })
+        })
+        .transpose()?;
+
+    for spec in &imported.implicit_mods {
+        let label = "imported implicit";
+        let m = db
+            .mods
+            .get(&spec.mod_id)
+            .ok_or_else(|| anyhow::anyhow!("{label}: mod '{}' not in mods.json", spec.mod_id))?;
+        let modifier = Modifier {
+            mod_id: spec.mod_id.clone(),
+            generation_type: m.generation_type.clone(),
+            rolls: imported_rolls(label, &spec.mod_id, m, &spec.values)?,
+        };
+        match m.generation_type {
+            GenerationType::Prefix | GenerationType::Suffix => bail!(
+                "{label}: '{}' is an explicit affix, not an implicit",
+                spec.mod_id
+            ),
+            GenerationType::ExarchImplicit => {
+                if item.exarch_implicit.is_some() {
+                    bail!("{label}: more than one Searing Exarch implicit");
+                }
+                item.exarch_implicit = Some(modifier);
+            }
+            GenerationType::EaterImplicit => {
+                if item.eater_implicit.is_some() {
+                    bail!("{label}: more than one Eater of Worlds implicit");
+                }
+                item.eater_implicit = Some(modifier);
+            }
+            _ => item.implicits.push(modifier),
+        }
+    }
+
+    for spec in &imported.enchantments {
+        let label = "imported enchantment";
+        let m = db
+            .mods
+            .get(&spec.mod_id)
+            .ok_or_else(|| anyhow::anyhow!("{label}: mod '{}' not in mods.json", spec.mod_id))?;
+        // RePoE classifies some enchants (e.g. Heist blueprint enchants)
+        // under non-enchantment generation types, so only explicit affixes
+        // are certainly wrong in the enchant slot.
+        if matches!(
+            m.generation_type,
+            GenerationType::Prefix | GenerationType::Suffix
+        ) {
+            bail!(
+                "{label}: '{}' has generation type {:?}, expected enchantment",
+                spec.mod_id,
+                m.generation_type
+            );
+        }
+        item.enchants.push(Modifier {
+            mod_id: spec.mod_id.clone(),
+            generation_type: m.generation_type.clone(),
+            rolls: imported_rolls(label, &spec.mod_id, m, &spec.values)?,
+        });
+    }
+
+    for spec in &imported.explicit_mods {
+        let label = "imported explicit";
+        let m = db
+            .mods
+            .get(&spec.mod_id)
+            .ok_or_else(|| anyhow::anyhow!("{label}: mod '{}' not in mods.json", spec.mod_id))?;
+        if spec.fractured && spec.crafted {
+            bail!(
+                "{label}: '{}' cannot be both fractured and crafted",
+                spec.mod_id
+            );
+        }
+        if !matches!(
+            m.generation_type,
+            GenerationType::Prefix | GenerationType::Suffix
+        ) {
+            bail!("{label}: '{}' is not a prefix or suffix", spec.mod_id);
+        }
+        if m.required_level > item_level {
+            bail!(
+                "{label}: '{}' requires item level {}, but the imported item level is {item_level}",
+                spec.mod_id,
+                m.required_level
+            );
+        }
+        // Deliberately NO spawn-weight check here (see the function docs):
+        // existing imported mods may be fractured/legacy/Delve mods that can
+        // no longer roll. `eligible_mods` still excludes them from every
+        // random pool because they fail `is_craftable()` or have zero weight.
+        if spec.crafted {
+            if m.domain != Domain::Crafted {
+                bail!(
+                    "{label}: crafted mod '{}' has domain {:?}, expected crafted",
+                    spec.mod_id,
+                    m.domain
+                );
+            }
+            if item.crafted_mod.is_some() {
+                bail!("{label}: only one crafted mod is allowed");
+            }
+        } else if m.domain == Domain::Crafted {
+            bail!(
+                "{label}: '{}' is a crafted-domain mod but the line is not \
+                 annotated (crafted); it must occupy the crafted-mod slot",
+                spec.mod_id
+            );
+        }
+
+        let conflict = item
+            .all_mods_for_conflict()
+            .filter_map(|placed| db.mods.get(&placed.mod_id))
+            .flat_map(|placed| placed.groups.iter())
+            .any(|g| m.groups.contains(g));
+        if conflict {
+            bail!(
+                "{label}: '{}' shares a mod group with another imported mod",
+                spec.mod_id
+            );
+        }
+
+        let open = match m.generation_type {
+            GenerationType::Prefix => item.has_open_prefix(),
+            _ => item.has_open_suffix(),
+        };
+        if !open {
+            bail!(
+                "{label}: no open {} slot for '{}' on a {:?} item",
+                if m.generation_type == GenerationType::Prefix {
+                    "prefix"
+                } else {
+                    "suffix"
+                },
+                spec.mod_id,
+                item.rarity
+            );
+        }
+
+        let modifier = Modifier {
+            mod_id: spec.mod_id.clone(),
+            generation_type: m.generation_type.clone(),
+            rolls: imported_rolls(label, &spec.mod_id, m, &spec.values)?,
+        };
+        if spec.crafted {
+            item.crafted_mod = Some(modifier);
+        } else if spec.fractured {
+            item.fractured.push(modifier);
+        } else {
+            match m.generation_type {
+                GenerationType::Prefix => item.prefixes.push(modifier),
+                _ => item.suffixes.push(modifier),
+            }
+        }
+    }
+
+    Ok(item)
+}
+
 /// One desired mod. All specified criteria must hold on a single mod
 /// for the want to be satisfied (see module docs).
 #[derive(Debug, Deserialize)]
@@ -1133,13 +1382,16 @@ impl GoalSpec {
 }
 
 /// Every mod a want can be satisfied by: affix-slot mods (prefixes, suffixes,
-/// fractured, crafted) plus eldritch implicits — implicits don't participate in
-/// affix conflicts but absolutely count toward goals.
+/// fractured, crafted) plus eldritch implicits, generic implicits, and
+/// enchantments — implicits and enchants don't occupy affix slots or
+/// participate in explicit group conflicts, but absolutely count toward goals.
 fn scorable_mods(state: &ItemState) -> impl Iterator<Item = &Modifier> {
     state
         .all_mods_for_conflict()
         .chain(state.exarch_implicit.iter())
         .chain(state.eater_implicit.iter())
+        .chain(state.implicits.iter())
+        .chain(state.enchants.iter())
 }
 
 /// True if `modifier` satisfies every criterion `want` specifies.
@@ -1220,6 +1472,7 @@ mod tests {
             mod_type: "IncreasedLife".to_string(),
             groups: vec!["IncreasedLife".to_string()],
             is_essence_only: false,
+            text: None,
         }
     }
 
@@ -1799,6 +2052,493 @@ mod tests {
         .unwrap();
         let db = db_with_life();
         assert_eq!(spec.score(&item_with_life(75), &db), 0.0);
+    }
+
+    // ─── build_imported_state ────────────────────────────────────────────────
+
+    use crate::import::{ImportedItem, ImportedModifier};
+
+    /// A mod with an explicit generation type, group, domain, and default
+    /// spawn weight; one stat `stat_<group>` rolling 1-10.
+    fn imported_db_mod(gen: GenerationType, group: &str, domain: Domain, weight: u32) -> Mod {
+        Mod {
+            name: format!("Test {group}"),
+            generation_type: gen,
+            required_level: 1,
+            stats: vec![ModStat {
+                id: format!("stat_{group}"),
+                min: 1,
+                max: 10,
+            }],
+            spawn_weights: vec![SpawnWeight {
+                tag: "default".to_string(),
+                weight,
+            }],
+            generation_weights: vec![],
+            adds_tags: vec![],
+            tags: vec![],
+            domain,
+            mod_type: group.to_string(),
+            groups: vec![group.to_string()],
+            is_essence_only: false,
+            text: None,
+        }
+    }
+
+    /// A DB shaped like the acceptance fixture: a zero-spawn Delve fractured
+    /// prefix, two normal ES prefixes, three suffixes, two enchants, and two
+    /// generic implicits.
+    fn fixture_db() -> GameData {
+        let mut mods = HashMap::new();
+        mods.insert(
+            "MaximumMinionCountSpectreDelve".to_string(),
+            imported_db_mod(GenerationType::Prefix, "MaximumSpectres", Domain::Delve, 0),
+        );
+        mods.insert(
+            "FlatES".to_string(),
+            imported_db_mod(
+                GenerationType::Prefix,
+                "BaseLocalDefences",
+                Domain::Item,
+                1000,
+            ),
+        );
+        mods.insert(
+            "PctES".to_string(),
+            imported_db_mod(
+                GenerationType::Prefix,
+                "DefencesPercent",
+                Domain::Item,
+                1000,
+            ),
+        );
+        mods.insert(
+            "FlatLife".to_string(),
+            imported_db_mod(GenerationType::Prefix, "BaseLife", Domain::Item, 1000),
+        );
+        mods.insert(
+            "StrGems".to_string(),
+            imported_db_mod(
+                GenerationType::Suffix,
+                "StrengthGemLevel",
+                Domain::Item,
+                500,
+            ),
+        );
+        mods.insert(
+            "IntGems".to_string(),
+            imported_db_mod(
+                GenerationType::Suffix,
+                "IntelligenceGemLevel",
+                Domain::Item,
+                500,
+            ),
+        );
+        mods.insert(
+            "ESRegenNearby".to_string(),
+            imported_db_mod(
+                GenerationType::Suffix,
+                "EnergyShieldRegenNearby",
+                Domain::Item,
+                200,
+            ),
+        );
+        mods.insert(
+            "EnchantDefences".to_string(),
+            imported_db_mod(
+                GenerationType::Enchantment,
+                "EnchantDefences",
+                Domain::Item,
+                0,
+            ),
+        );
+        mods.insert(
+            "EnchantResists".to_string(),
+            imported_db_mod(
+                GenerationType::Enchantment,
+                "EnchantResists",
+                Domain::Item,
+                0,
+            ),
+        );
+        mods.insert(
+            "PhysAsChaosImpl".to_string(),
+            imported_db_mod(GenerationType::Corrupted, "PhysAsChaos", Domain::Item, 0),
+        );
+        mods.insert(
+            "FlaskEffectImpl".to_string(),
+            imported_db_mod(GenerationType::Unique, "FlaskEffect", Domain::Item, 0),
+        );
+        GameData::new(mods, HashMap::new())
+    }
+
+    fn imported_mod(mod_id: &str, values: Vec<i32>) -> ImportedModifier {
+        ImportedModifier {
+            mod_id: mod_id.to_string(),
+            values,
+            fractured: false,
+            crafted: false,
+            displayed_lines: vec![],
+        }
+    }
+
+    fn fractured_mod(mod_id: &str, values: Vec<i32>) -> ImportedModifier {
+        ImportedModifier {
+            fractured: true,
+            ..imported_mod(mod_id, values)
+        }
+    }
+
+    /// The Damnation Wrap acceptance fixture as Sol's importer would emit it.
+    fn fixture_import() -> ImportedItem {
+        ImportedItem {
+            item_name: Some("Damnation Wrap".to_string()),
+            base_name: "Twilight Regalia".to_string(),
+            rarity: Rarity::Rare,
+            item_level: Some(86),
+            quality: Some(30),
+            sockets: Some("W-W-W-W-W-W".to_string()),
+            displayed_energy_shield: Some(1200),
+            explicit_mods: vec![
+                fractured_mod("MaximumMinionCountSpectreDelve", vec![1]),
+                imported_mod("StrGems", vec![1]),
+                imported_mod("IntGems", vec![1]),
+                imported_mod("FlatES", vec![5]),
+                imported_mod("PctES", vec![7]),
+                imported_mod("ESRegenNearby", vec![9]),
+            ],
+            implicit_mods: vec![
+                imported_mod("PhysAsChaosImpl", vec![10]),
+                imported_mod("FlaskEffectImpl", vec![10]),
+            ],
+            enchantments: vec![
+                imported_mod("EnchantDefences", vec![10]),
+                imported_mod("EnchantResists", vec![10]),
+            ],
+            corrupted: false,
+            mirrored: false,
+            warnings: vec![],
+        }
+    }
+
+    fn build_fixture_state() -> ItemState {
+        build_imported_state(
+            &fixture_import(),
+            "twilight_regalia".to_string(),
+            vec!["body_armour".to_string()],
+            &fixture_db(),
+        )
+        .expect("acceptance fixture must validate")
+    }
+
+    #[test]
+    fn imported_fixture_builds_six_affix_state_with_zero_spawn_fracture() {
+        let item = build_fixture_state();
+        assert_eq!(item.rarity, Rarity::Rare);
+        assert_eq!(item.item_level, 86);
+        // Explicit layout: fractured Spectre prefix + 2 rolled prefixes, 3 suffixes.
+        assert_eq!(item.fractured.len(), 1);
+        assert_eq!(item.fractured[0].mod_id, "MaximumMinionCountSpectreDelve");
+        assert_eq!(item.prefixes.len(), 2);
+        assert_eq!(item.suffixes.len(), 3);
+        assert_eq!(item.prefix_count(), 3);
+        assert_eq!(item.suffix_count(), 3);
+        assert!(item.is_full(), "six affixes must fill a rare item");
+        // Craft-invariant metadata.
+        assert_eq!(item.implicits.len(), 2);
+        assert_eq!(item.enchants.len(), 2);
+        assert_eq!(item.quality, 30);
+        assert_eq!(item.sockets.as_deref(), Some("W-W-W-W-W-W"));
+        assert_eq!(item.displayed_energy_shield, Some(1200));
+        assert!(!item.corrupted && !item.mirrored);
+        assert!(item.is_craftable());
+        // Imported roll values survive verbatim.
+        assert_eq!(item.prefixes[0].rolls[0].value, 5, "FlatES raw value");
+        assert_eq!(item.prefixes[1].rolls[0].value, 7, "PctES raw value");
+        assert_eq!(item.suffixes[2].rolls[0].value, 9, "ES regen raw value");
+    }
+
+    #[test]
+    fn imported_zero_spawn_mod_stays_out_of_normal_roll_pools() {
+        let db = fixture_db();
+        let delve = &db.mods["MaximumMinionCountSpectreDelve"];
+        assert!(
+            !delve.is_craftable(),
+            "Delve-domain mods must never enter the craftable index"
+        );
+
+        // Even on an empty rare item, no random pool may offer the Delve mod;
+        // ordinary item-domain mods remain available.
+        let empty = ItemState::new_base("twilight_regalia", vec!["body_armour".to_string()], 86);
+        let mut rare = empty;
+        rare.rarity = Rarity::Rare;
+        let pool = crate::engine::mod_pool::eligible_mods(&rare, &[], &db);
+        assert!(
+            pool.iter()
+                .all(|(id, _, _)| *id != "MaximumMinionCountSpectreDelve"),
+            "zero-spawn Delve mod must be excluded from random rolling"
+        );
+        assert!(
+            pool.iter().any(|(id, _, _)| *id == "FlatES"),
+            "normal mods must still roll"
+        );
+
+        // The same exclusion holds on the imported state itself.
+        let item = build_fixture_state();
+        let pool = crate::engine::mod_pool::eligible_mods(&item, &[], &db);
+        assert!(pool.is_empty(), "a full rare offers no roll targets at all");
+    }
+
+    #[test]
+    fn imported_implicits_and_enchants_are_scorable_but_slot_free() {
+        let db = fixture_db();
+        let item = build_fixture_state();
+
+        // Implicits and enchants must not occupy explicit capacity...
+        assert_eq!(item.mod_count(), 6, "only explicit affixes count");
+        // ...but goal scoring must see them.
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Twilight Regalia"
+            [[wants]]
+            group = "EnchantDefences"
+            weight = 3.0
+            [[wants]]
+            group = "FlaskEffect"
+            weight = 2.0
+            [[wants]]
+            group = "MaximumSpectres"
+            weight = 1.0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(spec.score(&item, &db), 6.0);
+        assert!(spec.is_complete(&item, &db));
+        assert!(spec
+            .report(&item, &db)
+            .iter()
+            .all(|(_, satisfied)| *satisfied));
+    }
+
+    #[test]
+    fn imported_enchant_groups_do_not_conflict_with_explicits() {
+        // An enchantment sharing a group with an explicit prefix must not
+        // trigger the explicit group-conflict check.
+        let mut import = fixture_import();
+        import.explicit_mods = vec![imported_mod("FlatES", vec![5])];
+        import.enchantments = vec![imported_mod("EnchantShared", vec![10])];
+        import.implicit_mods.clear();
+
+        let mut db_mods = fixture_db().mods;
+        db_mods.insert(
+            "EnchantShared".to_string(),
+            imported_db_mod(
+                GenerationType::Enchantment,
+                "BaseLocalDefences",
+                Domain::Item,
+                0,
+            ),
+        );
+        let db = GameData::new(db_mods, HashMap::new());
+
+        let item = build_imported_state(&import, "x".to_string(), vec![], &db)
+            .expect("enchant group overlap with an explicit must be allowed");
+        assert_eq!(item.prefixes.len(), 1);
+        assert_eq!(item.enchants.len(), 1);
+    }
+
+    #[test]
+    fn imported_state_rejects_invalid_layouts_and_rolls() {
+        let db = fixture_db();
+        let build = |mutate: fn(&mut ImportedItem)| {
+            let mut import = fixture_import();
+            mutate(&mut import);
+            build_imported_state(&import, "x".to_string(), vec![], &db)
+        };
+
+        // Roll value outside the mod's range.
+        let err = build(|i| i.explicit_mods[3].values = vec![999]).unwrap_err();
+        assert!(err.to_string().contains("outside"), "got: {err}");
+
+        // Wrong number of imported values.
+        let err = build(|i| i.explicit_mods[3].values = vec![1, 2]).unwrap_err();
+        assert!(err.to_string().contains("values"), "got: {err}");
+
+        // Prefix capacity overflow (4th distinct-group prefix on a rare).
+        let err = build(|i| {
+            i.explicit_mods[1] = imported_mod("FlatLife", vec![5]);
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("no open prefix slot"),
+            "got: {err}"
+        );
+
+        // Group conflict between two explicit mods.
+        let err = build(|i| {
+            i.explicit_mods[1] = imported_mod("StrGems", vec![1]);
+            i.explicit_mods[2] = imported_mod("StrGems", vec![2]);
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("shares a mod group"), "got: {err}");
+
+        // Fractured and crafted at once.
+        let err = build(|i| {
+            i.explicit_mods[0].crafted = true;
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("both fractured and crafted"),
+            "got: {err}"
+        );
+
+        // Crafted flag on a mod whose domain is not crafted.
+        let err = build(|i| {
+            i.explicit_mods[1].crafted = true;
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("expected crafted"), "got: {err}");
+
+        // An enchantment that is not an enchantment-type mod.
+        let err = build(|i| {
+            i.enchantments = vec![imported_mod("FlatES", vec![5])];
+            i.explicit_mods.clear();
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("expected enchantment"),
+            "got: {err}"
+        );
+
+        // An implicit that is really an explicit affix.
+        let err = build(|i| {
+            i.implicit_mods = vec![imported_mod("PctES", vec![7])];
+            i.explicit_mods.clear();
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("explicit affix"), "got: {err}");
+
+        // Unique rarity, missing item level, negative displayed ES, silly quality.
+        let err = build(|i| i.rarity = Rarity::Unique).unwrap_err();
+        assert!(err.to_string().contains("unique"), "got: {err}");
+        let err = build(|i| i.item_level = None).unwrap_err();
+        assert!(err.to_string().contains("item level"), "got: {err}");
+        let err = build(|i| i.displayed_energy_shield = Some(-5)).unwrap_err();
+        assert!(err.to_string().contains("negative"), "got: {err}");
+        let err = build(|i| i.quality = Some(400)).unwrap_err();
+        assert!(err.to_string().contains("quality"), "got: {err}");
+
+        // Item level bounds stay strict.
+        let err = build(|i| i.item_level = Some(0)).unwrap_err();
+        assert!(err.to_string().contains("between 1 and 100"), "got: {err}");
+
+        // required_level gating stays strict for explicits.
+        let mut db_mods = fixture_db().mods;
+        if let Some(m) = db_mods.get_mut("FlatES") {
+            m.required_level = 60;
+        }
+        let gated_db = GameData::new(db_mods, HashMap::new());
+        let mut import = fixture_import();
+        import.item_level = Some(50);
+        let err = build_imported_state(&import, "x".to_string(), vec![], &gated_db).unwrap_err();
+        assert!(
+            err.to_string().contains("requires item level"),
+            "got: {err}"
+        );
+
+        // Two crafted mods.
+        let mut db_mods = fixture_db().mods;
+        let mut crafted = imported_db_mod(GenerationType::Suffix, "CraftA", Domain::Crafted, 0);
+        crafted.required_level = 1;
+        db_mods.insert("CraftA".to_string(), crafted);
+        let crafted_b = imported_db_mod(GenerationType::Suffix, "CraftB", Domain::Crafted, 0);
+        db_mods.insert("CraftB".to_string(), crafted_b);
+        let db2 = GameData::new(db_mods, HashMap::new());
+        let mut import = fixture_import();
+        import.explicit_mods = vec![
+            ImportedModifier {
+                crafted: true,
+                ..imported_mod("CraftA", vec![1])
+            },
+            ImportedModifier {
+                crafted: true,
+                ..imported_mod("CraftB", vec![1])
+            },
+        ];
+        let err = build_imported_state(&import, "x".to_string(), vec![], &db2).unwrap_err();
+        assert!(
+            err.to_string().contains("only one crafted mod"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn imported_corrupted_and_mirrored_flags_block_crafting() {
+        let db = fixture_db();
+        let mut import = fixture_import();
+        import.corrupted = true;
+        let item = build_imported_state(&import, "x".to_string(), vec![], &db).unwrap();
+        assert!(item.corrupted);
+        assert!(!item.is_craftable(), "corrupted items cannot be crafted on");
+
+        let mut import = fixture_import();
+        import.mirrored = true;
+        let item = build_imported_state(&import, "x".to_string(), vec![], &db).unwrap();
+        assert!(item.mirrored);
+        assert!(!item.is_craftable(), "mirrored items cannot be crafted on");
+    }
+
+    #[test]
+    fn imported_eldritch_implicits_route_to_their_slots() {
+        let mut db_mods = fixture_db().mods;
+        db_mods.insert(
+            "ExarchImpl".to_string(),
+            imported_db_mod(
+                GenerationType::ExarchImplicit,
+                "ExarchGroup",
+                Domain::Item,
+                100,
+            ),
+        );
+        let db = GameData::new(db_mods, HashMap::new());
+        let mut import = fixture_import();
+        import
+            .implicit_mods
+            .push(imported_mod("ExarchImpl", vec![4]));
+
+        let item = build_imported_state(&import, "x".to_string(), vec![], &db).unwrap();
+        assert_eq!(item.implicits.len(), 2, "generic implicits stay generic");
+        assert_eq!(
+            item.exarch_implicit.as_ref().map(|m| m.mod_id.as_str()),
+            Some("ExarchImpl")
+        );
+    }
+
+    #[test]
+    fn toml_starting_items_still_require_positive_spawn_weight() {
+        // The import relaxation must NOT leak into TOML validation: a
+        // zero-spawn mod in [[item.mods]] keeps failing exactly as before.
+        let db = fixture_db();
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "x"
+            item_level = 86
+            rarity = "rare"
+            [[item.mods]]
+            mod_id = "MaximumMinionCountSpectreDelve"
+            fractured = true
+            [[wants]]
+            group = "MaximumSpectres"
+            "#,
+        )
+        .unwrap();
+        let err = spec
+            .item
+            .build_state("x".to_string(), vec![], &db)
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot appear"), "got: {err}");
     }
 
     #[test]

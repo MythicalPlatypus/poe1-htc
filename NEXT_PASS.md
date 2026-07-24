@@ -2,12 +2,18 @@
 
 This repository is at a clean guild-beta baseline as of 2026-07-23. The CLI
 works end to end against current RePoE Fork data, and the implemented crafting
-mechanics have synthetic unit and integration coverage.
+mechanics have synthetic unit and integration coverage. This pass added
+clipboard item-text import: `--item-file` parses a pasted in-game item,
+`crate::goal::build_imported_state` validates it into an `ItemState`, and the
+item model preserves generic implicits, enchantments, quality, sockets, and
+displayed Energy Shield as craft-invariant metadata (see README "Importing an
+Item" for the metadata-versus-modeled-state boundary).
 
 ## Baseline
 
 - `cargo fmt -- --check` passes.
-- `cargo test` passes 151 tests (123 unit and 28 integration).
+- `cargo test` passes (unit, integration, and item-text import suites; run the
+  full gate for the current count).
 - `cargo clippy --all-targets -- -D warnings` passes.
 - Release-mode data loading succeeds with the local RePoE `3.28.0.16` export:
   39,292 mods, 5,059 base items, 774 bench recipes, 106 essences, and 445
@@ -38,6 +44,13 @@ tracked so every contributor tests the same dependency resolution.
 - Exact probabilities are preferred. Sampled values must remain visibly marked
   as estimates.
 - Do not add `unwrap()` to production paths in `engine/` or `currency/`.
+- The import path alone may accept existing mods with zero current spawn
+  weight (fractured/legacy/Delve state). Random roll pools and TOML
+  starting-item validation must keep rejecting them.
+- Generic implicits, enchants, quality, sockets, and displayed ES on
+  `ItemState` are craft-invariant: crafting actions must not touch them, they
+  never consume explicit capacity or join explicit group conflicts, and the
+  search state signature must include them.
 
 ## Candidate Work Tracks
 

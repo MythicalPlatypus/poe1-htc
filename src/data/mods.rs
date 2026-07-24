@@ -57,6 +57,12 @@ pub struct Mod {
     /// Whether this mod can only appear via Essences.
     #[serde(default)]
     pub is_essence_only: bool,
+
+    /// RePoE display-text template for the mod's stat lines (e.g.
+    /// "+{0} to maximum Energy Shield"). `null` in RePoE for many
+    /// non-displayed mods; older synthetic fixtures omit the key entirely.
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 /// A single stat contribution from a mod.
@@ -91,30 +97,45 @@ pub struct GenerationWeight {
 }
 
 /// Where a mod can appear.
+///
+/// RePoE spells multi-word domains in snake_case ("heist_equipment",
+/// "abyss_jewel"), so this enum must use snake_case renaming — with
+/// "lowercase" those domains would silently collapse into `Unknown`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Domain {
     Item,
     Chest,
     Monster,
     Area,
     Crafted,
+    /// Current RePoE exports spell this domain "unveiled".
+    #[serde(alias = "unveiled")]
     Veiled,
     Delve,
     Abyss,
+    AbyssJewel,
     Map,
     Stance,
     Tempest,
     Leaguestone,
     Watchstone,
     Synthesis,
+    Flask,
     HeistEquipment,
     HeistArea,
+    HeistNpc,
+    HeistTrinket,
+    Misc,
     Trinket,
     SentinelTag,
     MemoryLine,
     Affliction,
+    AfflictionCharm,
+    AfflictionJewel,
     Sanctum,
+    SanctumRelic,
+    Tincture,
     Expedition,
     Necropolis,
     #[serde(other)]
@@ -242,5 +263,39 @@ mod tests {
 
         assert_eq!(parsed.generation_type, GenerationType::EaterImplicit);
         assert_eq!(parsed.tags, ["cold"]);
+    }
+
+    #[test]
+    fn parses_mod_display_text_string_null_and_missing() {
+        let with_text = |text_json: &str| {
+            format!(
+                r#"{{
+                    "name": "",
+                    "generation_type": "prefix",
+                    "required_level": 1,
+                    "stats": [],
+                    "spawn_weights": [],
+                    "domain": "item",
+                    "type": "T",
+                    "groups": []{text_json}
+                }}"#
+            )
+        };
+
+        let parsed: Mod =
+            serde_json::from_str(&with_text(r#", "text": "+{0} to maximum Energy Shield""#))
+                .expect("string text should parse");
+        assert_eq!(
+            parsed.text.as_deref(),
+            Some("+{0} to maximum Energy Shield")
+        );
+
+        let parsed: Mod =
+            serde_json::from_str(&with_text(r#", "text": null"#)).expect("null text should parse");
+        assert_eq!(parsed.text, None);
+
+        let parsed: Mod = serde_json::from_str(&with_text(""))
+            .expect("fixtures without a text key should still parse");
+        assert_eq!(parsed.text, None);
     }
 }

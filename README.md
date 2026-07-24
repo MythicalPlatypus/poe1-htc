@@ -27,6 +27,7 @@ before spending expensive currency.
 - Parallel, seeded beam search with semantic state deduplication
 - TOML goals targeting exact mod IDs, mod groups, stats, and minimum rolls
 - Existing-item input for evaluating or finishing a craft in progress
+- Clipboard item-text import (`--item-file`) to start from an item you own
 - League price overrides and multiple reported pathways
 
 Implemented crafting actions:
@@ -204,6 +205,46 @@ See [`goals/example_life_chest.toml`](goals/example_life_chest.toml) and
 [`goals/finish_fractured_chest.toml`](goals/finish_fractured_chest.toml) for
 complete examples.
 
+## Importing an Item
+
+Instead of describing your starting item in `[[item.mods]]`, copy it in game
+(hover the item and press `Ctrl+C`), save the text to a file, and pass it with
+`--item-file`:
+
+```bash
+cargo run --release -- --goal goals/example_life_chest.toml --item-file my_item.txt
+```
+
+Use `-` to read the item text from stdin. A goal file is **still required**:
+the import only replaces the goal's starting item; the `[[wants]]`,
+`[[methods]]`, `[prices]`, and `[search]` sections continue to drive the
+search. `--item-file` cannot be combined with `--base-item`.
+
+### Imported metadata versus modeled crafting state
+
+The importer preserves everything on the item, but the optimizer only *models*
+the explicit crafting state:
+
+- **Modeled state** — rarity, item level, prefixes, suffixes, fractured and
+  crafted mods, corrupted/mirrored status, and Eldritch implicits. These drive
+  eligibility, capacity, group conflicts, and probabilities exactly as they do
+  for TOML-described items.
+- **Preserved metadata** — generic (non-Eldritch) implicits and enchantments
+  are carried through every crafting action unchanged, never consume explicit
+  affix slots or join explicit group conflicts, and *can* satisfy `[[wants]]`.
+- **Descriptive metadata** — quality, the socket description, and the
+  displayed total Energy Shield are kept for reporting only. Socket crafting
+  and derived total defences are **not** modeled: no crafting probability or
+  goal calculation reads them, and the displayed total is not recomputed as
+  explicit mods change.
+
+Existing mods on an imported item are validated strictly (affix type, item
+level, roll ranges, capacity, group conflicts, one crafted mod, fractured
+versus crafted), but they are **not** required to be currently rollable:
+fractured, recombinated, Delve, unveiled, or legacy mods are accepted as
+existing state even when their spawn weight on the base is zero. Random roll
+pools are unaffected — such mods still never appear in new rolls.
+
 ## Reading Results
 
 The CLI reports:
@@ -243,6 +284,7 @@ Command-line flags override the goal file:
 --seed <N>          Reproducible random sampling
 --top <N>           Number of distinct pathways to print
 --base-item <NAME>  Override the goal's base
+--item-file <PATH>  Start from pasted item text ("-" for stdin); requires --goal
 --data-dir <PATH>   RePoE data directory
 ```
 
@@ -261,6 +303,9 @@ cheap routes that barely improve the item.
   items do not necessarily support the same continuation.
 - Numeric stat-roll probabilities are sampled for several otherwise exact
   actions.
+- Imported quality, sockets, and displayed total Energy Shield are descriptive
+  only. Socket crafting, catalysts/quality effects, and derived total defences
+  are not part of the crafting or goal math.
 - Metamods, Veiled currency, Awakener's Orb transfer, imprints, recombinators,
   Orb of Conflict, locks, catalysts, Rog, and several league-specific systems
   are not implemented.

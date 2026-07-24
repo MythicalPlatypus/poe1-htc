@@ -629,6 +629,7 @@ mod tests {
             // group-based conflict detection works correctly in tests.
             groups: vec![mod_type.to_string()],
             is_essence_only: false,
+            text: None,
         }
     }
 

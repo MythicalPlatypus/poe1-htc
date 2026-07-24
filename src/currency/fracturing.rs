@@ -141,6 +141,7 @@ mod tests {
                     mod_type: id.to_string(),
                     groups: vec![id.to_string()],
                     is_essence_only: false,
+                    text: None,
                 },
             );
         }

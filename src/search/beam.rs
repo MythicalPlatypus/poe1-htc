@@ -70,6 +70,11 @@ struct StateKey {
     mirrored: bool,
     exarch: Option<ModifierKey>,
     eater: Option<ModifierKey>,
+    implicits: Vec<ModifierKey>,
+    enchants: Vec<ModifierKey>,
+    quality: u8,
+    sockets: Option<String>,
+    displayed_energy_shield: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -83,6 +88,8 @@ struct RerollContextKey {
     mirrored: bool,
     exarch: Option<ModifierKey>,
     eater: Option<ModifierKey>,
+    implicits: Vec<ModifierKey>,
+    enchants: Vec<ModifierKey>,
 }
 
 struct RerollTransition {
@@ -157,6 +164,11 @@ fn state_key(state: &ItemState) -> StateKey {
         mirrored: state.mirrored,
         exarch: state.exarch_implicit.as_ref().map(modifier_key),
         eater: state.eater_implicit.as_ref().map(modifier_key),
+        implicits: sorted_modifier_keys(state.implicits.iter()),
+        enchants: sorted_modifier_keys(state.enchants.iter()),
+        quality: state.quality,
+        sockets: state.sockets.clone(),
+        displayed_energy_shield: state.displayed_energy_shield,
     }
 }
 
@@ -174,6 +186,8 @@ fn reroll_context_key(state: &ItemState, kind: RerollKind) -> RerollContextKey {
         mirrored: state.mirrored,
         exarch: state.exarch_implicit.as_ref().map(modifier_key),
         eater: state.eater_implicit.as_ref().map(modifier_key),
+        implicits: sorted_modifier_keys(state.implicits.iter()),
+        enchants: sorted_modifier_keys(state.enchants.iter()),
     }
 }
 
@@ -1351,5 +1365,68 @@ mod tests {
 
         assert_eq!(unique.len(), 1);
         assert_eq!(unique[0].score, 5.0);
+    }
+
+    #[test]
+    fn imported_metadata_differences_are_not_collapsed() {
+        let make_node = |state| BeamNode {
+            state,
+            steps: Vec::new(),
+            cumulative_cost: 0.0,
+            expected_cost: 0.0,
+            success_prob: 1.0,
+            raw_score: 1.0,
+            score: 1.0,
+            restart_adjusted_cost: 0.0,
+            reroll_contexts: std::collections::HashSet::new(),
+            reroll_initializers: std::collections::HashMap::new(),
+        };
+        let with_quality = {
+            let mut state = initial();
+            state.quality = 30;
+            state
+        };
+        let with_enchant = {
+            let mut state = initial();
+            state.enchants.push(crate::item::Modifier {
+                mod_id: "EnchantDefences".to_string(),
+                generation_type: crate::data::mods::GenerationType::Enchantment,
+                rolls: Vec::new(),
+            });
+            state
+        };
+        let with_implicit = {
+            let mut state = initial();
+            state.implicits.push(crate::item::Modifier {
+                mod_id: "PhysAsChaosImpl".to_string(),
+                generation_type: crate::data::mods::GenerationType::Corrupted,
+                rolls: Vec::new(),
+            });
+            state
+        };
+        let with_sockets = {
+            let mut state = initial();
+            state.sockets = Some("W-W-W-W-W-W".to_string());
+            state
+        };
+        let with_es = {
+            let mut state = initial();
+            state.displayed_energy_shield = Some(1200);
+            state
+        };
+
+        let unique = deduplicate_candidates(vec![
+            make_node(initial()),
+            make_node(with_quality),
+            make_node(with_enchant),
+            make_node(with_implicit),
+            make_node(with_sockets),
+            make_node(with_es),
+        ]);
+        assert_eq!(
+            unique.len(),
+            6,
+            "states differing only in imported metadata are semantically different"
+        );
     }
 }

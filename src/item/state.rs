@@ -48,6 +48,32 @@ pub struct ItemState {
 
     /// Eater of Worlds eldritch implicit, if present.
     pub eater_implicit: Option<Modifier>,
+
+    /// Generic (non-Eldritch) implicit modifiers, e.g. base implicits or
+    /// corruption implicits carried in from an imported item. Craft-invariant:
+    /// no implemented crafting action adds, removes, or rerolls them. They do
+    /// not occupy explicit affix slots or join explicit group conflicts, but
+    /// goal scoring can see them.
+    pub implicits: Vec<Modifier>,
+
+    /// Enchantment modifiers (lab/harvest enchants) carried in from an
+    /// imported item. Craft-invariant, slot-free, and conflict-free like
+    /// `implicits`; visible to goal scoring.
+    pub enchants: Vec<Modifier>,
+
+    /// Item quality percentage (e.g. 30 for "Quality: +30%"). Descriptive
+    /// imported metadata only: no implemented crafting action or probability
+    /// model reads or changes it.
+    pub quality: u8,
+
+    /// Socket description exactly as imported (e.g. "W-W-W-W-W-W").
+    /// Descriptive metadata only — socket crafting is not modeled.
+    pub sockets: Option<String>,
+
+    /// Total Energy Shield as displayed on the imported item. Descriptive
+    /// metadata only — derived/total defences are not recomputed as explicit
+    /// mods change, so this reflects the item at import time.
+    pub displayed_energy_shield: Option<u32>,
 }
 
 impl ItemState {
@@ -66,6 +92,11 @@ impl ItemState {
             mirrored: false,
             exarch_implicit: None,
             eater_implicit: None,
+            implicits: Vec::new(),
+            enchants: Vec::new(),
+            quality: 0,
+            sockets: None,
+            displayed_energy_shield: None,
         }
     }
 

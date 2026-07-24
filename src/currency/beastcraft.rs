@@ -303,6 +303,7 @@ mod tests {
             mod_type: group.to_string(),
             groups: vec![group.to_string()],
             is_essence_only: false,
+            text: None,
         }
     }
 

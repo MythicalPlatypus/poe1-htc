@@ -2,9 +2,10 @@
 //! `run()` that wires `GameData` + `GoalSpec` into `BeamSearch` and prints the
 //! resulting crafting plan.
 
+use std::io::Read;
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use crate::currency::{
@@ -37,6 +38,16 @@ pub struct Args {
     /// Without this the binary only verifies that the data files load.
     #[arg(long)]
     pub goal: Option<String>,
+
+    /// Path to Path of Exile clipboard item text, or "-" to read it from stdin.
+    /// Requires --goal; the imported item replaces the goal's starting item.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "goal",
+        conflicts_with = "base_item"
+    )]
+    pub item_file: Option<String>,
 
     /// Override the goal file's base item (display name or RePoE metadata ID)
     #[arg(long)]
@@ -74,6 +85,13 @@ pub struct Args {
 
 pub fn run(args: Args) -> Result<()> {
     println!("POE1 HTC — Crafting Path Optimizer");
+
+    if args.item_file.is_some() && args.goal.is_none() {
+        bail!("--item-file requires --goal");
+    }
+    if args.item_file.is_some() && args.base_item.is_some() {
+        bail!("--item-file cannot be combined with --base-item");
+    }
 
     let db = crate::data::loader::load_all(&args.data_dir)?;
     println!(
@@ -114,12 +132,42 @@ pub fn run(args: Args) -> Result<()> {
     let goal = GoalSpec::load(goal_path)?;
     goal.validate_against_db(&db)?;
 
-    // CLI --base-item overrides the goal file's [item] base.
-    let base_query = args.base_item.as_deref().unwrap_or(&goal.item.base);
-    let (base_id, base) = resolve_base_item(&db, base_query)?;
+    let imported_start = args.item_file.is_some();
+    let (base_id, base, imported_initial) = if let Some(item_path) = args.item_file.as_deref() {
+        let item_text = read_item_text(item_path)?;
+        let imported = crate::import::import_item_text(
+            &item_text,
+            &db,
+            crate::import::ImportOptions {
+                fallback_item_level: Some(goal.item.item_level),
+                strict: true,
+            },
+        )
+        .with_context(|| format!("Failed to import item from {item_path}"))?;
+
+        if !imported.warnings.is_empty() {
+            println!("\nImport warnings:");
+            for warning in &imported.warnings {
+                println!("  - [{}] {}", warning.code, warning.message);
+            }
+        }
+
+        let (base_id, base) = resolve_base_item(&db, &imported.base_name)?;
+        let initial =
+            crate::goal::build_imported_state(&imported, base_id.clone(), base.tags.clone(), &db)?;
+        (base_id, base, Some(initial))
+    } else {
+        // CLI --base-item overrides the goal file's [item] base.
+        let base_query = args.base_item.as_deref().unwrap_or(&goal.item.base);
+        let (base_id, base) = resolve_base_item(&db, base_query)?;
+        (base_id, base, None)
+    };
+    let starting_item_level = imported_initial
+        .as_ref()
+        .map_or(goal.item.item_level, |state| state.item_level);
     println!(
         "Base item: {} ({}), item level {}",
-        base.name, base_id, goal.item.item_level
+        base.name, base_id, starting_item_level
     );
 
     let config = BeamConfig {
@@ -168,7 +216,7 @@ pub fn run(args: Args) -> Result<()> {
     // Default orbs + any extra methods declared in the goal file.
     let mut methods = default_methods();
     for spec in &goal.methods {
-        methods.push(spec.build_for_item(&db, base, goal.item.item_level)?);
+        methods.push(spec.build_for_item(&db, base, starting_item_level)?);
     }
     let mut method_names = std::collections::HashSet::new();
     for method in &methods {
@@ -204,14 +252,17 @@ pub fn run(args: Args) -> Result<()> {
         println!("Warning: [prices] \"{name}\" matches no method name — ignored");
     }
 
-    let initial = goal
-        .item
-        .build_state(base_id.clone(), base.tags.clone(), &db)?;
-    if !goal.item.mods.is_empty() {
+    let initial = match imported_initial {
+        Some(initial) => initial,
+        None => goal
+            .item
+            .build_state(base_id.clone(), base.tags.clone(), &db)?,
+    };
+    if imported_start || !goal.item.mods.is_empty() {
         println!(
             "Starting item: {:?} with {} existing mod(s) ({} fractured, crafted: {})",
             initial.rarity,
-            initial.prefixes.len() + initial.suffixes.len() + initial.fractured.len(),
+            initial.mod_count(),
             initial.fractured.len(),
             initial.crafted_mod.is_some()
         );
@@ -265,9 +316,24 @@ pub fn run(args: Args) -> Result<()> {
                 );
             }
         }
-        None => println!("\nNo crafting path found — no method was applicable to the base item."),
+        None => {
+            println!("\nNo crafting path found — no method was applicable to the starting item.")
+        }
     }
     Ok(())
+}
+
+fn read_item_text(path: &str) -> Result<String> {
+    if path == "-" {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .context("Failed to read clipboard item text from stdin")?;
+        Ok(text)
+    } else {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read clipboard item text from {path}"))
+    }
 }
 
 /// Human-readable probability: percentages down to 0.1%, then "~1 in N" so
@@ -353,7 +419,7 @@ fn print_result(result: &SearchResult, goal: &GoalSpec, db: &GameData) {
         result.score
     );
     if result.steps.is_empty() {
-        println!("(the unmodified base item already scores best)");
+        println!("(the starting item already scores best)");
     }
     let mut any_estimate = false;
     for (i, step) in result.steps.iter().enumerate() {
@@ -408,6 +474,21 @@ fn print_result(result: &SearchResult, goal: &GoalSpec, db: &GameData) {
     }
 
     println!("\n--- Final item ({:?}) ---", result.state.rarity);
+    if result.state.quality != 0 {
+        println!("Quality: +{}%", result.state.quality);
+    }
+    if let Some(sockets) = &result.state.sockets {
+        println!("Sockets: {sockets}");
+    }
+    if let Some(energy_shield) = result.state.displayed_energy_shield {
+        println!("Imported displayed Energy Shield: {energy_shield}");
+    }
+    if result.state.corrupted {
+        println!("Corrupted");
+    }
+    if result.state.mirrored {
+        println!("Mirrored");
+    }
     print_mod_list("Prefixes", &result.state.prefixes, db);
     print_mod_list("Suffixes", &result.state.suffixes, db);
     if !result.state.fractured.is_empty() {
@@ -448,6 +529,8 @@ fn print_result(result: &SearchResult, goal: &GoalSpec, db: &GameData) {
             db,
         );
     }
+    print_mod_list("Implicits", &result.state.implicits, db);
+    print_mod_list("Enchantments", &result.state.enchants, db);
     let dominance = match (exarch_tier, eater_tier) {
         (Some(exarch), Some(eater)) if exarch < eater => Some("Searing Exarch"),
         (Some(exarch), Some(eater)) if eater < exarch => Some("Eater of Worlds"),
@@ -484,5 +567,42 @@ fn print_mod_list(label: &str, mods: &[crate::item::Modifier], db: &GameData) {
             .map(|r| format!("{} = {}", r.stat_id, r.value))
             .collect();
         println!("  {display_name} [{}]  {}", m.mod_id, rolls.join(", "));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn item_file_requires_goal() {
+        let error = Args::try_parse_from(["poe1_htc", "--item-file", "item.txt"])
+            .expect_err("--item-file without --goal must be rejected");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn item_file_accepts_stdin_marker() {
+        let args = Args::try_parse_from(["poe1_htc", "--goal", "goal.toml", "--item-file", "-"])
+            .expect("a lone dash should be accepted as the item input path");
+        assert_eq!(args.item_file.as_deref(), Some("-"));
+    }
+
+    #[test]
+    fn item_file_conflicts_with_base_override() {
+        let error = Args::try_parse_from([
+            "poe1_htc",
+            "--goal",
+            "goal.toml",
+            "--item-file",
+            "item.txt",
+            "--base-item",
+            "Astral Plate",
+        ])
+        .expect_err("an imported item has an authoritative base");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

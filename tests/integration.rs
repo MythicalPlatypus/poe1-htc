@@ -28,7 +28,7 @@ use poe1_htc::currency::{
     harvest::{HarvestCraft, HarvestOp, HarvestTarget},
     orbs::{
         ChaosOrb, DivineOrb, ExaltedOrb, OrbOfAlchemy, OrbOfAlteration, OrbOfAnnulment,
-        OrbOfAugmentation, OrbOfTransmutation, RegalOrb,
+        OrbOfAugmentation, OrbOfScouring, OrbOfTransmutation, RegalOrb,
     },
     CraftingMethod, Repriced, MONTE_CARLO_SAMPLES,
 };
@@ -70,6 +70,7 @@ fn make_mod(gen_type: GenerationType, mod_type: &str, tag: &str, weight: u32) ->
         mod_type: mod_type.to_string(),
         groups: vec![mod_type.to_string()],
         is_essence_only: false,
+        text: None,
     }
 }
 
@@ -915,6 +916,134 @@ fn repriced_overrides_cost_and_delegates_everything_else() {
         MONTE_CARLO_SAMPLES,
         "apply must delegate to the inner method"
     );
+}
+
+// ─── 7: imported craft-invariant metadata ────────────────────────────────────
+
+/// A rare sword carrying the metadata an imported item would have: generic
+/// implicits, enchants, quality, sockets, displayed ES, plus one normal
+/// prefix and suffix to give removal/reroll methods something to chew on.
+fn imported_meta_sword() -> ItemState {
+    let mut item = rare_sword();
+    item.prefixes.push(marker("P0", GenerationType::Prefix));
+    item.suffixes.push(marker("S0", GenerationType::Suffix));
+    item.implicits
+        .push(marker("ImportedImplicit", GenerationType::Corrupted));
+    item.enchants
+        .push(marker("ImportedEnchant", GenerationType::Enchantment));
+    item.quality = 30;
+    item.sockets = Some("W-W-W-W-W-W".to_string());
+    item.displayed_energy_shield = Some(1200);
+    item
+}
+
+fn assert_meta_preserved(outcomes: &[(ItemState, f64)], context: &str) {
+    for (state, _) in outcomes {
+        assert_eq!(
+            state.implicits.len(),
+            1,
+            "{context}: generic implicit lost or duplicated"
+        );
+        assert_eq!(state.implicits[0].mod_id, "ImportedImplicit", "{context}");
+        assert_eq!(
+            state.enchants.len(),
+            1,
+            "{context}: enchantment lost or duplicated"
+        );
+        assert_eq!(state.enchants[0].mod_id, "ImportedEnchant", "{context}");
+        assert_eq!(state.quality, 30, "{context}: quality changed");
+        assert_eq!(
+            state.sockets.as_deref(),
+            Some("W-W-W-W-W-W"),
+            "{context}: sockets changed"
+        );
+        assert_eq!(
+            state.displayed_energy_shield,
+            Some(1200),
+            "{context}: displayed ES changed"
+        );
+    }
+}
+
+#[test]
+fn crafting_actions_preserve_imported_metadata() {
+    let db = varied_db();
+    let item = imported_meta_sword();
+
+    let methods: Vec<(&str, Box<dyn CraftingMethod>)> = vec![
+        ("Orb of Scouring", Box::new(OrbOfScouring)),
+        ("Chaos Orb", Box::new(ChaosOrb)),
+        ("Exalted Orb", Box::new(ExaltedOrb)),
+        ("Orb of Annulment", Box::new(OrbOfAnnulment)),
+        ("Divine Orb", Box::new(DivineOrb)),
+        (
+            "Essence",
+            Box::new(Essence {
+                display_name: "Essence of Testing".to_string(),
+                guaranteed_mod_id: "P2".to_string(),
+                cost_chaos: 5.0,
+                max_item_level: None,
+                can_reforge_rare: true,
+            }),
+        ),
+    ];
+    for (name, method) in &methods {
+        assert!(
+            method.can_apply(&item, &db),
+            "{name} should apply to the fixture item"
+        );
+        let outcomes = method.apply(&item, &db, &mut test_rng()).unwrap();
+        assert_meta_preserved(&outcomes, name);
+    }
+
+    // Scouring back to Normal, then the Transmute/Alchemy front half of the
+    // ladder — metadata must ride through rarity transitions too.
+    let scoured = OrbOfScouring.apply(&item, &db, &mut test_rng()).unwrap();
+    assert_eq!(scoured[0].0.rarity, Rarity::Normal);
+    let transmuted = OrbOfTransmutation
+        .apply(&scoured[0].0, &db, &mut test_rng())
+        .unwrap();
+    assert_meta_preserved(&transmuted, "Orb of Transmutation");
+    let alched = OrbOfAlchemy
+        .apply(&scoured[0].0, &db, &mut test_rng())
+        .unwrap();
+    assert_meta_preserved(&alched, "Orb of Alchemy");
+}
+
+#[test]
+fn imported_zero_spawn_fractured_mod_survives_rerolls_but_never_rolls() {
+    // A Delve-domain, zero-spawn-weight prefix — importable as existing
+    // fractured state, impossible for ordinary random rolling.
+    let mut delve = make_mod(GenerationType::Prefix, "MaximumSpectres", "sword", 0);
+    delve.domain = Domain::Delve;
+    let db = varied_db_with(vec![("DelveSpectre", delve)]);
+
+    let mut item = rare_sword();
+    item.fractured
+        .push(marker("DelveSpectre", GenerationType::Prefix));
+
+    for (name, method) in [
+        ("Chaos Orb", &ChaosOrb as &dyn CraftingMethod),
+        ("Exalted Orb", &ExaltedOrb),
+    ] {
+        let outcomes = method.apply(&item, &db, &mut test_rng()).unwrap();
+        for (state, _) in &outcomes {
+            assert_eq!(
+                state.fractured.len(),
+                1,
+                "{name}: fractured mod must survive"
+            );
+            assert_eq!(state.fractured[0].mod_id, "DelveSpectre", "{name}");
+            assert!(
+                state
+                    .prefixes
+                    .iter()
+                    .chain(state.suffixes.iter())
+                    .all(|m| m.mod_id != "DelveSpectre"),
+                "{name}: zero-spawn Delve mod must never roll as a new affix"
+            );
+        }
+    }
 }
 
 #[test]
