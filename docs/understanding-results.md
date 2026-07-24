@@ -1,0 +1,152 @@
+# Understanding Results
+
+This page walks through a real report line by line, then explains how to
+act on the numbers. **Read this before spending expensive currency** — the
+tool reports honest uncertainty, and knowing which number is which will
+save you orbs.
+
+The example below is `goals/finish_fractured_chest.toml --seed 42`: finish
+a rare Astral Plate that already has a fractured T1 life roll, targeting
+life + triple resistance.
+
+## The header
+
+```text
+Loaded 39292 mods, 5059 base items from data
+Crafting catalogs: 774 bench recipes, 106 essences, 445 fossils
+Base item: Astral Plate (Metadata/Items/Armours/BodyArmours/BodyStr15), item level 86
+Search: beam_width=25, max_steps=8, cost_weight=0.05, restart_cost=1c, seed=42
+Starting item: Rare with 2 existing mod(s) (1 fractured, crafted: false)
+```
+
+Sanity-check this section first: the right base, the right item level, the
+starting mods you expected, and the search settings that were actually used
+(CLI flags override the goal file, which overrides defaults).
+
+## The recommended path
+
+```text
+=== Best crafting path: target COMPLETE (4/4 wants, goal score 34.0/34.0, ranking score -28.019) ===
+  1. Chaos Orb — 1.00c per application; ~6.0% per try, reroll until hit -> ~16.7c expected
+  2. Exalted Orb — 100.00c per application; one-shot, ~9.5% chance of >= this result
+```
+
+- **`target COMPLETE (4/4 wants)`** — the plan's final item satisfies every
+  want. If it says `INCOMPLETE`, the search could not reach everything within
+  `max_steps`/`beam_width`; the score tells you how close it got.
+- **`goal score`** — sum of satisfied want weights (here all 34 points).
+- **`ranking score`** — goal score minus `cost_weight ×` expected cost.
+  This is what the search maximizes; it can be negative for expensive plans
+  and is mainly useful for comparing pathways with each other.
+
+Each step is one of two kinds, and the difference matters:
+
+- **Repeatable ("reroll until hit")** — you spam this until you hit the
+  shown outcome or better. The Chaos Orb here hits ~6% per try, so it is
+  priced at `1c / 0.06 ≈ 16.7c` expected. No risk of ruining the item —
+  only of spending more than the average.
+- **One-shot** — you pay once and live with the result. The Exalted Orb
+  slam lands a result at least this good ~9.5% of the time. A miss does
+  not refund your orb, and may leave the item worse than planned.
+
+## The cost bracket
+
+```text
+Cost if every step hits first try: 101.0 chaos
+Expected cost (rerolling repeatable steps until they hit): ~116.7 chaos
+Chance all one-shot steps land at least this well: 9.5%
+Expected cost if a one-shot miss scraps the item and you restart: ~1240.4 chaos (includes configured reset cost)
+```
+
+Read these as a bracket, best case to worst case:
+
+1. **First-try cost** — lucky floor. You will rarely pay this little.
+2. **Expected cost** — the realistic number *if all one-shots land*:
+   repeatable steps priced at cost ÷ hit-chance.
+3. **One-shot odds** — the chance the whole plan lands as printed. 9.5%
+   means you should expect to miss more often than not.
+4. **Restart estimate** — pessimistic ceiling: every one-shot miss scraps
+   the item and you start over, paying `restart_cost` each time.
+
+Your real cost usually lands **between #2 and #4**, because actual recovery
+after a missed slam (annul, live with it, adjust the plan) is cheaper than
+a full restart but not free. The tool does not yet model recovery policies —
+this is listed in Known Limitations.
+
+```text
+(~ marks estimated probabilities from sampled rolls; full rerolls use 50 Monte Carlo samples)
+```
+
+Any number with `~` came from sampling, not exact enumeration. Full rerolls
+(Chaos Orb, Alchemy, essences, fossils) use 50 samples per expansion, so a
+`~6.0%` is an estimate with real sampling noise, and outcomes rarer than
+1-in-50 can be invisible to a single run. Exact probabilities (single-mod
+adds/removes like Exalts, Annuls, Augments over enumerable pools) print
+without the `~`.
+
+## The final item and goal report
+
+```text
+--- Final item (Rare) ---
+Prefixes:
+  Carapaced [LocalIncreasedPhysicalDamageReductionRating6]  local_base_physical_damage_reduction_rating = 104
+  ...
+Fractured:
+  Prime [IncreasedLife12]  base_maximum_life = 180
+
+--- Goal satisfaction ---
+  [x] stat base_maximum_life >= 175 (weight 10)
+  [x] stat base_fire_damage_resistance_% >= 30 (weight 8)
+  ...
+```
+
+This is the *planned* final item — the outcome the probabilities refer to,
+shown with each mod's RePoE ID and rolled values. The bracketed IDs are the
+same identifiers you use in `[[wants]]` and `[[item.mods]]`, so reports are
+also the easiest way to learn the mod vocabulary. Imported items additionally
+list quality, sockets, implicits, and enchantments here.
+
+## Alternative pathways
+
+```text
+--- Alternative pathway #2 (goal 34.0/34.0, 4/4 wants, ranking -69.399, retry ~156.7c, restart ~2068.0c, one-shot odds 5.7%) ---
+  Chaos Orb, then Orb of Annulment, then Exalted Orb
+
+--- Alternative pathway #3 (goal 26.0/34.0, 3/4 wants, ranking 25.167, retry ~16.7c, restart ~16.7c, rerolls only) ---
+  Chaos Orb
+```
+
+With `--top N` you get up to N genuinely distinct routes, best first. They
+are often more useful than the single best line: pathway #3 here scores
+lower but is **rerolls only** — no one-shot risk at all, ~17c, and gets 3
+of 4 wants. Depending on your budget and stomach, that may be the plan you
+actually execute.
+
+## Is the recommendation stable?
+
+Beam search is a heuristic and sampled probabilities carry noise. Before
+committing real currency to an expensive plan:
+
+- **Re-run with different seeds** (`--seed 1`, `--seed 2`, …). A robust
+  recommendation survives seed changes; a coin-flip plan will flicker.
+- **Widen the beam** (`--beam-width 100`). If the answer improves, the
+  default width was too narrow for this goal; keep widening until it
+  stabilizes.
+- **Compare `--top 3`** routes. If they disagree wildly in strategy but
+  score similarly, the model is telling you several plans are close — pick
+  the one whose risk profile you prefer.
+
+One more honest caveat: multi-step probabilities group sibling outcomes by
+goal score. Two outcomes with equal score can support different follow-ups,
+so a multi-step "chance all steps land" is a policy estimate, not a
+guarantee that every counted branch continues exactly as printed.
+
+## Quick reference: tuning knobs
+
+| Symptom | Try |
+|---|---|
+| Plan stops short of the full goal | Raise `max_steps`, widen `beam_width`, check the wants are individually reachable on this base/ilvl |
+| Recommends absurdly expensive routes | Raise `cost_weight`, set real `[prices]` |
+| Recommends cheap routes that barely improve the item | Lower `cost_weight` |
+| Different runs give different answers | Set `--seed`, widen `beam_width`, re-check with several seeds |
+| Search is slow | Lower `beam_width`/`max_steps`; make sure you built with `--release` |

@@ -17,6 +17,19 @@ works end to end and the implemented mechanics are tested, but several advanced
 crafting systems remain unsupported. Read [Known Limitations](#known-limitations)
 before spending expensive currency.
 
+## Documentation
+
+New here? Start with the guides in [`docs/`](docs):
+
+1. [Getting Started](docs/getting-started.md) — install, download data, first run
+2. [Writing Goal Files](docs/writing-goals.md) — tutorial and complete TOML reference
+3. [Importing Your Item](docs/importing-your-item.md) — start from a `Ctrl+C` item paste
+4. [Understanding Results](docs/understanding-results.md) — what every number means before you spend
+5. [FAQ & Troubleshooting](docs/faq.md) — common errors, stability, limitations
+
+The rest of this README is a condensed overview of the same material plus
+contributor notes.
+
 ## What Works
 
 - RePoE modifier and base-item loading

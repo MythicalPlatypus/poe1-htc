@@ -1,0 +1,308 @@
+# Writing Goal Files
+
+A goal file is a small TOML document that tells the optimizer three things:
+what item you start with, what mods you want on it, and which crafting
+methods and prices to plan with. This page is both a tutorial and the
+complete reference.
+
+Run any goal with:
+
+```bash
+cargo run --release -- --goal my_goal.toml
+```
+
+Unknown or misspelled fields are rejected at load time with an error, so
+typos fail fast instead of silently changing the search.
+
+## A minimal goal
+
+```toml
+[item]
+base = "Astral Plate"
+item_level = 86
+
+[[wants]]
+group = "IncreasedLife"
+weight = 10.0
+
+[search]
+cost_weight = 0.02
+```
+
+That is enough: start from a fresh item-level-86 Astral Plate, value any
+tier of the flat-life prefix at 10 points, and penalize expected spending at
+0.02 points per chaos.
+
+## `[item]` — the starting item
+
+| Field | Required | Meaning |
+|---|---|---|
+| `base` | yes | Base item display name (`"Astral Plate"`) or RePoE metadata ID (`"Metadata/Items/Armours/BodyArmours/BodyStr15"`) |
+| `item_level` | no (default 84) | Gates which mods can roll: a mod is only available when its `required_level <= item_level` |
+| `rarity` | when `[[item.mods]]` present | `"normal"` (default), `"magic"`, or `"rare"` |
+| `influences` | no | Up to two of `shaper`, `elder`, `crusader`, `hunter`, `redeemer`, `warlord` |
+| `exarch_implicit` | no | Existing Searing Exarch implicit (RePoE mod ID), for mid-craft starts |
+| `eater_implicit` | no | Existing Eater of Worlds implicit (RePoE mod ID) |
+
+### `[[item.mods]]` — mods already on the item
+
+Describe a mid-craft item by listing its current mods:
+
+```toml
+[item]
+base = "Astral Plate"
+item_level = 86
+rarity = "rare"
+
+[[item.mods]]
+mod_id = "IncreasedLife12"   # RePoE mod ID
+values = [180]               # one value per stat, in the mod's stat order
+fractured = true             # locked: survives rerolls, blocks its group
+
+[[item.mods]]
+mod_id = "Strength4"         # values omitted = midpoint rolls
+```
+
+| Field | Meaning |
+|---|---|
+| `mod_id` | RePoE mod ID; must exist in `mods.json` |
+| `values` | Rolled value per stat. Omitted = midpoint of each range. Out-of-range values are rejected |
+| `fractured` | The mod is fractured (locked against removal) |
+| `crafted` | The mod occupies the single bench-craft slot (must be a `domain = "crafted"` mod) |
+
+Every declared mod is validated against the database: affix type, item
+level, roll ranges, prefix/suffix capacity for the declared rarity, and
+group conflicts. An impossible starting item is an error, not a warning.
+
+> **Tip:** if the item exists in your stash, skip `[[item.mods]]` entirely
+> and use [`--item-file`](importing-your-item.md) instead — the game's own
+> item text is harder to get wrong.
+
+## `[[wants]]` — what you are crafting toward
+
+Each `[[wants]]` entry is one desired outcome worth `weight` points. At
+least one is required. **All criteria inside a single entry must hold on the
+same mod**:
+
+```toml
+# Any tier of the flat-life prefix group.
+[[wants]]
+group = "IncreasedLife"
+weight = 10.0
+
+# A life roll of 100+, on a mod from that same group (T1 only).
+[[wants]]
+group = "IncreasedLife"
+stat = "base_maximum_life"
+min_value = 100
+weight = 5.0
+
+# One exact tier, by mod ID.
+[[wants]]
+mod_id = "IncreasedLife10"
+weight = 2.0
+```
+
+| Field | Meaning |
+|---|---|
+| `mod_id` | Exact RePoE mod ID (a specific tier) |
+| `group` | RePoE conflict group — matches any tier in the group |
+| `stat` | RePoE stat ID (e.g. `base_maximum_life`) |
+| `min_value` | Minimum rolled value; requires `stat` |
+| `weight` | Points scored when satisfied. Default 1.0, must be > 0 |
+
+Weights are how you tell the search what matters: a mandatory mod should
+have a much higher weight than a nice-to-have. The search maximizes total
+score minus cost (see `cost_weight` below).
+
+Wants are satisfied by any mod on the final item — prefixes, suffixes,
+fractured mods, crafted mods, Eldritch implicits, and (on imported items)
+generic implicits and enchantments all count.
+
+### Finding mod IDs, groups, and stat names
+
+Three practical options:
+
+1. **Import your item.** Run with `--item-file` and read the IDs the report
+   prints, e.g. `Prime [IncreasedLife12] base_maximum_life = 180`. Fastest
+   way to learn the vocabulary for mods you already own.
+2. **Search the data files.** `data/mods.json` is plain JSON: search for the
+   in-game text ("to maximum Life") and read the entry's key (mod ID),
+   `groups`, and `stats[].id` fields.
+3. **Community databases.** [poedb.tw](https://poedb.tw) lists the same mod
+   and group identifiers RePoE exports.
+
+## `[[methods]]` — extra crafting methods
+
+The search always has the default orb set: Scouring, Transmutation,
+Alteration, Augmentation, Regal, Alchemy, Chaos, Exalted, Annulment,
+Divine, Fracturing, and Remove Crafted Mods. `[[methods]]` entries add
+configured crafts on top. Every entry is selected by `type`:
+
+### `essence` — guarantee one mod, reroll the rest
+
+```toml
+[[methods]]
+type = "essence"
+essence = "Deafening Essence of Greed"   # display name or metadata ID
+cost = 5.0
+```
+
+With `essences.json` present, the essence's guaranteed mod is resolved for
+your item class and lower-tier random-mod caps are enforced.
+
+### `bench` — deterministically add a crafted mod
+
+```toml
+[[methods]]
+type = "bench"
+mod_id = "EinharMasterIncreasedLife5_"   # any mods.json entry with domain = "crafted"
+cost = 3.0                               # default 2.0
+```
+
+With `crafting_bench_options.json` present, invalid bench crafts for your
+item class are rejected before the search starts.
+
+### `fossil` — weighted reroll, single or multi-fossil
+
+```toml
+[[methods]]
+type = "fossil"
+fossil = "Pristine Fossil"
+cost = 10.0
+```
+
+Multi-fossil resonator — add `[[methods.fossils]]` sub-tables:
+
+```toml
+[[methods]]
+type = "fossil"
+fossil = "Pristine Fossil"
+cost = 25.0
+
+[[methods.fossils]]
+fossil = "Dense Fossil"
+```
+
+Without the fossil catalog you can configure weights manually with
+`boosted_tags`, `reduced_tags`, `blocked_mod_ids`, and `forced_mod_ids`.
+
+### `harvest` — reforge or augment by tag
+
+```toml
+[[methods]]
+type = "harvest"
+op = "reforge"      # "reforge" | "augment"
+target = "life"
+cost = 30.0
+```
+
+Valid targets: `attack`, `caster`, `speed`, `life`, `defence`,
+`resistance`, `chaos`, `fire`, `cold`, `lightning`, `physical`,
+`critical`, `minion`, `mana`.
+
+Reforge rerolls a Rare item guaranteeing at least one mod with the target
+tag. Augment adds one mod with the target tag to a non-influenced Rare with
+an open slot.
+
+### `eldritch_chaos` / `eldritch_exalt` / `eldritch_annul`
+
+```toml
+[[methods]]
+type = "eldritch_exalt"
+god = "exarch"      # "exarch" | "eater" — the currently dominant side
+```
+
+Eldritch currency requires a dominant Eldritch implicit on the item, so
+these only fire on items with `exarch_implicit` / `eater_implicit` set (or
+imported items that have one).
+
+### `conqueror_exalt` — influenced slam
+
+```toml
+[[methods]]
+type = "conqueror_exalt"
+influence = "hunter"   # "crusader" | "hunter" | "redeemer" | "warlord"
+```
+
+Adds one conqueror-exclusive affix and applies that influence.
+
+### `bestiary_swap` — beastcraft affix swap
+
+```toml
+[[methods]]
+type = "bestiary_swap"
+add = "prefix"       # "prefix": remove a random suffix, add a prefix
+beast_level = 83     # caps the level of the added mod
+cost = 12.0
+```
+
+All method entries also accept an optional `name` to control how the step
+appears in reports and how `[prices]` keys match.
+
+## `[prices]` — your league's prices
+
+Built-in costs are placeholders. Override them with current league prices,
+keyed by the exact method display name:
+
+```toml
+[prices]
+"Divine Orb" = 220.0
+"Exalted Orb" = 45.0
+"Orb of Annulment" = 25.0
+"Fracturing Orb" = 180.0
+```
+
+Built-in defaults (chaos):
+
+| Method | Default | Method | Default |
+|---|---|---|---|
+| Orb of Transmutation | 0.05 | Orb of Annulment | 40 |
+| Orb of Augmentation | 0.05 | Exalted Orb | 100 |
+| Orb of Alteration | 0.1 | Divine Orb | 150 |
+| Orb of Scouring | 1 | Fracturing Orb | 250 |
+| Chaos Orb | 1 | Eldritch Chaos Orb | 5 |
+| Regal Orb | 1 | Eldritch Orb of Annulment | 10 |
+| Orb of Alchemy | 2 | Eldritch Exalted Orb | 20 |
+| Remove Crafted Mods | 1 | Conqueror Exalted Orbs | 200 |
+
+A `[prices]` key that matches no method name prints a warning, so typos are
+visible. The Eldritch and Conqueror entries above use per-god / per-conqueror
+display names, e.g. `"Eldritch Exalted Orb (Exarch)"` and
+`"Hunter's Exalted Orb"` — copy the name exactly as a report prints it.
+
+## `[search]` — search parameters
+
+```toml
+[search]
+beam_width = 40
+max_steps = 12
+cost_weight = 0.02
+restart_cost = 1.0
+seed = 42
+top = 3
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `beam_width` | 50 | Candidate states kept per depth. Wider = more thorough, slower |
+| `max_steps` | 10 | Maximum crafting actions in a plan |
+| `cost_weight` | 0.0 | Ranking penalty per expected chaos spent. **The default ignores cost entirely — always set this** |
+| `restart_cost` | 1.0 | Chaos to restore/replace the base if a failed one-shot forces a restart |
+| `seed` | random | RNG seed; set it for reproducible runs |
+| `top` | 1 | Distinct pathways to report, best first |
+
+Every field can be overridden on the command line (`--beam-width`,
+`--max-steps`, `--cost-weight`, `--restart-cost`, `--seed`, `--top`);
+CLI flag beats goal file beats built-in default.
+
+### Choosing `cost_weight`
+
+`cost_weight` is the exchange rate between score and money. Rule of thumb:
+decide how much expected chaos one point of score is worth to you and
+invert. If your want weights sum to ~25 and you would pay about 50 chaos
+per point, set `0.02`. Too low and the search happily recommends 500-chaos
+routes for marginal gains; too high and it stops at cheap, mediocre items.
+
+The examples in [`goals/`](../goals) are annotated with this reasoning —
+copy one and adjust.
