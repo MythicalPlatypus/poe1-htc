@@ -219,10 +219,18 @@ impl CraftingMethod for EldritchChaosOrb {
             let mut next = item.clone();
             clear_target_modifiers(&mut next, &target);
 
-            // RePoE supplies mod weights, but not the game's affix-count odds.
-            // Sample every legal target-side count without presenting the
-            // resulting sample weights as exact in-game probabilities.
-            let add_count = rng.random_range(0..=open_target_slots(&next, &target));
+            // A reforge of one side always yields at least one new modifier;
+            // observed counts are "1-2, sometimes 3" (maxroll eldritch guide).
+            // RePoE does not publish the exact count odds, so approximate with
+            // weights 40/40/20 for 1/2/3, clamped to the open slots on that
+            // side. Sample weights are Monte Carlo, never exact probabilities.
+            let open_slots = open_target_slots(&next, &target);
+            let raw_count = match rng.random_range(0..10u32) {
+                0..=3 => 1,
+                4..=7 => 2,
+                _ => 3,
+            };
+            let add_count = raw_count.min(open_slots.max(1));
             let mut extra_tags = Vec::new();
             for _ in 0..add_count {
                 if !add_target_modifier(&mut next, &target, db, rng, &mut extra_tags) {

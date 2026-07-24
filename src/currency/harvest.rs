@@ -146,12 +146,20 @@ impl CraftingMethod for HarvestCraft {
         self.op == HarvestOp::Reforge
     }
 
-    fn can_apply(&self, item: &ItemState, _db: &GameData) -> bool {
+    fn can_apply(&self, item: &ItemState, db: &GameData) -> bool {
         if !item.is_craftable() || item.rarity != Rarity::Rare {
             return false;
         }
         match self.op {
-            HarvestOp::Reforge => true,
+            // The guaranteed-tag pick must have at least one candidate on the
+            // reforged (cleared) item, or every apply would fail.
+            HarvestOp::Reforge => {
+                let mut cleared = item.clone();
+                cleared.prefixes.clear();
+                cleared.suffixes.clear();
+                cleared.crafted_mod = None;
+                !eligible_mods_harvest_tag(&cleared, self.target.as_tag(), db).is_empty()
+            }
             HarvestOp::Augment => !Self::has_influence(item) && Self::removable_count(item) > 0,
         }
     }

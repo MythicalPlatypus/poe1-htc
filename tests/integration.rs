@@ -585,7 +585,7 @@ fn transmutation_makes_magic_with_one_or_two_mods() {
 }
 
 #[test]
-fn alteration_rerolls_magic_and_is_blocked_by_crafted_mod() {
+fn alteration_rerolls_magic_and_removes_crafted_mod() {
     let db = varied_db();
     let mut item = sword(Rarity::Magic);
     item.prefixes.push(marker("P0", GenerationType::Prefix));
@@ -599,10 +599,12 @@ fn alteration_rerolls_magic_and_is_blocked_by_crafted_mod() {
     }
 
     item.crafted_mod = Some(marker("C0", GenerationType::Suffix));
-    assert!(
-        !OrbOfAlteration.can_apply(&item, &db),
-        "alteration must be blocked while a crafted mod is present"
-    );
+    let outcomes = OrbOfAlteration
+        .apply(&item, &db, &mut test_rng())
+        .expect("Alteration should reroll the crafted modifier away");
+    assert!(outcomes
+        .iter()
+        .all(|(state, _)| state.crafted_mod.is_none()));
 }
 
 #[test]

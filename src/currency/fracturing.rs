@@ -30,8 +30,11 @@ impl FracturingOrb {
             .any(|tag| INFLUENCE_TAGS.contains(&tag.as_str()))
     }
 
+    /// Bench-crafted modifiers cannot be fractured, so they are excluded from
+    /// the candidate set and — conservatively, since the interaction is not
+    /// separately verified — from the "at least 4 modifiers" count as well.
     fn candidate_count(item: &ItemState) -> usize {
-        item.prefixes.len() + item.suffixes.len() + usize::from(item.crafted_mod.is_some())
+        item.prefixes.len() + item.suffixes.len()
     }
 }
 
@@ -82,16 +85,6 @@ impl CraftingMethod for FracturingOrb {
             outcomes.push((next, probability));
         }
 
-        if item.crafted_mod.is_some() {
-            let mut next = item.clone();
-            let fractured = next
-                .crafted_mod
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("crafted fracture candidate disappeared"))?;
-            next.fractured.push(fractured);
-            outcomes.push((next, probability));
-        }
-
         Ok(outcomes)
     }
 }
@@ -121,6 +114,7 @@ mod tests {
             ("p1", GenerationType::Prefix, Domain::Item),
             ("p2", GenerationType::Prefix, Domain::Item),
             ("s1", GenerationType::Suffix, Domain::Item),
+            ("s2", GenerationType::Suffix, Domain::Item),
             ("crafted", GenerationType::Suffix, Domain::Crafted),
         ] {
             mods.insert(
@@ -153,12 +147,13 @@ mod tests {
         item.prefixes.push(modifier("p1", GenerationType::Prefix));
         item.prefixes.push(modifier("p2", GenerationType::Prefix));
         item.suffixes.push(modifier("s1", GenerationType::Suffix));
+        item.suffixes.push(modifier("s2", GenerationType::Suffix));
         item.crafted_mod = Some(modifier("crafted", GenerationType::Suffix));
         item
     }
 
     #[test]
-    fn enumerates_every_explicit_with_equal_probability() {
+    fn enumerates_every_natural_explicit_with_equal_probability() {
         let item = eligible_item();
         let outcomes = FracturingOrb
             .apply(&item, &db(), &mut StdRng::seed_from_u64(1))
@@ -169,9 +164,19 @@ mod tests {
             .iter()
             .all(|(_, probability)| (*probability - 0.25).abs() < f64::EPSILON));
         assert!(outcomes.iter().all(|(state, _)| state.fractured.len() == 1));
-        assert!(outcomes.iter().any(
-            |(state, _)| state.fractured[0].mod_id == "crafted" && state.crafted_mod.is_none()
+        // Bench-crafted mods are never fractured and survive untouched.
+        assert!(outcomes.iter().all(
+            |(state, _)| state.fractured[0].mod_id != "crafted" && state.crafted_mod.is_some()
         ));
+    }
+
+    #[test]
+    fn crafted_mod_does_not_count_toward_minimum_modifiers() {
+        let data = db();
+        let mut item = eligible_item();
+        // 3 natural mods + crafted: below the 4-natural-modifier floor.
+        item.suffixes.pop();
+        assert!(!FracturingOrb.can_apply(&item, &data));
     }
 
     #[test]
