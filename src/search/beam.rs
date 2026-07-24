@@ -202,7 +202,9 @@ fn deduplicate_candidates(candidates: Vec<BeamNode>) -> Vec<BeamNode> {
                 let current = &unique[position];
                 if candidate.score > current.score
                     || (candidate.score == current.score
-                        && candidate.success_prob > current.success_prob)
+                        && (candidate.restart_adjusted_cost < current.restart_adjusted_cost
+                            || (candidate.restart_adjusted_cost == current.restart_adjusted_cost
+                                && candidate.success_prob > current.success_prob)))
                 {
                     unique[position] = candidate;
                 }
@@ -1365,6 +1367,76 @@ mod tests {
 
         assert_eq!(unique.len(), 1);
         assert_eq!(unique[0].score, 5.0);
+    }
+
+    #[test]
+    fn semantic_dedup_prefers_cheaper_path_when_score_ignores_cost() {
+        struct TransitionMethod {
+            name: &'static str,
+            from: &'static str,
+            to: &'static str,
+            cost: f64,
+        }
+
+        impl CraftingMethod for TransitionMethod {
+            fn name(&self) -> &str {
+                self.name
+            }
+
+            fn cost_chaos(&self) -> f64 {
+                self.cost
+            }
+
+            fn can_apply(&self, item: &ItemState, _db: &GameData) -> bool {
+                item.base_id == self.from
+            }
+
+            fn apply(
+                &self,
+                item: &ItemState,
+                _db: &GameData,
+                _rng: &mut dyn RngCore,
+            ) -> Result<Vec<(ItemState, f64)>> {
+                let mut next = item.clone();
+                next.base_id = self.to.to_string();
+                Ok(vec![(next, 1.0)])
+            }
+        }
+
+        let db = empty_db();
+        let methods: Vec<Arc<dyn CraftingMethod>> = vec![
+            Arc::new(TransitionMethod {
+                name: "expensive",
+                from: "initial",
+                to: "common",
+                cost: 10.0,
+            }),
+            Arc::new(TransitionMethod {
+                name: "cheap",
+                from: "initial",
+                to: "common",
+                cost: 1.0,
+            }),
+            Arc::new(TransitionMethod {
+                name: "finish",
+                from: "common",
+                to: "complete",
+                cost: 1.0,
+            }),
+        ];
+        let search = BeamSearch::new(config(1, 2, 0.0), &db, methods);
+
+        let result = search
+            .run(initial(), |state| f64::from(state.base_id == "complete"))
+            .expect("the shared successor should reach the final state");
+        let method_names: Vec<&str> = result
+            .steps
+            .iter()
+            .map(|step| step.method.as_str())
+            .collect();
+
+        assert_eq!(method_names, ["cheap", "finish"]);
+        assert_eq!(result.total_cost, 2.0);
     }
 
     #[test]

@@ -152,12 +152,18 @@ impl CraftingMethod for HarvestCraft {
         self.op == HarvestOp::Reforge
     }
 
-    fn can_apply(&self, item: &ItemState, _db: &GameData) -> bool {
+    fn can_apply(&self, item: &ItemState, db: &GameData) -> bool {
         if !item.is_craftable() || item.rarity != Rarity::Rare {
             return false;
         }
         match self.op {
-            HarvestOp::Reforge => true,
+            HarvestOp::Reforge => {
+                let mut cleared = item.clone();
+                cleared.prefixes.clear();
+                cleared.suffixes.clear();
+                cleared.crafted_mod = None;
+                !eligible_mods_harvest_tag(&cleared, self.target.as_tag(), db).is_empty()
+            }
             HarvestOp::Augment => !Self::has_influence(item) && Self::removable_count(item) > 0,
         }
     }
@@ -358,6 +364,7 @@ mod tests {
             target: HarvestTarget::Life,
             op: HarvestOp::Reforge,
         };
+        assert!(craft.can_apply(&rare_item(), &data));
         let outcomes = craft
             .apply(&rare_item(), &data, &mut StdRng::seed_from_u64(2))
             .expect("reforge should succeed");
@@ -367,6 +374,24 @@ mod tests {
             .iter()
             .chain(&state.suffixes)
             .any(|modifier| modifier.mod_id.starts_with("life_"))));
+    }
+
+    #[test]
+    fn reforge_rejects_an_empty_guaranteed_tag_pool() {
+        let data = GameData::new(HashMap::new(), HashMap::new());
+        let craft = HarvestCraft {
+            display_name: "Harvest reforge life".to_string(),
+            cost_chaos: 5.0,
+            target: HarvestTarget::Life,
+            op: HarvestOp::Reforge,
+        };
+        let item = rare_item();
+
+        assert!(!craft.can_apply(&item, &data));
+        let error = craft
+            .apply(&item, &data, &mut StdRng::seed_from_u64(2))
+            .expect_err("an impossible guaranteed tag must fail before search expansion");
+        assert!(error.to_string().contains("Cannot apply"));
     }
 
     #[test]

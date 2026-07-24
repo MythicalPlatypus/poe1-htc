@@ -35,9 +35,10 @@ starting mods you expected, and the search settings that were actually used
   want. If it says `INCOMPLETE`, the search could not reach everything within
   `max_steps`/`beam_width`; the score tells you how close it got.
 - **`goal score`** — sum of satisfied want weights (here all 34 points).
-- **`ranking score`** — goal score minus `cost_weight ×` expected cost.
-  This is what the search maximizes; it can be negative for expensive plans
-  and is mainly useful for comparing pathways with each other.
+- **`ranking score`** — goal score minus `cost_weight ×` restart-adjusted
+  expected cost, not the optimistic expected-cost line below. Complete targets
+  always sort ahead of incomplete states; ranking score orders paths within
+  the same completion class. It can be negative for expensive plans.
 
 Each step is one of two kinds, and the difference matters:
 
@@ -58,31 +59,40 @@ Chance all one-shot steps land at least this well: 9.5%
 Expected cost if a one-shot miss scraps the item and you restart: ~1240.4 chaos (includes configured reset cost)
 ```
 
-Read these as a bracket, best case to worst case:
+Read these as modeled scenarios from optimistic to pessimistic, not guaranteed
+bounds:
 
 1. **First-try cost** — lucky floor. You will rarely pay this little.
 2. **Expected cost** — the realistic number *if all one-shots land*:
    repeatable steps priced at cost ÷ hit-chance.
 3. **One-shot odds** — the chance the whole plan lands as printed. 9.5%
    means you should expect to miss more often than not.
-4. **Restart estimate** — pessimistic ceiling: every one-shot miss scraps
+4. **Restart estimate** — a pessimistic scenario: every one-shot miss scraps
    the item and you start over, paying `restart_cost` each time.
 
-Your real cost usually lands **between #2 and #4**, because actual recovery
-after a missed slam (annul, live with it, adjust the plan) is cheaper than
-a full restart but not free. The tool does not yet model recovery policies —
-this is listed in Known Limitations.
+Your real cost may land between #2 and #4 because actual recovery after a
+missed slam (annul, live with it, adjust the plan) is often cheaper than a full
+restart but not free. It can also fall outside either estimate. The tool does
+not yet model recovery policies — this is listed in Known Limitations.
 
 ```text
-(~ marks estimated probabilities from sampled rolls; full rerolls use 50 Monte Carlo samples)
+(Sampled step probabilities are estimates; full rerolls use 50 Monte Carlo samples. ~ on costs and 1-in-N odds denotes approximation.)
 ```
 
-Any number with `~` came from sampling, not exact enumeration. Full rerolls
+A `~` before a percentage on a step marks a sampled probability. Full rerolls
 (Chaos Orb, Alchemy, essences, fossils) use 50 samples per expansion, so a
-`~6.0%` is an estimate with real sampling noise, and outcomes rarer than
-1-in-50 can be invisible to a single run. Exact probabilities (single-mod
-adds/removes like Exalts, Annuls, Augments over enumerable pools) print
-without the `~`.
+`~6.0%` has real sampling noise and outcomes rarer than 1-in-50 can be
+invisible to a single run. Methods such as Exalts, Augments, Regals, bench
+crafts, Conqueror/Eldritch Exalts, and Bestiary swaps enumerate modifier
+identities but sample numeric rolls, so roll-sensitive hit chances are also
+estimates. Roll-insensitive removals such as Annulment and Fracturing are clean
+exact examples.
+
+The symbol also appears on expected-cost lines because those are expectations,
+and tiny odds render as `~1 in N` for readability even when the underlying
+identity probability was enumerated exactly. Eldritch Chaos has an additional
+model assumption: it samples uniformly across legal replacement-affix counts
+because RePoE does not publish the real count distribution.
 
 ## The final item and goal report
 
@@ -118,8 +128,10 @@ list quality, sockets, implicits, and enchantments here.
 
 With `--top N` you get up to N genuinely distinct routes, best first. They
 are often more useful than the single best line: pathway #3 here scores
-lower but is **rerolls only** — no one-shot risk at all, ~17c, and gets 3
-of 4 wants. Depending on your budget and stomach, that may be the plan you
+lower on the raw goal but has a numerically higher ranking score. It still
+sorts after the complete routes because completion is the first priority.
+Pathway #3 is **rerolls only** — no one-shot risk at all, ~17c, and gets 3 of
+4 wants. Depending on your budget and stomach, that may be the plan you
 actually execute.
 
 ## Is the recommendation stable?

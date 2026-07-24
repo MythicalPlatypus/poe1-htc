@@ -35,20 +35,22 @@ for how to judge whether a plan is robust.
 
 **`No crafting path found — no method was applicable to the starting item.`**
 The starting item accepts none of the available methods. Typical causes:
-the item is corrupted or mirrored, it's a Unique, or the goal restricts to
-methods that can't fire (e.g. Eldritch currency with no dominant implicit,
-Harvest augment on an influenced item).
+the item is corrupted or mirrored, every relevant modifier pool is empty, or
+none of the configured special methods can fire. Unique starts are rejected
+during validation rather than reaching this message.
 
 **Why does it recommend Chaos-spamming instead of something clever?**
 With the default method set, that often *is* the cheapest route. Give the
 search your real options — bench crafts, essences, fossils, Harvest — via
-`[[methods]]`, and give it real `[prices]`. It can only choose from what
-you declare.
+`[[methods]]`, and give it real `[prices]`. The default orb set is always
+enabled; `[[methods]]` adds options and is not an allowlist.
 
 **Why is my expensive plan ranked below a cheap mediocre one (or vice versa)?**
-That's `cost_weight` — the exchange rate between score and chaos. See
+Complete targets always sort ahead of incomplete ones. Within the same
+completion class, `cost_weight` is the exchange rate between score and the
+restart-adjusted expected cost. See
 [Writing Goals — choosing cost_weight](writing-goals.md#choosing-cost_weight).
-Note the built-in default is `0.0` (cost ignored) — set it in every goal.
+The built-in default is `0.0` (cost ignored) — set it in every goal.
 
 ## Goal files
 
@@ -61,7 +63,8 @@ otherwise silently change the search.
 The identifier doesn't exist in the loaded data. Copy IDs from a report
 (run once with `--item-file` on a similar item), from `data/mods.json`
 itself, or from poedb. Remember `group` wants a conflict group
-(`IncreasedLife`), `mod_id` wants an exact tier (`IncreasedLife10`).
+(`IncreasedLife`), `mod_id` wants an exact tier (`IncreasedLife12` in the
+current T1 body-armour life example).
 
 **How do I require T1 specifically?**
 Either `mod_id = "<the T1 id>"`, or `group` + `stat` + `min_value` at the
@@ -80,9 +83,12 @@ worth repeating:
 
 - Stale `mods.json` is the most common cause of "could not resolve
   modifier text" — re-download after every patch.
-- The importer refuses to guess between identical-looking mods or invent
-  hidden rolls. That's a feature; fall back to `[[item.mods]]` for those
-  edge cases.
+- Explicit-mod import refuses to guess between identical-looking mods or
+  invent hidden rolls. That's a feature; fall back to `[[item.mods]]` for
+  those edge cases.
+- Influence, Synthesised, and Split status lines currently produce
+  `unsupported_metadata` and are not carried into crafting state. Do not use
+  an imported plan for influenced or Synthesised items.
 
 **My item's quality / sockets / total ES don't affect the plan.**
 Correct — they're carried and displayed, but socket crafting, catalysts,
@@ -93,9 +99,9 @@ and derived defence totals are not modeled.
 **Should I follow the plan blindly?**
 No — treat it as a well-costed suggestion. The search is heuristic, full
 rerolls are sampled (50 samples), and recovery after a missed one-shot is
-not modeled as a policy: your true cost usually lies between the printed
-"expected" and "restart" numbers. Check plan stability across seeds before
-committing big currency, and read
+not modeled as a policy. The printed "expected" and "restart" numbers are
+different scenarios, not guaranteed bounds. Check plan stability across seeds
+before committing big currency, and read
 [Understanding Results](understanding-results.md) for what each number
 does and doesn't promise.
 
@@ -106,6 +112,9 @@ catalysts/quality effects, socket crafting, Rog, and various league
 systems. The full list lives in
 [README — Known Limitations](../README.md#known-limitations). If a real
 strategy depends on a metamod, this tool cannot plan it yet.
+
+Clipboard import also does not preserve influence, Synthesised, or Split
+status. Use TOML for influenced starts; Synthesised starts are unsupported.
 
 **Are the prices live?**
 No. Prices are whatever you put in `[prices]` — snapshots you control.

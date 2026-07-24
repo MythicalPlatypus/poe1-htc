@@ -14,16 +14,23 @@ to the clipboard when you hover it and press `Ctrl+C`.
 cargo run --release -- --goal my_goal.toml --item-file my_item.txt
 ```
 
-On Linux/macOS you can pipe the clipboard straight in with `-`:
+On Linux/X11 you can pipe the clipboard straight in with `-`:
 
 ```bash
 xclip -o | cargo run --release -- --goal my_goal.toml --item-file -
 ```
 
-A goal file is **still required**: the import only replaces the goal's
-`[item]` section. Your `[[wants]]`, `[[methods]]`, `[prices]`, and
-`[search]` sections drive the search exactly as before. `--item-file`
-cannot be combined with `--base-item`.
+On macOS, use `pbpaste`:
+
+```bash
+pbpaste | cargo run --release -- --goal my_goal.toml --item-file -
+```
+
+A goal file is **still required**: the import replaces the goal's starting
+item, except that `[item].item_level` is the fallback when the paste omits
+`Item Level:`. Your `[[wants]]`, `[[methods]]`, `[prices]`, and `[search]`
+sections drive the search exactly as before. `--item-file` cannot be combined
+with `--base-item`.
 
 ## What a paste looks like
 
@@ -68,13 +75,20 @@ annotations the game prints. Abbreviated, hand-written pastes work too; the
   Energy Shield are kept for reporting. Socket crafting and derived totals
   are not modeled, and the displayed total is not recomputed as mods change.
 
+Influence, Synthesised, and Split status lines are recognized only as
+`unsupported_metadata`; they are not preserved in `ItemState`. This matters
+for craft legality. Do not optimize an influenced or Synthesised item through
+`--item-file`: describe an influenced start with `[item].influences` and
+`[[item.mods]]`; Synthesised starts are not modeled faithfully yet. Review all
+warnings before trusting a plan.
+
 Existing mods are validated strictly (affix type, item level, roll ranges,
 capacity, group conflicts, one crafted mod), but they do **not** need to be
 currently rollable: fractured, Delve, unveiled, recombinated, or legacy mods
 are accepted as existing state even at zero spawn weight. They still never
 appear in new random rolls.
 
-## The importer never guesses
+## Explicit-mod resolution never guesses
 
 Clipboard text is ambiguous more often than you'd think — two different mods
 can print identical lines. The importer resolves what it can deterministically
@@ -84,17 +98,24 @@ indistinguishable or when a mod has hidden rolls the text doesn't show.
 Corrupted and mirrored items import fine as state, but note the optimizer
 will refuse to craft on them for the obvious reason.
 
+Ambiguous generic implicits or enchantments do not affect explicit affix
+capacity, so the importer may pick a deterministic candidate and emit
+`ambiguous_special_modifier` instead of failing.
+
 ## Warnings you may see
 
-Warnings are printed before the search and never silently change your item:
+Warnings are printed before the search. They identify assumptions or data that
+was not carried into the model; review them rather than treating them as
+cosmetic:
 
 | Code | Meaning |
 |---|---|
 | `missing_item_level` | The paste had no `Item Level:` line; the goal file's `item_level` was used instead |
-| `unsupported_metadata` | A property line (e.g. `Armour: 711`) was recognized and ignored — it isn't part of crafting state |
+| `unsupported_metadata` | A line was recognized but ignored. Ordinary properties such as `Armour: 711` are descriptive, but influence/Synthesised/Split status can affect crafting legality and make an imported plan unsafe |
 | `unresolved_modifier` | (non-strict contexts) A line couldn't be matched and was skipped |
 | `inferred_base_name` / `duplicate_base_name` / `ambiguous_base_name` | The base line needed disambiguation; the report shows which base was chosen |
 | `base_implicit_disambiguation` | Several bases share the name; your item's implicit picked the right one |
+| `ambiguous_special_modifier` | A generic implicit or enchantment had indistinguishable candidates; one was selected deterministically |
 
 ## Common errors and fixes
 
@@ -106,10 +127,12 @@ Warnings are printed before the search and never silently change your item:
 | `genuinely ambiguous` | Two or more mods print this exact line and nothing distinguishes them | Rare; describe the item via `[[item.mods]]` with explicit `mod_id`s instead |
 | `hidden stat values` | The mod has rolls the clipboard text doesn't display | The item can't be imported faithfully; use `[[item.mods]]` with known values |
 | `unique items cannot be crafted on` | You imported a unique | The optimizer only crafts rare/magic/normal items |
+| `unsupported_metadata` warning for influence or synthesis | A crafting-relevant status was dropped | Do not use the imported plan; describe influence in TOML, while Synthesised starts remain unsupported |
 
 ## Why import instead of `[[item.mods]]`?
 
-Both produce the same validated starting state. Import wins because the game
-text carries exact rolls and annotations you would otherwise transcribe by
-hand — and the importer tells you the RePoE mod IDs in its report, which you
-can then use to write sharper `[[wants]]`.
+For supported, non-influenced, non-Synthesised starts, both produce the same
+validated crafting state. Import wins because the game text carries exact
+rolls and annotations you would otherwise transcribe by hand — and the
+importer tells you the RePoE mod IDs in its report, which you can then use to
+write sharper `[[wants]]`.

@@ -1,6 +1,6 @@
 # Stress-test goal: a "mirror-tier" Astral Plate — six specific high-tier mods.
 # This is intentionally at the edge of what the model can plan: the final slams
-# are one-shot Exalts, so watch the success probability and the two cost bounds
+# are one-shot Exalts, so watch the success probability and both cost scenarios
 # diverge. Run with a seed to compare parameter tweaks fairly:
 #   cargo run --release -- --goal goals/mirror_tier_chest.toml --seed 1
 
@@ -12,7 +12,7 @@ item_level = 86
 [[wants]]
 group = "IncreasedLife"
 stat = "base_maximum_life"
-min_value = 100          # T1 (IncreasedLife10) only
+min_value = 175          # T1 (IncreasedLife12) only in RePoE 3.28.0.16
 weight = 10.0
 
 [[wants]]

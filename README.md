@@ -2,10 +2,11 @@
 
 **A Path of Exile 1 crafting-path optimizer written in Rust.**
 
-PoE1 HTC takes a base item, a set of desired modifiers, league prices, and the
-crafting methods you are willing to use. It explores possible craft sequences
-and reports the strongest routes it found, their estimated cost, and the chance
-of one-shot steps landing.
+PoE1 HTC takes a base item, a set of desired modifiers, league prices, and
+optional configured crafts. It explores possible craft sequences using its
+always-enabled default orb set plus those configured crafts, then reports the
+strongest routes it found, their estimated cost, and the chance of one-shot
+steps landing.
 
 The practical question is:
 
@@ -155,11 +156,10 @@ Start from an item you already own:
 base = "Astral Plate"
 item_level = 86
 rarity = "rare"
-influences = ["hunter"]
 
 [[item.mods]]
-mod_id = "IncreasedLife9"
-values = [95]
+mod_id = "IncreasedLife12"
+values = [180]
 fractured = true
 ```
 
@@ -218,6 +218,9 @@ See [`goals/example_life_chest.toml`](goals/example_life_chest.toml) and
 [`goals/finish_fractured_chest.toml`](goals/finish_fractured_chest.toml) for
 complete examples.
 
+The default orb set is always enabled. `[[methods]]` adds configured crafts; it
+does not form an allowlist or disable default methods.
+
 ## Importing an Item
 
 Instead of describing your starting item in `[[item.mods]]`, copy it in game
@@ -235,8 +238,8 @@ search. `--item-file` cannot be combined with `--base-item`.
 
 ### Imported metadata versus modeled crafting state
 
-The importer preserves everything on the item, but the optimizer only *models*
-the explicit crafting state:
+The importer preserves the supported fields listed below and warns when it
+recognizes metadata that the optimizer does not carry into crafting state:
 
 - **Modeled state** — rarity, item level, prefixes, suffixes, fractured and
   crafted mods, corrupted/mirrored status, and Eldritch implicits. These drive
@@ -250,6 +253,12 @@ the explicit crafting state:
   and derived total defences are **not** modeled: no crafting probability or
   goal calculation reads them, and the displayed total is not recomputed as
   explicit mods change.
+
+Clipboard influence, Synthesised, and Split status lines are currently reported
+as `unsupported_metadata` and are not preserved in `ItemState`. Do not optimize
+an influenced or Synthesised item from `--item-file`: describe influence with
+`[item].influences` and `[[item.mods]]` instead; Synthesised starting items are
+not modeled faithfully yet. Review every import warning before trusting a plan.
 
 Existing mods on an imported item are validated strictly (affix type, item
 level, roll ranges, capacity, group conflicts, one crafted mod, fractured
@@ -292,7 +301,7 @@ Command-line flags override the goal file:
 ```text
 --beam-width <N>    More candidates retained per depth; slower and broader
 --max-steps <N>     Maximum actions in a path
---cost-weight <N>   Penalty per expected chaos in ranking
+--cost-weight <N>   Penalty per restart-adjusted expected chaos in ranking
 --restart-cost <N>  Cost to restore or replace the base after a failed path
 --seed <N>          Reproducible random sampling
 --top <N>           Number of distinct pathways to print
@@ -301,13 +310,17 @@ Command-line flags override the goal file:
 --data-dir <PATH>   RePoE data directory
 ```
 
-`cost_weight` is relative to the total weight of your wants. A value that is
-too low favors expensive high-score routes; a value that is too high favors
-cheap routes that barely improve the item.
+`cost_weight` is relative to the total weight of your wants. Complete targets
+sort ahead of incomplete ones; within the same completion class, ranking
+subtracts `cost_weight ×` restart-adjusted expected cost. A value that is too
+low favors expensive high-score routes; a value that is too high favors cheap
+routes that barely improve the item.
 
 ## Known Limitations
 
 - Full rerolls use only 50 samples, so rare outcomes can be missed entirely.
+- Eldritch Chaos samples uniformly across legal replacement-affix counts
+  because RePoE does not publish the real count distribution.
 - Beam search is heuristic. A wider beam improves coverage but does not prove
   global optimality.
 - Recovery after a failed one-shot craft is not modeled as a full policy. The
@@ -319,6 +332,9 @@ cheap routes that barely improve the item.
 - Imported quality, sockets, and displayed total Energy Shield are descriptive
   only. Socket crafting, catalysts/quality effects, and derived total defences
   are not part of the crafting or goal math.
+- Clipboard influence, Synthesised, and Split statuses are recognized but not
+  carried into crafting state. Influenced and Synthesised clipboard starts can
+  therefore produce invalid recommendations and must not be optimized as-is.
 - Metamods, Veiled currency, Awakener's Orb transfer, imprints, recombinators,
   Orb of Conflict, locks, catalysts, Rog, and several league-specific systems
   are not implemented.
@@ -342,7 +358,8 @@ goals/        Example goal files
 tests/        Synthetic end-to-end integration tests
 ```
 
-Every action implements:
+Every action implements this contract; the behavioral classification hooks
+have conservative defaults:
 
 ```rust
 pub trait CraftingMethod: Send + Sync {
@@ -355,8 +372,18 @@ pub trait CraftingMethod: Send + Sync {
         db: &GameData,
         rng: &mut dyn RngCore,
     ) -> Result<Vec<(ItemState, f64)>>;
+    fn weights_are_probabilities(&self) -> bool { true }
+    fn repeatable_on_failure(&self) -> bool { false }
+    fn reroll_kind(&self) -> Option<RerollKind> { None }
+    fn reroll_initializer_kind(&self) -> Option<RerollKind> { None }
+    fn consumes_reroll_initializer(&self) -> bool { false }
 }
 ```
+
+`apply` returns concrete successor states whose weights sum to 1.0. The
+probability hook distinguishes exact enumeration from sampled representatives;
+the retry and reroll hooks drive expected-cost pricing and prevent dominated
+reroll chains.
 
 `GameData` is immutable after loading and shared by reference. Search nodes
 clone only `ItemState`. Seeded runs are deterministic because the craftable

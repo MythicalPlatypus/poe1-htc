@@ -30,8 +30,8 @@ cost_weight = 0.02
 ```
 
 That is enough: start from a fresh item-level-86 Astral Plate, value any
-tier of the flat-life prefix at 10 points, and penalize expected spending at
-0.02 points per chaos.
+tier of the flat-life prefix at 10 points, and penalize restart-adjusted
+expected spending at 0.02 points per chaos.
 
 ## `[item]` — the starting item
 
@@ -43,6 +43,10 @@ tier of the flat-life prefix at 10 points, and penalize expected spending at
 | `influences` | no | Up to two of `shaper`, `elder`, `crusader`, `hunter`, `redeemer`, `warlord` |
 | `exarch_implicit` | no | Existing Searing Exarch implicit (RePoE mod ID), for mid-craft starts |
 | `eater_implicit` | no | Existing Eater of Worlds implicit (RePoE mod ID) |
+
+`item_level` must be between 1 and 100. A starting item cannot combine a
+fractured modifier with an influence, or combine Shaper/Elder/Conqueror
+influence with Eldritch implicits.
 
 ### `[[item.mods]]` — mods already on the item
 
@@ -90,16 +94,16 @@ same mod**:
 group = "IncreasedLife"
 weight = 10.0
 
-# A life roll of 100+, on a mod from that same group (T1 only).
+# A T1 body-armour life roll in RePoE 3.28.0.16.
 [[wants]]
 group = "IncreasedLife"
 stat = "base_maximum_life"
-min_value = 100
+min_value = 175
 weight = 5.0
 
 # One exact tier, by mod ID.
 [[wants]]
-mod_id = "IncreasedLife10"
+mod_id = "IncreasedLife12"
 weight = 2.0
 ```
 
@@ -112,8 +116,9 @@ weight = 2.0
 | `weight` | Points scored when satisfied. Default 1.0, must be > 0 |
 
 Weights are how you tell the search what matters: a mandatory mod should
-have a much higher weight than a nice-to-have. The search maximizes total
-score minus cost (see `cost_weight` below).
+have a much higher weight than a nice-to-have. Complete targets sort ahead
+of incomplete states. Within the same completion class, the search maximizes
+total score minus restart-adjusted cost (see `cost_weight` below).
 
 Wants are satisfied by any mod on the final item — prefixes, suffixes,
 fractured mods, crafted mods, Eldritch implicits, and (on imported items)
@@ -137,7 +142,8 @@ Three practical options:
 The search always has the default orb set: Scouring, Transmutation,
 Alteration, Augmentation, Regal, Alchemy, Chaos, Exalted, Annulment,
 Divine, Fracturing, and Remove Crafted Mods. `[[methods]]` entries add
-configured crafts on top. Every entry is selected by `type`:
+configured crafts on top; they cannot disable or restrict the default set.
+Every entry is selected by `type`:
 
 ### `essence` — guarantee one mod, reroll the rest
 
@@ -150,6 +156,19 @@ cost = 5.0
 
 With `essences.json` present, the essence's guaranteed mod is resolved for
 your item class and lower-tier random-mod caps are enforced.
+
+For manual configuration, replace `essence` with one exact RePoE modifier ID:
+
+```toml
+[[methods]]
+type = "essence"
+mod_id = "IncreasedLife11"
+cost = 5.0
+name = "Manual Essence"
+```
+
+Specify exactly one of `essence` or `mod_id`. Manual configuration does not
+infer catalog restrictions.
 
 ### `bench` — deterministically add a crafted mod
 
@@ -186,6 +205,8 @@ fossil = "Dense Fossil"
 
 Without the fossil catalog you can configure weights manually with
 `boosted_tags`, `reduced_tags`, `blocked_mod_ids`, and `forced_mod_ids`.
+Each resonator supports at most four fossil parts. A part must use either a
+named `fossil` or manual tag/mod fields, never both.
 
 ### `harvest` — reforge or augment by tag
 
@@ -202,8 +223,9 @@ Valid targets: `attack`, `caster`, `speed`, `life`, `defence`,
 `critical`, `minion`, `mana`.
 
 Reforge rerolls a Rare item guaranteeing at least one mod with the target
-tag. Augment adds one mod with the target tag to a non-influenced Rare with
-an open slot.
+tag. Augment requires a non-influenced Rare with at least one removable
+explicit or crafted modifier; it removes one modifier first, then adds a
+target-tag modifier from the pool that remains.
 
 ### `eldritch_chaos` / `eldritch_exalt` / `eldritch_annul`
 
@@ -237,8 +259,13 @@ beast_level = 83     # caps the level of the added mod
 cost = 12.0
 ```
 
-All method entries also accept an optional `name` to control how the step
-appears in reports and how `[prices]` keys match.
+Essence, bench, and fossil entries accept an optional `name` to control how
+the step appears in reports and how `[prices]` keys match. Other method types
+use their generated display name.
+
+Configured costs, want weights, and `[prices]` values must be positive finite
+numbers. `beast_level` must be between 1 and 100, and every built method must
+have a unique display name.
 
 ## `[prices]` — your league's prices
 
@@ -264,7 +291,7 @@ Built-in defaults (chaos):
 | Chaos Orb | 1 | Eldritch Chaos Orb | 5 |
 | Regal Orb | 1 | Eldritch Orb of Annulment | 10 |
 | Orb of Alchemy | 2 | Eldritch Exalted Orb | 20 |
-| Remove Crafted Mods | 1 | Conqueror Exalted Orbs | 200 |
+| Remove Crafted Mods | 1 | Conqueror Exalted Orbs | 100 |
 
 A `[prices]` key that matches no method name prints a warning, so typos are
 visible. The Eldritch and Conqueror entries above use per-god / per-conqueror
@@ -287,7 +314,7 @@ top = 3
 |---|---|---|
 | `beam_width` | 50 | Candidate states kept per depth. Wider = more thorough, slower |
 | `max_steps` | 10 | Maximum crafting actions in a plan |
-| `cost_weight` | 0.0 | Ranking penalty per expected chaos spent. **The default ignores cost entirely — always set this** |
+| `cost_weight` | 0.0 | Ranking penalty per restart-adjusted expected chaos spent. **The default ignores cost entirely — always set this** |
 | `restart_cost` | 1.0 | Chaos to restore/replace the base if a failed one-shot forces a restart |
 | `seed` | random | RNG seed; set it for reproducible runs |
 | `top` | 1 | Distinct pathways to report, best first |
@@ -296,13 +323,19 @@ Every field can be overridden on the command line (`--beam-width`,
 `--max-steps`, `--cost-weight`, `--restart-cost`, `--seed`, `--top`);
 CLI flag beats goal file beats built-in default.
 
+`beam_width`, `max_steps`, and `top` must be greater than zero.
+`cost_weight` and `restart_cost` must be non-negative finite numbers.
+
 ### Choosing `cost_weight`
 
-`cost_weight` is the exchange rate between score and money. Rule of thumb:
-decide how much expected chaos one point of score is worth to you and
-invert. If your want weights sum to ~25 and you would pay about 50 chaos
-per point, set `0.02`. Too low and the search happily recommends 500-chaos
-routes for marginal gains; too high and it stops at cheap, mediocre items.
+`cost_weight` is the exchange rate between score and money. The cost term is
+the restart-on-one-shot-miss estimate, including `restart_cost`, rather than
+the optimistic expected cost printed above it. Rule of thumb: decide how much
+restart-adjusted chaos one point of score is worth to you and invert. If your
+want weights sum to ~25 and you would pay about 50 chaos per point, set `0.02`.
+Too low and the search happily recommends 500-chaos routes for marginal gains;
+too high and it stops at cheap, mediocre items. Completion is still a separate
+priority: any complete target sorts ahead of every incomplete state.
 
 The examples in [`goals/`](../goals) are annotated with this reasoning —
 copy one and adjust.

@@ -4,8 +4,8 @@ This guide takes you from nothing to your first crafting plan. Expect it to
 take about ten minutes, most of which is the first compile.
 
 PoE1 HTC is a command-line tool: you describe the item you want in a small
-text file, and it searches for the cheapest crafting route to get there. No
-account access, no game hooks — it works entirely from
+text file, and it searches for strong crafting routes while accounting for
+your configured cost preference. No account access, no game hooks — it works entirely from
 [RePoE](https://repoe-fork.github.io/) game-data exports and text you paste.
 
 ## 1. Install the prerequisites

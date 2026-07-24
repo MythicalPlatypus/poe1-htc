@@ -1,19 +1,19 @@
 # Next Push Handoff
 
-This repository is at a clean guild-beta baseline as of 2026-07-23. The CLI
+This repository is at a reviewed guild-beta baseline as of 2026-07-24. The CLI
 works end to end against current RePoE Fork data, and the implemented crafting
-mechanics have synthetic unit and integration coverage. This pass added
-clipboard item-text import: `--item-file` parses a pasted in-game item,
-`crate::goal::build_imported_state` validates it into an `ItemState`, and the
-item model preserves generic implicits, enchantments, quality, sockets, and
-displayed Energy Shield as craft-invariant metadata (see README "Importing an
-Item" for the metadata-versus-modeled-state boundary).
+mechanics have synthetic unit and integration coverage. This integration
+reconciled the pending hardening/review branches, retained the valid Harvest
+pool-applicability guard, fixed cost-insensitive semantic deduplication, and
+rejected two mechanics regressions in the reviewed branch. Clipboard item-text
+import remains the latest major feature; see README "Importing an Item" for its
+modeled-state and unsupported-status boundary.
 
 ## Baseline
 
 - `cargo fmt -- --check` passes.
-- `cargo test` passes (unit, integration, and item-text import suites; run the
-  full gate for the current count).
+- `cargo test` passes (145 unit, 30 integration, and 36 item-text import tests;
+  211 total).
 - `cargo clippy --all-targets -- -D warnings` passes.
 - Release-mode data loading succeeds with the local RePoE `3.28.0.16` export:
   39,292 mods, 5,059 base items, 774 bench recipes, 106 essences, and 445
@@ -51,6 +51,9 @@ tracked so every contributor tests the same dependency resolution.
   `ItemState` are craft-invariant: crafting actions must not touch them, they
   never consume explicit capacity or join explicit group conflicts, and the
   search state signature must include them.
+- Clipboard influence, Synthesised, and Split status lines are currently
+  unsupported metadata, not modeled state. Do not claim imported influence or
+  synthesis support until those statuses are preserved or rejected fail-closed.
 
 ## Candidate Work Tracks
 
@@ -81,7 +84,8 @@ probability tests, CLI configuration, and user-facing reporting.
 ### Product hardening
 
 - Small checked-in RePoE-derived fixtures for real-schema integration tests.
-- A documented goal-file schema and validation examples.
+- A machine-readable, versioned goal-file schema generated from or checked
+  against the maintained reference in `docs/writing-goals.md`.
 - Optional machine-readable output for downstream tooling.
 - League-price ingestion as a separately bounded feature; current prices are
   deliberately user-supplied snapshots.

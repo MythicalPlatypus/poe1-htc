@@ -63,7 +63,8 @@ pub struct Args {
     #[arg(long)]
     pub max_steps: Option<usize>,
 
-    /// Cost penalty per expected chaos in node ranking (see BeamConfig::cost_weight).
+    /// Cost penalty per restart-adjusted expected chaos in node ranking
+    /// (see BeamConfig::cost_weight).
     /// Overrides the goal file's [search] cost_weight.
     #[arg(long)]
     pub cost_weight: Option<f64>,
@@ -467,8 +468,8 @@ fn print_result(result: &SearchResult, goal: &GoalSpec, db: &GameData) {
     }
     if any_estimate {
         println!(
-            "(~ marks estimated probabilities from sampled rolls; full rerolls \
-             use {} Monte Carlo samples)",
+            "(Sampled step probabilities are estimates; full rerolls use {} \
+             Monte Carlo samples. ~ on costs and 1-in-N odds denotes approximation.)",
             crate::currency::MONTE_CARLO_SAMPLES
         );
     }

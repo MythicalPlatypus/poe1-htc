@@ -72,10 +72,11 @@ cost = 10.0
 # type = "eldritch_chaos"
 # god = "exarch"                # the currently dominant side
 
-# Search parameters. cost_weight is the penalty per point of EXPECTED chaos
-# spent (reroll steps are priced at cost / hit-chance): with want weights
-# summing to 23, cost_weight 0.05 means the search will spend up to ~20
-# expected chaos to gain 1 point of score. Set `seed` for reproducible runs.
+# Search parameters. cost_weight penalizes RESTART-ADJUSTED expected chaos,
+# including the configured restart cost after a failed one-shot: with want
+# weights summing to 23, cost_weight 0.05 values 1 point of score at 20 of
+# those expected chaos. Complete targets still sort ahead of incomplete ones.
+# Set `seed` for reproducible runs.
 [search]
 beam_width = 40
 max_steps = 30

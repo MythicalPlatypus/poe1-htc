@@ -785,7 +785,7 @@ fn default_bench_cost() -> f64 {
 /// cost = 12.0
 /// ```
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MethodSpec {
     /// Guarantees `mod_id`, rerolls the rest (Monte Carlo).
     Essence {
@@ -2002,6 +2002,28 @@ mod tests {
         .unwrap_err();
         // Typos in field names must fail loudly, not be silently ignored.
         assert!(err.to_string().contains("Failed to parse"), "got: {err}");
+
+        let err = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+
+            [[wants]]
+            group = "IncreasedLife"
+
+            [[methods]]
+            type = "harvest"
+            op = "reforge"
+            target = "life"
+            cost = 1.0
+            typo_field = 3
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to parse"),
+            "method-field typo should fail loudly: {err}"
+        );
     }
 
     #[test]
