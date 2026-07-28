@@ -59,12 +59,12 @@ cost = 30.0
 [[methods]]                     # Essence that guarantees a specific mod
 type = "essence"
 essence = "Deafening Essence of Greed"
-cost = 5.0
+cost = 1.9                      # Allflame softcore exchange (poe.ninja, 2026-07-25)
 
 [[methods]]                     # Catalog supplies exact weights and blocked tags
 type = "fossil"
 fossil = "Pristine Fossil"
-cost = 10.0
+cost = 4.7                      # Allflame softcore exchange (poe.ninja, 2026-07-25)
 
 # Eldritch currency needs an existing dominant implicit. To model a mid-craft,
 # set [item].exarch_implicit / eater_implicit to RePoE mod IDs, then enable:
@@ -83,3 +83,16 @@ max_steps = 30
 cost_weight = 0.02
 restart_cost = 1.0
 #seed = 42
+
+# Allflame softcore exchange rates (poe.ninja, 2026-07-25). Chaos Orb is the
+# pricing unit (1.0) and needs no override.
+[prices]
+"Orb of Transmutation" = 0.013
+"Orb of Augmentation" = 0.023
+"Orb of Alchemy" = 0.055
+"Orb of Alteration" = 0.10
+"Regal Orb" = 0.30
+"Orb of Scouring" = 0.40
+"Exalted Orb" = 0.82
+"Orb of Annulment" = 3.75
+"Divine Orb" = 90.6

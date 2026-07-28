@@ -565,10 +565,12 @@ Corrupted";
     assert_eq!(imported.explicit_mods[0].mod_id, "RobustLife");
     assert_eq!(imported.explicit_mods[0].values, [37]);
     assert!(imported.explicit_mods[0].fractured);
+    // Advanced mod-description headers are segmentation anchors now, not
+    // ignored metadata — they must import without an unsupported warning.
     assert!(imported
         .warnings
         .iter()
-        .any(|warning| warning.code == "unsupported_metadata"));
+        .all(|warning| warning.code != "unsupported_metadata"));
 }
 
 #[test]
@@ -1755,4 +1757,119 @@ Regenerate 224 Energy Shield per second while a Rare or Unique Enemy is Nearby";
     assert_eq!(state.quality, 30);
     assert_eq!(state.sockets.as_deref(), Some("W-W-W-W-W-W"));
     assert_eq!(state.displayed_energy_shield, Some(1200));
+}
+
+#[test]
+fn advanced_mod_headers_anchor_segmentation_and_crafted_status() {
+    let hybrid = test_mod(
+        GenerationType::Prefix,
+        Domain::Item,
+        30,
+        "+(21-42) to Evasion Rating\n+(24-28) to maximum Life",
+        &[
+            ("local_base_evasion_rating", 21, 42),
+            ("base_maximum_life", 24, 28),
+        ],
+        "body_armour",
+        "EvasionLifeHybrid",
+        &["life", "evasion"],
+    );
+    let flat_evasion = test_mod(
+        GenerationType::Prefix,
+        Domain::Item,
+        30,
+        "+(21-42) to Evasion Rating",
+        &[("local_base_evasion_rating", 21, 42)],
+        "body_armour",
+        "FlatEvasion",
+        &["evasion"],
+    );
+    let flat_life = test_mod(
+        GenerationType::Prefix,
+        Domain::Item,
+        30,
+        "+(24-28) to maximum Life",
+        &[("base_maximum_life", 24, 28)],
+        "body_armour",
+        "FlatLife",
+        &["life"],
+    );
+    let crafted_cold = test_mod(
+        GenerationType::Suffix,
+        Domain::Crafted,
+        30,
+        "+(11-15)% to Cold Resistance",
+        &[("base_cold_damage_resistance_%", 11, 15)],
+        "body_armour",
+        "CraftedColdRes",
+        &["resistance"],
+    );
+    let natural_cold = test_mod(
+        GenerationType::Suffix,
+        Domain::Item,
+        30,
+        "+(11-15)% to Cold Resistance",
+        &[("base_cold_damage_resistance_%", 11, 15)],
+        "body_armour",
+        "NaturalColdRes",
+        &["resistance"],
+    );
+    let db = game_data(
+        TEST_BASE_ID,
+        "Test Vest",
+        vec![
+            ("EvasionLifeHybrid", hybrid),
+            ("FlatEvasion", flat_evasion),
+            ("FlatLife", flat_life),
+            ("CraftedColdRes", crafted_cold),
+            ("NaturalColdRes", natural_cold),
+        ],
+    );
+
+    // Without headers the hybrid's two lines also parse as two flat mods:
+    // strict import must refuse to guess.
+    let bare = "\
+Rarity: Rare
+Storm Shelter
+Test Vest
+--------
+Item Level: 77
+--------
++36 to Evasion Rating
++25 to maximum Life";
+    let error = import_item_text(bare, &db, strict_options(None))
+        .expect_err("ambiguous segmentation without headers must fail closed");
+    assert!(error
+        .to_string()
+        .contains("genuinely ambiguous explicit modifier segmentation"));
+
+    // Advanced headers pin each modifier's line span, generation type, and
+    // crafted status, so the same stat lines import unambiguously.
+    let advanced = "\
+Rarity: Rare
+Storm Shelter
+Test Vest
+--------
+Item Level: 77
+--------
+{ Prefix Modifier \"Fawn's\" (Tier: 3) — Life, Defences, Evasion }
++36 to Evasion Rating
++25 to maximum Life
+{ Master Crafted Suffix Modifier \"of Craft\" (Tier: 1) — Cold, Resistance }
++14% to Cold Resistance";
+    let imported = import_item_text(advanced, &db, strict_options(None))
+        .expect("headers should disambiguate the hybrid and the crafted suffix");
+    assert_eq!(imported.explicit_mods.len(), 2);
+    assert_eq!(imported.explicit_mods[0].mod_id, "EvasionLifeHybrid");
+    assert_eq!(imported.explicit_mods[0].values, [36, 25]);
+    assert_eq!(imported.explicit_mods[1].mod_id, "CraftedColdRes");
+    assert_eq!(imported.explicit_mods[1].values, [14]);
+    assert!(
+        imported.explicit_mods[1].crafted,
+        "the Master Crafted header must mark the mod crafted without a per-line annotation"
+    );
+    assert!(imported
+        .warnings
+        .iter()
+        .all(|warning| warning.code != "ambiguous_modifier_segmentation"));
 }

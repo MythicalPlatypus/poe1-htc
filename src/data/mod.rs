@@ -2,8 +2,10 @@ pub mod base_items;
 pub mod crafting_catalogs;
 pub mod loader;
 pub mod mods;
+pub mod provenance;
 
 use crafting_catalogs::{CraftingBenchCatalog, EssenceCatalog, FossilCatalog};
+pub use provenance::{DataFingerprint, DataProvenance};
 
 /// Central database holding all loaded RePoE data.
 ///

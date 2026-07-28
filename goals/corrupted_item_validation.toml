@@ -1,0 +1,17 @@
+# Use only with a disposable corrupted body armour that does not already carry
+# this exact crafted modifier. It verifies pre-search uncraftable-item proof.
+
+[item]
+base = "Astral Plate"
+item_level = 86
+
+[[wants]]
+mod_id = "EinharMasterIncreasedLife5_"
+required = true
+weight = 1.0
+
+[search]
+beam_width = 5
+max_steps = 2
+seed = 42
+top = 1

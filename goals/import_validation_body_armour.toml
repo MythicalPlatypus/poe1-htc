@@ -1,0 +1,30 @@
+# Safe clipboard-import validation goal. Every want is preferred, so an
+# imported item's missing affixes cannot make the request pre-search
+# impossible. The two value-scaled wants also exercise A4 reporting.
+
+[item]
+base = "Triumphant Lamellar"
+item_level = 77
+
+[[wants]]
+stat = "base_maximum_life"
+mode = "per_unit"
+cap = 500
+weight = 0.1
+required = false
+
+[[wants]]
+stat = "local_attribute_requirements_+%"
+mode = "per_unit"
+max_value = -10
+cap = 0
+weight = 1.0
+required = false
+
+[search]
+beam_width = 5
+max_steps = 2
+cost_weight = 0.0
+restart_cost = 1.0
+seed = 42
+top = 1

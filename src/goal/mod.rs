@@ -24,23 +24,24 @@
 //! ```
 //!
 //! ## Scoring semantics
-//! `GoalSpec::score` returns the sum of `weight` over all *satisfied* wants.
-//! A want is satisfied when at least one mod on the item (prefix, suffix,
-//! fractured, crafted, or eldritch implicit) matches **all** criteria the want
-//! specifies:
+//! A want is satisfied when its selector and optional threshold match the item.
+//! Presence and threshold wants contribute their weight when satisfied.
+//! `per_unit` wants instead aggregate the selected stat across every matching
+//! modifier and contribute a non-negative, optionally capped value-scaled
+//! amount. Selectors can inspect prefix, suffix, fractured, crafted, implicit,
+//! and enchantment modifiers:
 //!
 //! - `mod_id` — the mod's RePoE ID equals this string exactly.
 //! - `group`  — the mod's DB entry lists this group in `groups` (the same
 //!   field used for conflict checks — never display names).
 //! - `stat`   — the mod has a rolled stat with this RePoE stat ID.
-//! - `min_value` — requires `stat`; the matching stat's rolled value must be
-//!   `>= min_value` *on the same mod*.
+//! - `min_value` / `max_value` — higher/lower satisfaction bounds.
 //!
-//! Each want contributes its weight at most once, no matter how many mods
-//! match it. Scoring is binary per want (no partial credit for low rolls
-//! except via the `min_value` threshold).
+//! Wants are required by default. Setting `required = false` keeps the score
+//! contribution as a search preference but removes that want from the
+//! definition of target completion.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -58,7 +59,7 @@ use crate::currency::{
     CraftingMethod,
 };
 use crate::data::base_items::BaseItem;
-use crate::data::mods::{Domain, GenerationType};
+use crate::data::mods::{Domain, GenerationType, Mod};
 use crate::data::GameData;
 use crate::engine::mod_pool::FossilWeightRule;
 use crate::item::modifier::StatRoll;
@@ -71,6 +72,32 @@ fn default_item_level() -> u32 {
 
 fn default_weight() -> f64 {
     1.0
+}
+
+const fn default_required() -> bool {
+    true
+}
+
+/// How one desired modifier contributes to preference score.
+///
+/// Omitted modes retain the legacy goal-file behavior: a want with a bound is
+/// a threshold, while an unbounded want checks presence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalScoringMode {
+    Presence,
+    Threshold,
+    PerUnit,
+}
+
+impl GoalScoringMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Presence => "presence",
+            Self::Threshold => "threshold",
+            Self::PerUnit => "per_unit",
+        }
+    }
 }
 
 fn repoe_influence_pool_tag(base_tags: &[String], influence: &str) -> Option<String> {
@@ -123,7 +150,7 @@ fn repoe_influence_pool_tag(base_tags: &[String], influence: &str) -> Option<Str
 #[serde(deny_unknown_fields)]
 pub struct GoalSpec {
     pub item: ItemSpec,
-    /// Desired mods. At least one required.
+    /// Desired mods. At least one entry is required.
     pub wants: Vec<WantSpec>,
     /// Extra crafting methods (essences, fossils, harvest, bench, eldritch)
     /// made available to the search on top of the default orb set.
@@ -721,9 +748,34 @@ pub struct WantSpec {
     pub stat: Option<String>,
     /// Minimum rolled value for `stat`. Requires `stat` to be set.
     pub min_value: Option<i32>,
+    /// Maximum rolled value for lower-is-better numeric goals.
+    pub max_value: Option<i32>,
+    /// Explicit scoring mode. When omitted, legacy presence/threshold
+    /// inference is used.
+    pub mode: Option<GoalScoringMode>,
+    /// Optional score cap for per-unit goals. It is mandatory for
+    /// lower-is-better per-unit scoring.
+    pub cap: Option<i32>,
     /// Score contribution when satisfied. Defaults to 1.0; must be > 0.
     #[serde(default = "default_weight")]
     pub weight: f64,
+    /// Whether this want is mandatory for target completion. Defaults to true
+    /// so existing goal files retain their exact completion semantics.
+    #[serde(default = "default_required")]
+    pub required: bool,
+}
+
+impl WantSpec {
+    /// Effective scoring mode after applying legacy goal-file inference.
+    pub const fn scoring_mode(&self) -> GoalScoringMode {
+        match self.mode {
+            Some(mode) => mode,
+            None if self.min_value.is_some() || self.max_value.is_some() => {
+                GoalScoringMode::Threshold
+            }
+            None => GoalScoringMode::Presence,
+        }
+    }
 }
 
 /// Search-parameter overrides. Precedence: CLI flag > goal file > built-in default.
@@ -741,6 +793,10 @@ pub struct SearchSpec {
     pub seed: Option<u64>,
     /// How many distinct pathways to report (default 1).
     pub top: Option<usize>,
+    /// Optional maximum number of concrete successor states generated.
+    pub expansion_limit: Option<u64>,
+    /// Optional wall-clock limit in milliseconds.
+    pub timeout_ms: Option<u64>,
 }
 
 fn default_bench_cost() -> f64 {
@@ -1148,6 +1204,79 @@ impl MethodSpec {
     }
 }
 
+/// Validate configured crafting-method requests independently of goal-file parsing.
+pub(crate) fn validate_method_specs(methods: &[MethodSpec]) -> Result<()> {
+    for (i, method) in methods.iter().enumerate() {
+        if let Some(cost) = method.configured_cost() {
+            if cost <= 0.0 || !cost.is_finite() {
+                bail!("[[methods]] entry {i}: cost must be a positive finite number");
+            }
+        }
+        if let MethodSpec::Essence {
+            essence, mod_id, ..
+        } = method
+        {
+            if essence.is_some() == mod_id.is_some() {
+                bail!(
+                    "[[methods]] entry {i}: essence requires exactly one of \
+                     'essence' or 'mod_id'"
+                );
+            }
+        }
+        if let MethodSpec::Fossil {
+            fossil,
+            boosted_tags,
+            reduced_tags,
+            blocked_mod_ids,
+            forced_mod_ids,
+            fossils,
+            ..
+        } = method
+        {
+            if fossils.len() > 3 {
+                bail!("[[methods]] entry {i}: a resonator can contain at most 4 fossils");
+            }
+            if fossil.is_some()
+                && (!boosted_tags.is_empty()
+                    || !reduced_tags.is_empty()
+                    || !blocked_mod_ids.is_empty()
+                    || !forced_mod_ids.is_empty())
+            {
+                bail!("[[methods]] entry {i}: named fossil cannot also use manual tag/mod fields");
+            }
+            if let Some(part) = fossils.iter().find(|part| {
+                part.fossil.is_some()
+                    && (!part.boosted_tags.is_empty()
+                        || !part.reduced_tags.is_empty()
+                        || !part.blocked_mod_ids.is_empty()
+                        || !part.forced_mod_ids.is_empty())
+            }) {
+                bail!(
+                    "[[methods]] entry {i}: named fossil '{}' cannot also use manual tag/mod fields",
+                    part.fossil.as_deref().unwrap_or_default()
+                );
+            }
+            let blocked = blocked_mod_ids
+                .iter()
+                .chain(fossils.iter().flat_map(|f| f.blocked_mod_ids.iter()));
+            let forced: std::collections::HashSet<&str> = forced_mod_ids
+                .iter()
+                .chain(fossils.iter().flat_map(|f| f.forced_mod_ids.iter()))
+                .map(String::as_str)
+                .collect();
+            if let Some(id) = blocked.map(String::as_str).find(|id| forced.contains(id)) {
+                bail!("[[methods]] entry {i}: fossil mod '{id}' cannot be both blocked and forced");
+            }
+        }
+        if let MethodSpec::BestiarySwap { beast_level, .. } = method {
+            if !(1..=100).contains(beast_level) {
+                bail!("[[methods]] entry {i}: beast_level must be between 1 and 100");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_god(s: &str) -> Result<EldritchGod> {
     match s {
         "exarch" => Ok(EldritchGod::SearingExarch),
@@ -1168,143 +1297,171 @@ fn parse_conqueror_influence(s: &str) -> Result<Influence> {
     }
 }
 
-impl GoalSpec {
-    /// Parse a goal spec from TOML text and validate it.
-    pub fn from_toml_str(text: &str) -> Result<Self> {
-        let spec: GoalSpec = toml::from_str(text).context("Failed to parse goal TOML")?;
-        spec.validate()?;
-        Ok(spec)
+/// Evaluates an owned caller's goal selectors without depending on a goal-file
+/// or CLI representation.
+#[derive(Debug, Clone, Copy)]
+pub struct GoalEvaluator<'a> {
+    wants: &'a [WantSpec],
+}
+
+/// Allocation-free aggregate facts for one item against a goal set.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GoalEvaluation {
+    pub score: f64,
+    pub satisfied_count: usize,
+    pub required_goal_count: usize,
+    pub satisfied_required_count: usize,
+}
+
+impl GoalEvaluation {
+    /// True when every required want is satisfied. An all-preferred goal set is
+    /// complete by definition while its preferences still contribute score.
+    pub const fn complete(self) -> bool {
+        self.satisfied_required_count == self.required_goal_count
+    }
+}
+
+/// One structured goal-satisfaction fact for presentation adapters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalReportEntry {
+    pub description: String,
+    pub required: bool,
+    pub satisfied: bool,
+    pub scoring_mode: GoalScoringMode,
+    /// Selected numeric value. Per-unit goals report the aggregate across all
+    /// matching modifiers; threshold goals report the best matching value for
+    /// their direction. Presence goals report `None`.
+    pub attained: Option<i64>,
+    pub contribution: f64,
+}
+
+/// Stable warning classification produced while resolving numeric selectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GoalSelectorWarningCode {
+    ImplicitFirstStat,
+}
+
+impl GoalSelectorWarningCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ImplicitFirstStat => "implicit_first_stat",
+        }
+    }
+}
+
+/// A non-fatal warning tied to one goal selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalSelectorWarning {
+    pub code: GoalSelectorWarningCode,
+    pub want_index: usize,
+    /// JSON-pointer-compatible path used by machine-readable adapters.
+    pub field_path: String,
+    /// Deterministically sorted RePoE mod IDs that make the selector ambiguous.
+    pub matching_mod_ids: Vec<String>,
+    pub message: String,
+}
+
+/// Stable reason code for a conservatively proven impossible required goal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImpossibleGoalReasonCode {
+    ItemNotCraftable,
+    NoReachableModifier,
+    ModifierGroupConflict,
+    AffixCapacity,
+}
+
+impl ImpossibleGoalReasonCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ItemNotCraftable => "item_not_craftable",
+            Self::NoReachableModifier => "no_reachable_modifier",
+            Self::ModifierGroupConflict => "modifier_group_conflict",
+            Self::AffixCapacity => "affix_capacity",
+        }
+    }
+}
+
+/// One per-want explanation for a conservatively proven impossible request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImpossibleGoalReason {
+    pub code: ImpossibleGoalReasonCode,
+    pub want_index: usize,
+    pub field_path: String,
+    pub related_want_indices: Vec<usize>,
+    pub message: String,
+}
+
+impl<'a> GoalEvaluator<'a> {
+    pub const fn new(wants: &'a [WantSpec]) -> Self {
+        Self { wants }
     }
 
-    /// Load and validate a goal spec from a TOML file.
-    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read goal file {}", path.display()))?;
-        Self::from_toml_str(&text).with_context(|| format!("Invalid goal file {}", path.display()))
-    }
-
-    /// Structural validation beyond what serde enforces.
-    fn validate(&self) -> Result<()> {
-        if self.item.base.trim().is_empty() {
-            bail!("[item] base must not be empty");
-        }
-        if self.item.item_level == 0 || self.item.item_level > 100 {
-            bail!("[item] item_level must be between 1 and 100");
-        }
+    /// Structural validation for goal selectors.
+    pub fn validate(&self) -> Result<()> {
         if self.wants.is_empty() {
             bail!("Goal must contain at least one [[wants]] entry");
         }
-        for (i, w) in self.wants.iter().enumerate() {
-            if w.mod_id.is_none() && w.group.is_none() && w.stat.is_none() {
+        let mut representable_score_bound = 0.0_f64;
+        for (i, want) in self.wants.iter().enumerate() {
+            if want.mod_id.is_none() && want.group.is_none() && want.stat.is_none() {
                 bail!("[[wants]] entry {i}: specify at least one of mod_id, group, stat");
             }
-            if w.min_value.is_some() && w.stat.is_none() {
-                bail!("[[wants]] entry {i}: min_value requires stat to be set");
+            if want.min_value.is_some() && want.max_value.is_some() {
+                bail!("[[wants]] entry {i}: min_value and max_value are mutually exclusive");
             }
-            if w.weight <= 0.0 || !w.weight.is_finite() {
+            if want.weight <= 0.0 || !want.weight.is_finite() {
                 bail!("[[wants]] entry {i}: weight must be a positive finite number");
             }
-        }
-        for (name, price) in &self.prices {
-            if *price <= 0.0 || !price.is_finite() {
-                bail!("[prices] \"{name}\": price must be a positive finite number");
-            }
-        }
-        for (i, method) in self.methods.iter().enumerate() {
-            if let Some(cost) = method.configured_cost() {
-                if cost <= 0.0 || !cost.is_finite() {
-                    bail!("[[methods]] entry {i}: cost must be a positive finite number");
+            match want.scoring_mode() {
+                GoalScoringMode::Presence => {
+                    if want.min_value.is_some() || want.max_value.is_some() {
+                        bail!(
+                            "[[wants]] entry {i}: presence mode does not accept min_value or max_value"
+                        );
+                    }
+                    if want.cap.is_some() {
+                        bail!("[[wants]] entry {i}: presence mode does not accept cap");
+                    }
+                }
+                GoalScoringMode::Threshold => {
+                    if want.min_value.is_none() && want.max_value.is_none() {
+                        bail!(
+                            "[[wants]] entry {i}: threshold mode requires exactly one of min_value or max_value"
+                        );
+                    }
+                    if want.cap.is_some() {
+                        bail!("[[wants]] entry {i}: threshold mode does not accept cap");
+                    }
+                }
+                GoalScoringMode::PerUnit => {
+                    if want.required && want.min_value.is_none() && want.max_value.is_none() {
+                        bail!(
+                            "[[wants]] entry {i}: a required per_unit goal needs min_value or max_value"
+                        );
+                    }
+                    if want.max_value.is_some() && want.cap.is_none() {
+                        bail!("[[wants]] entry {i}: lower-is-better per_unit scoring requires cap");
+                    }
                 }
             }
-            if let MethodSpec::Essence {
-                essence, mod_id, ..
-            } = method
-            {
-                if essence.is_some() == mod_id.is_some() {
-                    bail!(
-                        "[[methods]] entry {i}: essence requires exactly one of \
-                         'essence' or 'mod_id'"
-                    );
+
+            let maximum_representable_units = match want.scoring_mode() {
+                GoalScoringMode::Presence | GoalScoringMode::Threshold => 1.0,
+                GoalScoringMode::PerUnit if want.max_value.is_none() && want.cap.is_some() => {
+                    f64::from(want.cap.expect("checked above").max(0))
                 }
+                GoalScoringMode::PerUnit => i64::MAX as f64,
+            };
+            let contribution_bound = want.weight * maximum_representable_units;
+            if !contribution_bound.is_finite() {
+                bail!(
+                    "[[wants]] entry {i}: weight and per-unit range can overflow the finite score representation"
+                );
             }
-            if let MethodSpec::Fossil {
-                fossil,
-                boosted_tags,
-                reduced_tags,
-                blocked_mod_ids,
-                forced_mod_ids,
-                fossils,
-                ..
-            } = method
-            {
-                if fossils.len() > 3 {
-                    bail!("[[methods]] entry {i}: a resonator can contain at most 4 fossils");
-                }
-                if fossil.is_some()
-                    && (!boosted_tags.is_empty()
-                        || !reduced_tags.is_empty()
-                        || !blocked_mod_ids.is_empty()
-                        || !forced_mod_ids.is_empty())
-                {
-                    bail!(
-                        "[[methods]] entry {i}: named fossil cannot also use manual tag/mod fields"
-                    );
-                }
-                if let Some(part) = fossils.iter().find(|part| {
-                    part.fossil.is_some()
-                        && (!part.boosted_tags.is_empty()
-                            || !part.reduced_tags.is_empty()
-                            || !part.blocked_mod_ids.is_empty()
-                            || !part.forced_mod_ids.is_empty())
-                }) {
-                    bail!(
-                        "[[methods]] entry {i}: named fossil '{}' cannot also use manual tag/mod fields",
-                        part.fossil.as_deref().unwrap_or_default()
-                    );
-                }
-                let blocked = blocked_mod_ids
-                    .iter()
-                    .chain(fossils.iter().flat_map(|f| f.blocked_mod_ids.iter()));
-                let forced: std::collections::HashSet<&str> = forced_mod_ids
-                    .iter()
-                    .chain(fossils.iter().flat_map(|f| f.forced_mod_ids.iter()))
-                    .map(String::as_str)
-                    .collect();
-                if let Some(id) = blocked.map(String::as_str).find(|id| forced.contains(id)) {
-                    bail!(
-                        "[[methods]] entry {i}: fossil mod '{id}' cannot be both blocked and forced"
-                    );
-                }
+            representable_score_bound += contribution_bound;
+            if !representable_score_bound.is_finite() {
+                bail!("Goal weights can overflow the finite aggregate score representation");
             }
-            if let MethodSpec::BestiarySwap { beast_level, .. } = method {
-                if !(1..=100).contains(beast_level) {
-                    bail!("[[methods]] entry {i}: beast_level must be between 1 and 100");
-                }
-            }
-        }
-        if self.search.beam_width == Some(0) {
-            bail!("[search] beam_width must be greater than 0");
-        }
-        if self.search.max_steps == Some(0) {
-            bail!("[search] max_steps must be greater than 0");
-        }
-        if self.search.top == Some(0) {
-            bail!("[search] top must be greater than 0");
-        }
-        if self
-            .search
-            .cost_weight
-            .is_some_and(|weight| weight < 0.0 || !weight.is_finite())
-        {
-            bail!("[search] cost_weight must be a non-negative finite number");
-        }
-        if self
-            .search
-            .restart_cost
-            .is_some_and(|cost| cost < 0.0 || !cost.is_finite())
-        {
-            bail!("[search] restart_cost must be a non-negative finite number");
         }
         Ok(())
     }
@@ -1336,48 +1493,554 @@ impl GoalSpec {
                     bail!("[[wants]] entry {i}: stat '{stat}' not found in mods.json");
                 }
             }
+            if want.scoring_mode() != GoalScoringMode::Presence
+                && !matching_db_mods(want, db)
+                    .any(|candidate| selected_db_stat_id(want, candidate).is_some())
+            {
+                bail!(
+                    "[[wants]] entry {i}: numeric goal matches no modifier with a selectable stat"
+                );
+            }
         }
         Ok(())
+    }
+
+    /// Warn when a numeric selector relies on RePoE's first-stat ordering for
+    /// one or more multi-stat modifiers.
+    pub fn selector_warnings(&self, db: &GameData) -> Vec<GoalSelectorWarning> {
+        self.wants
+            .iter()
+            .enumerate()
+            .filter(|(_, want)| {
+                want.scoring_mode() != GoalScoringMode::Presence && want.stat.is_none()
+            })
+            .filter_map(|(want_index, want)| {
+                let mut matching_mod_ids = db
+                    .mods
+                    .iter()
+                    .filter(|(_, candidate)| candidate.stats.len() > 1)
+                    .filter(|(mod_id, candidate)| db_mod_matches_selectors(want, mod_id, candidate))
+                    .map(|(mod_id, _)| mod_id.clone())
+                    .collect::<Vec<_>>();
+                matching_mod_ids.sort();
+                matching_mod_ids.dedup();
+                if matching_mod_ids.is_empty() {
+                    return None;
+                }
+                Some(GoalSelectorWarning {
+                    code: GoalSelectorWarningCode::ImplicitFirstStat,
+                    want_index,
+                    field_path: format!("/goals/{want_index}/stat"),
+                    message: format!(
+                        "numeric goal {want_index} omits stat and matches multi-stat modifiers; \
+                         using each modifier's first RePoE-declared stat (set stat explicitly to \
+                         avoid declaration-order dependence)"
+                    ),
+                    matching_mod_ids,
+                })
+            })
+            .collect()
+    }
+
+    /// Evaluate score, total satisfaction, and required-goal completion in one
+    /// allocation-free pass over the wants.
+    pub fn evaluate(&self, state: &ItemState, db: &GameData) -> GoalEvaluation {
+        let mut evaluation = GoalEvaluation {
+            score: 0.0,
+            satisfied_count: 0,
+            required_goal_count: 0,
+            satisfied_required_count: 0,
+        };
+
+        for want in self.wants {
+            if want.required {
+                evaluation.required_goal_count += 1;
+            }
+            let assessment = assess_want(want, state, db);
+            evaluation.score += assessment.contribution;
+            if assessment.satisfied {
+                evaluation.satisfied_count += 1;
+                if want.required {
+                    evaluation.satisfied_required_count += 1;
+                }
+            }
+        }
+        evaluation
+    }
+
+    /// Score an item state: sum of weights over all satisfied wants.
+    pub fn score(&self, state: &ItemState, db: &GameData) -> f64 {
+        self.evaluate(state, db).score
+    }
+
+    /// Maximum raw goal score when every requested condition is satisfied.
+    ///
+    /// This compatibility accessor returns infinity when an uncapped numeric
+    /// goal has no request-only ceiling. New callers should prefer
+    /// [`Self::maximum_score`].
+    pub fn max_score(&self) -> f64 {
+        self.maximum_score().unwrap_or(f64::INFINITY)
+    }
+
+    /// Request-only upper score bound, when one exists.
+    ///
+    /// Uncapped higher-is-better and lower-is-better per-unit goals require
+    /// item/data-aware analysis for a sound ceiling, so they return `None`.
+    pub fn maximum_score(&self) -> Option<f64> {
+        self.wants.iter().try_fold(0.0, |total, want| {
+            let contribution = match want.scoring_mode() {
+                GoalScoringMode::Presence | GoalScoringMode::Threshold => want.weight,
+                GoalScoringMode::PerUnit if want.max_value.is_some() => return None,
+                GoalScoringMode::PerUnit => want.weight * f64::from(want.cap?.max(0)),
+            };
+            Some(total + contribution)
+        })
+    }
+
+    /// Number of requested conditions satisfied by `state`.
+    pub fn satisfied_count(&self, state: &ItemState, db: &GameData) -> usize {
+        self.evaluate(state, db).satisfied_count
+    }
+
+    pub fn required_goal_count(&self) -> usize {
+        self.wants.iter().filter(|want| want.required).count()
+    }
+
+    pub fn satisfied_required_count(&self, state: &ItemState, db: &GameData) -> usize {
+        self.evaluate(state, db).satisfied_required_count
+    }
+
+    /// True when every required condition is present on the same item.
+    pub fn is_complete(&self, state: &ItemState, db: &GameData) -> bool {
+        self.evaluate(state, db).complete()
+    }
+
+    /// One structured satisfaction entry per want.
+    pub fn report_entries(&self, state: &ItemState, db: &GameData) -> Vec<GoalReportEntry> {
+        self.wants
+            .iter()
+            .map(|want| {
+                let assessment = assess_want(want, state, db);
+                GoalReportEntry {
+                    description: describe_want(want),
+                    required: want.required,
+                    satisfied: assessment.satisfied,
+                    scoring_mode: want.scoring_mode(),
+                    attained: assessment.attained,
+                    contribution: assessment.contribution,
+                }
+            })
+            .collect()
+    }
+
+    /// Backward-compatible human-readable `(description, satisfied)` pairs.
+    pub fn report(&self, state: &ItemState, db: &GameData) -> Vec<(String, bool)> {
+        self.report_entries(state, db)
+            .into_iter()
+            .map(|entry| (entry.description, entry.satisfied))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GoalCandidate {
+    mod_id: String,
+    generation_type: GenerationType,
+    groups: Vec<String>,
+    crafted: bool,
+}
+
+/// Conservatively prove required-goal impossibility before search.
+///
+/// The analysis deliberately returns no reason when a broad selector or
+/// combinatorial case cannot be proven cheaply. A false negative merely allows
+/// the normal search to return incomplete; false positives are forbidden.
+pub fn analyze_impossible_goals(
+    wants: &[WantSpec],
+    state: &ItemState,
+    db: &GameData,
+    provided_mod_ids: &HashSet<String>,
+) -> Vec<ImpossibleGoalReason> {
+    let evaluator = GoalEvaluator::new(wants);
+    if evaluator.is_complete(state, db) {
+        return Vec::new();
+    }
+
+    if !state.is_craftable() {
+        return wants
+            .iter()
+            .enumerate()
+            .filter(|(_, want)| want.required)
+            .filter(|(_, want)| !assess_want(want, state, db).satisfied)
+            .map(|(want_index, _)| ImpossibleGoalReason {
+                code: ImpossibleGoalReasonCode::ItemNotCraftable,
+                want_index,
+                field_path: format!("/goals/{want_index}"),
+                related_want_indices: Vec::new(),
+                message: "the starting item is corrupted or mirrored and cannot be modified"
+                    .to_string(),
+            })
+            .collect();
+    }
+
+    let existing_mod_ids = scorable_mods(state)
+        .map(|modifier| modifier.mod_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut analyzable = Vec::new();
+    let mut reasons = Vec::new();
+
+    for (want_index, want) in wants.iter().enumerate() {
+        if !want.required || assess_want(want, state, db).satisfied {
+            continue;
+        }
+
+        let matching_candidates = matching_db_mod_entries(want, db).collect::<Vec<_>>();
+        if matching_candidates.iter().any(|(_, candidate)| {
+            !matches!(
+                candidate.generation_type,
+                GenerationType::Prefix | GenerationType::Suffix
+            )
+        }) {
+            // Implicits and enchantments are slot-free and may have separate
+            // acquisition rules. Leave mixed/non-affix selectors to search
+            // rather than proving impossibility from explicit-affix rules.
+            continue;
+        }
+
+        let per_unit = want.scoring_mode() == GoalScoringMode::PerUnit;
+        let mut candidates = matching_candidates
+            .into_iter()
+            .filter(|(_, candidate)| {
+                matches!(
+                    candidate.generation_type,
+                    GenerationType::Prefix | GenerationType::Suffix
+                )
+            })
+            .filter(|(_, candidate)| per_unit || db_mod_can_meet_threshold(want, candidate))
+            .filter(|(mod_id, candidate)| {
+                let existing = existing_mod_ids.contains(mod_id.as_str());
+                let provided = provided_mod_ids.contains(*mod_id);
+                let random_pool_reachable = candidate.domain == Domain::Item
+                    && !candidate.is_essence_only
+                    && candidate.required_level <= state.item_level
+                    && candidate
+                        .spawn_weights
+                        .iter()
+                        .any(|weight| weight.weight > 0);
+                existing || provided || random_pool_reachable
+            })
+            .map(|(mod_id, candidate)| GoalCandidate {
+                mod_id: mod_id.clone(),
+                generation_type: candidate.generation_type.clone(),
+                groups: candidate.groups.clone(),
+                crafted: candidate.domain == Domain::Crafted,
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.mod_id.cmp(&right.mod_id));
+        candidates.dedup_by(|left, right| left.mod_id == right.mod_id);
+
+        if candidates.is_empty() {
+            reasons.push(ImpossibleGoalReason {
+                code: ImpossibleGoalReasonCode::NoReachableModifier,
+                want_index,
+                field_path: format!("/goals/{want_index}"),
+                related_want_indices: Vec::new(),
+                message: format!(
+                    "required goal {want_index} has no level-valid prefix or suffix with a \
+                     positive normal weight or enabled deterministic source"
+                ),
+            });
+        } else if !per_unit {
+            analyzable.push((want_index, candidates));
+        }
+    }
+
+    if !reasons.is_empty()
+        || analyzable.len() < 2
+        || analyzable.len() > 6
+        || analyzable
+            .iter()
+            .any(|(_, candidates)| candidates.len() > 64)
+    {
+        return reasons;
+    }
+
+    if goal_combination_possible(&analyzable, state, db, true) {
+        return reasons;
+    }
+
+    let code = if goal_combination_possible(&analyzable, state, db, false) {
+        ImpossibleGoalReasonCode::ModifierGroupConflict
+    } else {
+        ImpossibleGoalReasonCode::AffixCapacity
+    };
+    let all_indices = analyzable
+        .iter()
+        .map(|(want_index, _)| *want_index)
+        .collect::<Vec<_>>();
+    for (want_index, _) in analyzable {
+        reasons.push(ImpossibleGoalReason {
+            code,
+            want_index,
+            field_path: format!("/goals/{want_index}"),
+            related_want_indices: all_indices
+                .iter()
+                .copied()
+                .filter(|related| *related != want_index)
+                .collect(),
+            message: match code {
+                ImpossibleGoalReasonCode::ModifierGroupConflict => format!(
+                    "required goal {want_index} cannot coexist with the related required goals \
+                     because every candidate assignment has a modifier-group conflict"
+                ),
+                ImpossibleGoalReasonCode::AffixCapacity => format!(
+                    "required goal {want_index} cannot coexist with the related required goals \
+                     within three prefix, three suffix, and one crafted-mod slots"
+                ),
+                ImpossibleGoalReasonCode::ItemNotCraftable
+                | ImpossibleGoalReasonCode::NoReachableModifier => unreachable!(),
+            },
+        });
+    }
+    reasons
+}
+
+fn db_mod_can_meet_threshold(want: &WantSpec, candidate: &Mod) -> bool {
+    if want.scoring_mode() == GoalScoringMode::Presence {
+        return true;
+    }
+    let Some(stat_id) = selected_db_stat_id(want, candidate) else {
+        return false;
+    };
+    let Some(stat) = candidate.stats.iter().find(|stat| stat.id == stat_id) else {
+        return false;
+    };
+    want.min_value.is_none_or(|minimum| stat.max >= minimum)
+        && want.max_value.is_none_or(|maximum| stat.min <= maximum)
+}
+
+fn goal_combination_possible(
+    analyzable: &[(usize, Vec<GoalCandidate>)],
+    state: &ItemState,
+    db: &GameData,
+    enforce_groups: bool,
+) -> bool {
+    let mut ordered = analyzable.to_vec();
+    ordered.sort_by_key(|(_, candidates)| candidates.len());
+
+    let mut chosen_mod_ids = HashSet::new();
+    let mut occupied_groups = HashSet::new();
+    let mut prefix_count = 0_usize;
+    let mut suffix_count = 0_usize;
+    let mut crafted_count = 0_usize;
+    for modifier in &state.fractured {
+        chosen_mod_ids.insert(modifier.mod_id.clone());
+        match modifier.generation_type {
+            GenerationType::Prefix => prefix_count += 1,
+            GenerationType::Suffix => suffix_count += 1,
+            _ => {}
+        }
+        if let Some(candidate) = db.mods.get(&modifier.mod_id) {
+            occupied_groups.extend(candidate.groups.iter().cloned());
+            crafted_count += usize::from(candidate.domain == Domain::Crafted);
+        }
+    }
+
+    assign_goal_candidates(
+        &ordered,
+        0,
+        &mut chosen_mod_ids,
+        &mut occupied_groups,
+        prefix_count,
+        suffix_count,
+        crafted_count,
+        enforce_groups,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assign_goal_candidates(
+    wants: &[(usize, Vec<GoalCandidate>)],
+    position: usize,
+    chosen_mod_ids: &mut HashSet<String>,
+    occupied_groups: &mut HashSet<String>,
+    prefix_count: usize,
+    suffix_count: usize,
+    crafted_count: usize,
+    enforce_groups: bool,
+) -> bool {
+    if position == wants.len() {
+        return true;
+    }
+    for candidate in &wants[position].1 {
+        if chosen_mod_ids.contains(&candidate.mod_id) {
+            if assign_goal_candidates(
+                wants,
+                position + 1,
+                chosen_mod_ids,
+                occupied_groups,
+                prefix_count,
+                suffix_count,
+                crafted_count,
+                enforce_groups,
+            ) {
+                return true;
+            }
+            continue;
+        }
+
+        let (next_prefixes, next_suffixes) = match candidate.generation_type {
+            GenerationType::Prefix => (prefix_count + 1, suffix_count),
+            GenerationType::Suffix => (prefix_count, suffix_count + 1),
+            _ => continue,
+        };
+        let next_crafted = crafted_count + usize::from(candidate.crafted);
+        if next_prefixes > 3 || next_suffixes > 3 || next_crafted > 1 {
+            continue;
+        }
+        if enforce_groups
+            && candidate
+                .groups
+                .iter()
+                .any(|group| occupied_groups.contains(group))
+        {
+            continue;
+        }
+
+        chosen_mod_ids.insert(candidate.mod_id.clone());
+        let inserted_groups = candidate
+            .groups
+            .iter()
+            .filter(|group| occupied_groups.insert((*group).clone()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let possible = assign_goal_candidates(
+            wants,
+            position + 1,
+            chosen_mod_ids,
+            occupied_groups,
+            next_prefixes,
+            next_suffixes,
+            next_crafted,
+            enforce_groups,
+        );
+        chosen_mod_ids.remove(&candidate.mod_id);
+        for group in inserted_groups {
+            occupied_groups.remove(&group);
+        }
+        if possible {
+            return true;
+        }
+    }
+    false
+}
+
+impl GoalSpec {
+    /// Parse a goal spec from TOML text and validate it.
+    pub fn from_toml_str(text: &str) -> Result<Self> {
+        let spec: GoalSpec = toml::from_str(text).context("Failed to parse goal TOML")?;
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Load and validate a goal spec from a TOML file.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read goal file {}", path.display()))?;
+        Self::from_toml_str(&text).with_context(|| format!("Invalid goal file {}", path.display()))
+    }
+
+    /// Structural validation beyond what serde enforces.
+    fn validate(&self) -> Result<()> {
+        if self.item.base.trim().is_empty() {
+            bail!("[item] base must not be empty");
+        }
+        if self.item.item_level == 0 || self.item.item_level > 100 {
+            bail!("[item] item_level must be between 1 and 100");
+        }
+        GoalEvaluator::new(&self.wants).validate()?;
+        for (name, price) in &self.prices {
+            if *price <= 0.0 || !price.is_finite() {
+                bail!("[prices] \"{name}\": price must be a positive finite number");
+            }
+        }
+        validate_method_specs(&self.methods)?;
+        if self.search.beam_width == Some(0) {
+            bail!("[search] beam_width must be greater than 0");
+        }
+        if self.search.max_steps == Some(0) {
+            bail!("[search] max_steps must be greater than 0");
+        }
+        if self.search.top == Some(0) {
+            bail!("[search] top must be greater than 0");
+        }
+        if self
+            .search
+            .cost_weight
+            .is_some_and(|weight| weight < 0.0 || !weight.is_finite())
+        {
+            bail!("[search] cost_weight must be a non-negative finite number");
+        }
+        if self
+            .search
+            .restart_cost
+            .is_some_and(|cost| cost < 0.0 || !cost.is_finite())
+        {
+            bail!("[search] restart_cost must be a non-negative finite number");
+        }
+        Ok(())
+    }
+
+    /// Validate goal selectors against the loaded RePoE export so typos fail
+    /// before an expensive search silently chases an impossible target.
+    pub fn validate_against_db(&self, db: &GameData) -> Result<()> {
+        GoalEvaluator::new(&self.wants).validate_against_db(db)
     }
 
     /// Score an item state: sum of weights over satisfied wants.
     /// Called once per candidate node in the beam search — kept allocation-free.
     pub fn score(&self, state: &ItemState, db: &GameData) -> f64 {
-        self.wants
-            .iter()
-            .filter(|w| scorable_mods(state).any(|m| want_matches(w, m, db)))
-            .map(|w| w.weight)
-            .sum()
+        GoalEvaluator::new(&self.wants).score(state, db)
     }
 
     /// Maximum raw goal score when every requested condition is satisfied.
     pub fn max_score(&self) -> f64 {
-        self.wants.iter().map(|want| want.weight).sum()
+        GoalEvaluator::new(&self.wants).max_score()
+    }
+
+    /// Request-only maximum score, or `None` when numeric goals require a
+    /// data/item-aware ceiling.
+    pub fn maximum_score(&self) -> Option<f64> {
+        GoalEvaluator::new(&self.wants).maximum_score()
     }
 
     /// Number of requested conditions satisfied by `state`.
     pub fn satisfied_count(&self, state: &ItemState, db: &GameData) -> usize {
-        self.wants
-            .iter()
-            .filter(|want| scorable_mods(state).any(|m| want_matches(want, m, db)))
-            .count()
+        GoalEvaluator::new(&self.wants).satisfied_count(state, db)
     }
 
-    /// True only when every requested condition is present on the same item.
+    pub fn required_goal_count(&self) -> usize {
+        GoalEvaluator::new(&self.wants).required_goal_count()
+    }
+
+    pub fn satisfied_required_count(&self, state: &ItemState, db: &GameData) -> usize {
+        GoalEvaluator::new(&self.wants).satisfied_required_count(state, db)
+    }
+
+    /// True only when every required condition is present on the same item.
     pub fn is_complete(&self, state: &ItemState, db: &GameData) -> bool {
-        self.satisfied_count(state, db) == self.wants.len()
+        GoalEvaluator::new(&self.wants).is_complete(state, db)
     }
 
-    /// Human-readable satisfaction report for the final CLI output:
-    /// one `(description, satisfied)` pair per want.
+    /// Structured satisfaction report for application adapters.
+    pub fn report_entries(&self, state: &ItemState, db: &GameData) -> Vec<GoalReportEntry> {
+        GoalEvaluator::new(&self.wants).report_entries(state, db)
+    }
+
+    /// Backward-compatible human-readable `(description, satisfied)` pairs.
     pub fn report(&self, state: &ItemState, db: &GameData) -> Vec<(String, bool)> {
-        self.wants
-            .iter()
-            .map(|w| {
-                let satisfied = scorable_mods(state).any(|m| want_matches(w, m, db));
-                (describe_want(w), satisfied)
-            })
-            .collect()
+        GoalEvaluator::new(&self.wants).report(state, db)
     }
 }
 
@@ -1394,8 +2057,88 @@ fn scorable_mods(state: &ItemState) -> impl Iterator<Item = &Modifier> {
         .chain(state.enchants.iter())
 }
 
-/// True if `modifier` satisfies every criterion `want` specifies.
-fn want_matches(want: &WantSpec, modifier: &Modifier, db: &GameData) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WantAssessment {
+    satisfied: bool,
+    attained: Option<i64>,
+    contribution: f64,
+}
+
+fn assess_want(want: &WantSpec, state: &ItemState, db: &GameData) -> WantAssessment {
+    match want.scoring_mode() {
+        GoalScoringMode::Presence => {
+            let satisfied =
+                scorable_mods(state).any(|modifier| modifier_matches_selectors(want, modifier, db));
+            WantAssessment {
+                satisfied,
+                attained: None,
+                contribution: if satisfied { want.weight } else { 0.0 },
+            }
+        }
+        GoalScoringMode::Threshold => {
+            let values = scorable_mods(state)
+                .filter_map(|modifier| selected_numeric_value(want, modifier, db));
+            if let Some(minimum) = want.min_value {
+                let attained = values.max();
+                let satisfied = attained.is_some_and(|value| value >= i64::from(minimum));
+                WantAssessment {
+                    satisfied,
+                    attained,
+                    contribution: if satisfied { want.weight } else { 0.0 },
+                }
+            } else {
+                let attained = values.min();
+                let maximum = want
+                    .max_value
+                    .expect("validated threshold goals have exactly one bound");
+                let satisfied = attained.is_some_and(|value| value <= i64::from(maximum));
+                WantAssessment {
+                    satisfied,
+                    attained,
+                    contribution: if satisfied { want.weight } else { 0.0 },
+                }
+            }
+        }
+        GoalScoringMode::PerUnit => {
+            let mut matched = false;
+            let attained = scorable_mods(state)
+                .filter_map(|modifier| selected_numeric_value(want, modifier, db))
+                .fold(0_i64, |total, value| {
+                    matched = true;
+                    total.saturating_add(value)
+                });
+            let satisfied = matched
+                && want
+                    .min_value
+                    .is_none_or(|minimum| attained >= i64::from(minimum))
+                && want
+                    .max_value
+                    .is_none_or(|maximum| attained <= i64::from(maximum));
+            let scaled_units = if !matched {
+                0
+            } else if want.max_value.is_some() {
+                i64::from(
+                    want.cap
+                        .expect("validated lower-is-better per_unit goals have a cap"),
+                )
+                .saturating_sub(attained)
+                .max(0)
+            } else {
+                want.cap
+                    .map_or(attained, |cap| attained.min(i64::from(cap)))
+                    .max(0)
+            };
+            WantAssessment {
+                satisfied,
+                attained: matched.then_some(attained),
+                contribution: want.weight * scaled_units as f64,
+            }
+        }
+    }
+}
+
+/// True if `modifier` satisfies every non-numeric selector `want` specifies.
+fn modifier_matches_selectors(want: &WantSpec, modifier: &Modifier, db: &GameData) -> bool {
     if let Some(id) = &want.mod_id {
         if &modifier.mod_id != id {
             return false;
@@ -1411,16 +2154,68 @@ fn want_matches(want: &WantSpec, modifier: &Modifier, db: &GameData) -> bool {
         }
     }
     if let Some(stat) = &want.stat {
-        let threshold = want.min_value.unwrap_or(i32::MIN);
-        let has_stat = modifier
-            .rolls
-            .iter()
-            .any(|r| &r.stat_id == stat && r.value >= threshold);
+        let has_stat = modifier.rolls.iter().any(|roll| &roll.stat_id == stat);
         if !has_stat {
             return false;
         }
     }
     true
+}
+
+fn selected_numeric_value(want: &WantSpec, modifier: &Modifier, db: &GameData) -> Option<i64> {
+    if !modifier_matches_selectors(want, modifier, db) {
+        return None;
+    }
+    let stat_id = want.stat.as_deref().or_else(|| {
+        db.mods
+            .get(&modifier.mod_id)
+            .and_then(|candidate| candidate.stats.first())
+            .map(|stat| stat.id.as_str())
+    })?;
+    modifier
+        .rolls
+        .iter()
+        .find(|roll| roll.stat_id == stat_id)
+        .map(|roll| i64::from(roll.value))
+}
+
+fn matching_db_mods<'a>(
+    want: &'a WantSpec,
+    db: &'a GameData,
+) -> impl Iterator<Item = &'a Mod> + 'a {
+    matching_db_mod_entries(want, db).map(|(_, candidate)| candidate)
+}
+
+fn matching_db_mod_entries<'a>(
+    want: &'a WantSpec,
+    db: &'a GameData,
+) -> impl Iterator<Item = (&'a String, &'a Mod)> + 'a {
+    db.mods
+        .iter()
+        .filter(move |(mod_id, candidate)| db_mod_matches_selectors(want, mod_id, candidate))
+}
+
+fn db_mod_matches_selectors(want: &WantSpec, mod_id: &str, candidate: &Mod) -> bool {
+    want.mod_id.as_ref().is_none_or(|wanted| wanted == mod_id)
+        && want
+            .group
+            .as_ref()
+            .is_none_or(|group| candidate.groups.iter().any(|entry| entry == group))
+        && want
+            .stat
+            .as_ref()
+            .is_none_or(|stat| candidate.stats.iter().any(|entry| &entry.id == stat))
+}
+
+fn selected_db_stat_id<'a>(want: &'a WantSpec, candidate: &'a Mod) -> Option<&'a str> {
+    match &want.stat {
+        Some(stat) => candidate
+            .stats
+            .iter()
+            .find(|entry| &entry.id == stat)
+            .map(|entry| entry.id.as_str()),
+        None => candidate.stats.first().map(|entry| entry.id.as_str()),
+    }
 }
 
 fn describe_want(w: &WantSpec) -> String {
@@ -1432,10 +2227,21 @@ fn describe_want(w: &WantSpec) -> String {
         parts.push(format!("group {g}"));
     }
     if let Some(s) = &w.stat {
-        match w.min_value {
-            Some(v) => parts.push(format!("stat {s} >= {v}")),
-            None => parts.push(format!("stat {s}")),
+        match (w.min_value, w.max_value) {
+            (Some(value), None) => parts.push(format!("stat {s} >= {value}")),
+            (None, Some(value)) => parts.push(format!("stat {s} <= {value}")),
+            _ => parts.push(format!("stat {s}")),
         }
+    } else {
+        if let Some(value) = w.min_value {
+            parts.push(format!("first stat >= {value}"));
+        }
+        if let Some(value) = w.max_value {
+            parts.push(format!("first stat <= {value}"));
+        }
+    }
+    if let Some(cap) = w.cap {
+        parts.push(format!("cap {cap}"));
     }
     format!("{} (weight {})", parts.join(" + "), w.weight)
 }
@@ -1922,8 +2728,131 @@ mod tests {
         assert_eq!(spec.item.base, "Astral Plate");
         assert_eq!(spec.item.item_level, 86);
         assert_eq!(spec.wants.len(), 2);
+        assert!(
+            spec.wants.iter().all(|want| want.required),
+            "omitted required flags must preserve legacy all-required behavior"
+        );
         assert_eq!(spec.search.beam_width, Some(20));
         assert_eq!(spec.search.cost_weight, Some(0.05));
+    }
+
+    #[test]
+    fn preferred_wants_score_without_blocking_required_completion() {
+        let text = VALID_TOML.replacen(
+            "min_value = 70",
+            "min_value = 70\n        required = false",
+            1,
+        );
+        let spec = GoalSpec::from_toml_str(&text).unwrap();
+        let db = db_with_life();
+        let state = item_with_life(65);
+        let evaluation = GoalEvaluator::new(&spec.wants).evaluate(&state, &db);
+
+        assert!(spec.wants[0].required);
+        assert!(!spec.wants[1].required);
+        assert_eq!(evaluation.score, 10.0);
+        assert_eq!(evaluation.satisfied_count, 1);
+        assert_eq!(evaluation.required_goal_count, 1);
+        assert_eq!(evaluation.satisfied_required_count, 1);
+        assert!(evaluation.complete());
+
+        let report = spec.report_entries(&state, &db);
+        assert!(report[0].required);
+        assert!(report[0].satisfied);
+        assert!(!report[1].required);
+        assert!(!report[1].satisfied);
+    }
+
+    #[test]
+    fn preference_weight_cannot_mask_an_unsatisfied_required_want() {
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+
+            [[wants]]
+            group = "IncreasedLife"
+            weight = 100.0
+            required = false
+
+            [[wants]]
+            stat = "base_maximum_life"
+            min_value = 70
+            weight = 1.0
+            "#,
+        )
+        .unwrap();
+        let db = db_with_life();
+        let evaluation = GoalEvaluator::new(&spec.wants).evaluate(&item_with_life(65), &db);
+
+        assert_eq!(evaluation.score, 100.0);
+        assert_eq!(spec.max_score(), 101.0);
+        assert_eq!(evaluation.satisfied_required_count, 0);
+        assert_eq!(evaluation.required_goal_count, 1);
+        assert!(!evaluation.complete());
+    }
+
+    #[test]
+    fn all_preferred_goal_set_is_complete_but_keeps_its_score_target() {
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+
+            [[wants]]
+            group = "IncreasedLife"
+            weight = 10.0
+            required = false
+            "#,
+        )
+        .unwrap();
+        let db = db_with_life();
+        let empty = ItemState::new_base("chest", vec![], 86);
+        let evaluation = GoalEvaluator::new(&spec.wants).evaluate(&empty, &db);
+
+        assert_eq!(evaluation.score, 0.0);
+        assert_eq!(spec.max_score(), 10.0);
+        assert_eq!(evaluation.required_goal_count, 0);
+        assert!(evaluation.complete());
+    }
+
+    #[test]
+    fn goal_evaluator_exposes_the_goal_spec_evaluation_contract() {
+        let spec = GoalSpec::from_toml_str(VALID_TOML).unwrap();
+        let db = db_with_life();
+        let state = item_with_life(75);
+        let evaluator = GoalEvaluator::new(&spec.wants);
+
+        evaluator.validate().unwrap();
+        evaluator.validate_against_db(&db).unwrap();
+        assert_eq!(evaluator.score(&state, &db), spec.score(&state, &db));
+        assert_eq!(evaluator.max_score(), spec.max_score());
+        assert_eq!(
+            evaluator.satisfied_count(&state, &db),
+            spec.satisfied_count(&state, &db)
+        );
+        assert_eq!(
+            evaluator.is_complete(&state, &db),
+            spec.is_complete(&state, &db)
+        );
+        assert_eq!(evaluator.report(&state, &db), spec.report(&state, &db));
+
+        let no_wants: [WantSpec; 0] = [];
+        assert_eq!(
+            GoalEvaluator::new(&no_wants)
+                .validate()
+                .unwrap_err()
+                .to_string(),
+            "Goal must contain at least one [[wants]] entry"
+        );
+        let empty_db = GameData::new(HashMap::new(), HashMap::new());
+        assert_eq!(
+            evaluator
+                .validate_against_db(&empty_db)
+                .unwrap_err()
+                .to_string(),
+            "[[wants]] entry 0: group 'IncreasedLife' not found in mods.json"
+        );
     }
 
     #[test]
@@ -1956,8 +2885,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_min_value_without_stat() {
-        let err = GoalSpec::from_toml_str(
+    fn numeric_group_selector_uses_the_first_declared_stat() {
+        let spec = GoalSpec::from_toml_str(
             r#"
             [item]
             base = "Astral Plate"
@@ -1966,11 +2895,449 @@ mod tests {
             min_value = 70
             "#,
         )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("min_value requires stat"),
-            "got: {err}"
+        .unwrap();
+        let db = db_with_life();
+        spec.validate_against_db(&db).unwrap();
+
+        let report = spec.report_entries(&item_with_life(75), &db);
+        assert!(report[0].satisfied);
+        assert_eq!(report[0].attained, Some(75));
+        assert_eq!(report[0].scoring_mode, GoalScoringMode::Threshold);
+    }
+
+    #[test]
+    fn implicit_first_stat_on_multi_stat_mod_emits_typed_warning() {
+        let mut multi_stat = life_mod();
+        multi_stat.stats.push(ModStat {
+            id: "second_stat".to_string(),
+            min: 1,
+            max: 2,
+        });
+        let db = GameData::new(
+            HashMap::from([("MultiStatLife".to_string(), multi_stat)]),
+            HashMap::new(),
         );
+        let implicit = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            group = "IncreasedLife"
+            min_value = 60
+            "#,
+        )
+        .unwrap();
+
+        let warnings = GoalEvaluator::new(&implicit.wants).selector_warnings(&db);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, GoalSelectorWarningCode::ImplicitFirstStat);
+        assert_eq!(warnings[0].field_path, "/goals/0/stat");
+        assert_eq!(warnings[0].matching_mod_ids, ["MultiStatLife"]);
+
+        let explicit = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            group = "IncreasedLife"
+            stat = "base_maximum_life"
+            min_value = 60
+            "#,
+        )
+        .unwrap();
+        assert!(
+            GoalEvaluator::new(&explicit.wants)
+                .selector_warnings(&db)
+                .is_empty(),
+            "an explicit stat selector removes declaration-order ambiguity"
+        );
+    }
+
+    #[test]
+    fn per_unit_sums_every_matching_modifier_and_applies_cap() {
+        let mut second = life_mod();
+        second.name = "Healthy".to_string();
+        second.generation_type = GenerationType::Suffix;
+        second.groups = vec!["SecondLifeSource".to_string()];
+        let mut mods = HashMap::new();
+        mods.insert("LifePrefix".to_string(), life_mod());
+        mods.insert("LifeSuffix".to_string(), second);
+        let db = GameData::new(mods, HashMap::new());
+
+        let mut item = ItemState::new_base("chest", vec!["body_armour".to_string()], 86);
+        item.rarity = Rarity::Rare;
+        item.prefixes.push(Modifier {
+            mod_id: "LifePrefix".to_string(),
+            generation_type: GenerationType::Prefix,
+            rolls: vec![StatRoll {
+                stat_id: "base_maximum_life".to_string(),
+                value: 30,
+            }],
+        });
+        item.suffixes.push(Modifier {
+            mod_id: "LifeSuffix".to_string(),
+            generation_type: GenerationType::Suffix,
+            rolls: vec![StatRoll {
+                stat_id: "base_maximum_life".to_string(),
+                value: 20,
+            }],
+        });
+
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+
+            [[wants]]
+            stat = "base_maximum_life"
+            mode = "per_unit"
+            min_value = 40
+            cap = 45
+            weight = 2.0
+            "#,
+        )
+        .unwrap();
+        spec.validate_against_db(&db).unwrap();
+
+        let evaluation = GoalEvaluator::new(&spec.wants).evaluate(&item, &db);
+        let report = spec.report_entries(&item, &db);
+        assert!(evaluation.complete());
+        assert_eq!(evaluation.score, 90.0);
+        assert_eq!(spec.maximum_score(), Some(90.0));
+        assert_eq!(report[0].attained, Some(50));
+        assert_eq!(report[0].contribution, 90.0);
+    }
+
+    #[test]
+    fn uncapped_preferred_per_unit_defaults_higher_and_has_no_known_maximum() {
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+
+            [[wants]]
+            group = "IncreasedLife"
+            mode = "per_unit"
+            required = false
+            weight = 0.5
+            "#,
+        )
+        .unwrap();
+        let db = db_with_life();
+        spec.validate_against_db(&db).unwrap();
+
+        let evaluation = GoalEvaluator::new(&spec.wants).evaluate(&item_with_life(70), &db);
+        assert!(evaluation.complete(), "all-preferred sets remain complete");
+        assert_eq!(evaluation.score, 35.0);
+        assert_eq!(spec.maximum_score(), None);
+        assert!(spec.max_score().is_infinite());
+    }
+
+    #[test]
+    fn lower_is_better_uses_aggregate_threshold_and_nonnegative_gap_score() {
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+
+            [[wants]]
+            stat = "base_maximum_life"
+            mode = "per_unit"
+            max_value = 70
+            cap = 100
+            weight = 1.5
+            "#,
+        )
+        .unwrap();
+        let db = db_with_life();
+        spec.validate_against_db(&db).unwrap();
+
+        let low = GoalEvaluator::new(&spec.wants).evaluate(&item_with_life(65), &db);
+        let high = GoalEvaluator::new(&spec.wants).evaluate(&item_with_life(110), &db);
+        assert!(low.complete());
+        assert_eq!(low.score, 52.5);
+        assert!(!high.complete());
+        assert_eq!(high.score, 0.0);
+        assert_eq!(spec.maximum_score(), None);
+    }
+
+    #[test]
+    fn higher_per_unit_never_contributes_a_negative_score() {
+        let mut negative = life_mod();
+        negative.stats[0].min = -20;
+        negative.stats[0].max = -1;
+        let db = GameData::new(
+            HashMap::from([("NegativeLife".to_string(), negative)]),
+            HashMap::new(),
+        );
+        let mut item = ItemState::new_base("chest", vec![], 86);
+        item.rarity = Rarity::Rare;
+        item.prefixes.push(Modifier {
+            mod_id: "NegativeLife".to_string(),
+            generation_type: GenerationType::Prefix,
+            rolls: vec![StatRoll {
+                stat_id: "base_maximum_life".to_string(),
+                value: -10,
+            }],
+        });
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+
+            [[wants]]
+            stat = "base_maximum_life"
+            mode = "per_unit"
+            required = false
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(spec.score(&item, &db), 0.0);
+        assert_eq!(spec.report_entries(&item, &db)[0].attained, Some(-10));
+    }
+
+    #[test]
+    fn scoring_mode_field_matrix_is_strict() {
+        let invalid_wants = [
+            (
+                "mode = \"presence\"\nmin_value = 1",
+                "presence mode does not accept",
+            ),
+            (
+                "mode = \"presence\"\ncap = 10",
+                "presence mode does not accept cap",
+            ),
+            (
+                "mode = \"threshold\"",
+                "threshold mode requires exactly one",
+            ),
+            (
+                "mode = \"threshold\"\nmin_value = 1\ncap = 10",
+                "threshold mode does not accept cap",
+            ),
+            (
+                "mode = \"per_unit\"",
+                "required per_unit goal needs min_value or max_value",
+            ),
+            (
+                "mode = \"per_unit\"\nmax_value = 10",
+                "lower-is-better per_unit scoring requires cap",
+            ),
+            (
+                "min_value = 1\nmax_value = 2",
+                "min_value and max_value are mutually exclusive",
+            ),
+        ];
+
+        for (fields, expected) in invalid_wants {
+            let text = format!(
+                r#"
+                [item]
+                base = "Astral Plate"
+
+                [[wants]]
+                group = "IncreasedLife"
+                {fields}
+                "#
+            );
+            let error = GoalSpec::from_toml_str(&text).expect_err(fields);
+            assert!(
+                error.to_string().contains(expected),
+                "{fields:?} produced {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn impossible_analysis_detects_zero_weight_without_deterministic_source() {
+        let mut unreachable = life_mod();
+        unreachable.spawn_weights[0].weight = 0;
+        unreachable.is_essence_only = true;
+        let db = GameData::new(
+            HashMap::from([("EssenceOnlyLife".to_string(), unreachable)]),
+            HashMap::new(),
+        );
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            mod_id = "EssenceOnlyLife"
+            "#,
+        )
+        .unwrap();
+        let mut item = ItemState::new_base("chest", vec![], 86);
+        item.rarity = Rarity::Rare;
+
+        let reasons = analyze_impossible_goals(&spec.wants, &item, &db, &HashSet::new());
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(
+            reasons[0].code,
+            ImpossibleGoalReasonCode::NoReachableModifier
+        );
+        assert_eq!(reasons[0].want_index, 0);
+
+        assert!(
+            analyze_impossible_goals(
+                &spec.wants,
+                &item,
+                &db,
+                &HashSet::from(["EssenceOnlyLife".to_string()])
+            )
+            .is_empty(),
+            "an enabled deterministic provider prevents a false impossibility"
+        );
+
+        let per_unit = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            mod_id = "EssenceOnlyLife"
+            mode = "per_unit"
+            min_value = 1
+            cap = 100
+            "#,
+        )
+        .unwrap();
+        let reasons = analyze_impossible_goals(&per_unit.wants, &item, &db, &HashSet::new());
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(
+            reasons[0].code,
+            ImpossibleGoalReasonCode::NoReachableModifier
+        );
+    }
+
+    #[test]
+    fn impossible_analysis_skips_satisfied_and_non_affix_wants() {
+        let mut enchantment = life_mod();
+        enchantment.generation_type = GenerationType::Enchantment;
+        enchantment.groups = vec!["EnchantLife".to_string()];
+        let db = GameData::new(
+            HashMap::from([
+                ("LifePrefix".to_string(), life_mod()),
+                ("LifeEnchant".to_string(), enchantment.clone()),
+            ]),
+            HashMap::new(),
+        );
+        let spec = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            mod_id = "LifeEnchant"
+            [[wants]]
+            mod_id = "LifePrefix"
+            "#,
+        )
+        .unwrap();
+        let mut item = ItemState::new_base("chest", vec![], 86);
+        item.rarity = Rarity::Rare;
+        item.enchants.push(Modifier::from_min_rolls(
+            "LifeEnchant",
+            GenerationType::Enchantment,
+            &enchantment.stats,
+        ));
+
+        assert!(
+            analyze_impossible_goals(&spec.wants, &item, &db, &HashSet::new()).is_empty(),
+            "an already-satisfied slot-free want must not consume an affix candidate"
+        );
+
+        item.enchants.clear();
+        assert!(
+            analyze_impossible_goals(&spec.wants, &item, &db, &HashSet::new()).is_empty(),
+            "non-affix acquisition is left to search instead of producing a false proof"
+        );
+    }
+
+    #[test]
+    fn impossible_analysis_detects_group_conflicts_without_rejecting_reuse() {
+        let mut first = life_mod();
+        first.groups = vec!["SharedExclusiveGroup".to_string()];
+        let mut second = life_mod();
+        second.name = "Second".to_string();
+        second.groups = vec!["SharedExclusiveGroup".to_string()];
+        let db = GameData::new(
+            HashMap::from([
+                ("FirstLife".to_string(), first),
+                ("SecondLife".to_string(), second),
+            ]),
+            HashMap::new(),
+        );
+        let mut item = ItemState::new_base("chest", vec![], 86);
+        item.rarity = Rarity::Rare;
+        let conflicting = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            mod_id = "FirstLife"
+            [[wants]]
+            mod_id = "SecondLife"
+            "#,
+        )
+        .unwrap();
+        let reasons = analyze_impossible_goals(&conflicting.wants, &item, &db, &HashSet::new());
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons
+            .iter()
+            .all(|reason| reason.code == ImpossibleGoalReasonCode::ModifierGroupConflict));
+
+        let reusable = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            mod_id = "FirstLife"
+            [[wants]]
+            group = "SharedExclusiveGroup"
+            "#,
+        )
+        .unwrap();
+        assert!(
+            analyze_impossible_goals(&reusable.wants, &item, &db, &HashSet::new()).is_empty(),
+            "one modifier may satisfy multiple required wants"
+        );
+    }
+
+    #[test]
+    fn impossible_analysis_detects_affix_slot_overflow() {
+        let mut mods = HashMap::new();
+        let mut toml = String::from("[item]\nbase = \"Astral Plate\"\n");
+        for index in 0..4 {
+            let mod_id = format!("Prefix{index}");
+            let mut modifier = life_mod();
+            modifier.name = mod_id.clone();
+            modifier.groups = vec![format!("Group{index}")];
+            mods.insert(mod_id.clone(), modifier);
+            toml.push_str(&format!("[[wants]]\nmod_id = \"{mod_id}\"\n"));
+        }
+        let db = GameData::new(mods, HashMap::new());
+        let spec = GoalSpec::from_toml_str(&toml).unwrap();
+        let mut item = ItemState::new_base("chest", vec![], 86);
+        item.rarity = Rarity::Rare;
+
+        let reasons = analyze_impossible_goals(&spec.wants, &item, &db, &HashSet::new());
+        assert_eq!(reasons.len(), 4);
+        assert!(reasons
+            .iter()
+            .all(|reason| reason.code == ImpossibleGoalReasonCode::AffixCapacity));
+    }
+
+    #[test]
+    fn impossible_analysis_marks_unsatisfied_uncraftable_items() {
+        let db = db_with_life();
+        let spec = GoalSpec::from_toml_str(VALID_TOML).unwrap();
+        let mut item = ItemState::new_base("chest", vec![], 86);
+        item.corrupted = true;
+
+        let reasons = analyze_impossible_goals(&spec.wants, &item, &db, &HashSet::new());
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons
+            .iter()
+            .all(|reason| reason.code == ImpossibleGoalReasonCode::ItemNotCraftable));
     }
 
     #[test]
@@ -1986,6 +3353,48 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("positive"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_goal_scores_that_can_overflow_finite_representation() {
+        let aggregate = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            mod_id = "First"
+            weight = 1.0e308
+            [[wants]]
+            mod_id = "Second"
+            weight = 1.0e308
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            aggregate
+                .to_string()
+                .contains("overflow the finite aggregate score"),
+            "got: {aggregate:#}"
+        );
+
+        let per_unit = GoalSpec::from_toml_str(
+            r#"
+            [item]
+            base = "Astral Plate"
+            [[wants]]
+            stat = "base_maximum_life"
+            mode = "per_unit"
+            required = false
+            weight = 1.0e308
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            per_unit
+                .to_string()
+                .contains("overflow the finite score representation"),
+            "got: {per_unit:#}"
+        );
     }
 
     #[test]
@@ -2567,12 +3976,13 @@ mod tests {
     fn report_flags_each_want() {
         let spec = GoalSpec::from_toml_str(VALID_TOML).unwrap();
         let db = db_with_life();
-        let report = spec.report(&item_with_life(65), &db);
+        let report = spec.report_entries(&item_with_life(65), &db);
         assert_eq!(report.len(), 2);
-        assert!(report[0].1, "group want should be satisfied");
+        assert!(report[0].satisfied, "group want should be satisfied");
         assert!(
-            !report[1].1,
+            !report[1].satisfied,
             "min_value 70 want should not be satisfied at roll 65"
         );
+        assert!(report.iter().all(|entry| entry.required));
     }
 }

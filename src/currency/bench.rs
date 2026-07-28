@@ -6,7 +6,10 @@
 //! (`ItemState::crafted_mod`), and the crafted mod occupies a normal affix slot
 //! and participates in group-conflict checks like any other mod.
 
-use super::CraftingMethod;
+use super::{
+    CraftingMethod, ItemClassSupport, MethodCatalog, MethodFamily, MethodId, MethodSetup,
+    ProbabilityModel,
+};
 use crate::data::mods::{Domain, GenerationType};
 use crate::data::GameData;
 use crate::engine::mod_pool::random_rolls_pub;
@@ -90,6 +93,18 @@ impl BenchCraft {
 pub struct RemoveCraftedMods;
 
 impl CraftingMethod for RemoveCraftedMods {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("bench", "remove-crafted", &[])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Bench
+    }
+
+    fn description(&self) -> &str {
+        "Removes the item's removable bench-crafted modifier."
+    }
+
     fn name(&self) -> &str {
         "Remove Crafted Mods"
     }
@@ -118,6 +133,26 @@ impl CraftingMethod for RemoveCraftedMods {
 }
 
 impl CraftingMethod for BenchCraft {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("bench", "add-explicit", &[&self.mod_id])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Bench
+    }
+
+    fn description(&self) -> &str {
+        "Adds one configured crafted modifier, consuming the item's crafted-mod slot."
+    }
+
+    fn setup(&self) -> MethodSetup {
+        MethodSetup::CatalogOrConfigured(MethodCatalog::CraftingBench)
+    }
+
+    fn item_class_support(&self) -> ItemClassSupport {
+        ItemClassSupport::CatalogRestricted
+    }
+
     fn name(&self) -> &str {
         &self.display_name
     }
@@ -125,8 +160,16 @@ impl CraftingMethod for BenchCraft {
         self.cost_chaos
     }
 
+    fn provided_mod_ids(&self) -> Vec<&str> {
+        vec![self.mod_id.as_str()]
+    }
+
     fn weights_are_probabilities(&self) -> bool {
         false
+    }
+
+    fn probability_model(&self) -> ProbabilityModel {
+        ProbabilityModel::ExactIdentitySampledRolls
     }
 
     fn can_apply(&self, item: &ItemState, db: &GameData) -> bool {

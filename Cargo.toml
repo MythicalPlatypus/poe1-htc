@@ -26,6 +26,9 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "1"
 
+# Stable source-bundle fingerprints for loaded RePoE data
+sha2 = "0.10"
+
 # Ordered float for priority queues in beam search
 ordered-float = "4"
 
@@ -34,6 +37,10 @@ rand = "0.9"
 
 # Goal specification files (what the user wants to craft)
 toml = "0.8"
+
+[dev-dependencies]
+# Execute the checked saved-request contract against Draft 2020-12.
+jsonschema = { version = "0.49.1", default-features = false }
 
 [profile.release]
 opt-level = 3

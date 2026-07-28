@@ -4,9 +4,10 @@
 
 PoE1 HTC takes a base item, a set of desired modifiers, league prices, and
 optional configured crafts. It explores possible craft sequences using its
-always-enabled default orb set plus those configured crafts, then reports the
+legacy CLI default orb set plus those configured crafts, then reports the
 strongest routes it found, their estimated cost, and the chance of one-shot
-steps landing.
+steps landing. Programmatic service callers can instead supply an explicit
+semantic-ID allowlist.
 
 The practical question is:
 
@@ -27,6 +28,7 @@ New here? Start with the guides in [`docs/`](docs):
 3. [Importing Your Item](docs/importing-your-item.md) — start from a `Ctrl+C` item paste
 4. [Understanding Results](docs/understanding-results.md) — what every number means before you spend
 5. [FAQ & Troubleshooting](docs/faq.md) — common errors, stability, limitations
+6. [In-Game Validation](docs/in-game-validation.md) — safe live-item checks for imports and state transitions
 
 The rest of this README is a condensed overview of the same material plus
 contributor notes.
@@ -39,10 +41,27 @@ contributor notes.
 - Modifier filtering by item level, base tags, ordered spawn/generation weights,
   affix capacity, and RePoE `groups`
 - Parallel, seeded beam search with semantic state deduplication
-- TOML goals targeting exact mod IDs, mod groups, stats, and minimum rolls
+- Presence, threshold, and per-unit TOML goals targeting exact mod IDs, mod
+  groups, stats, minimum/maximum rolls, and capped value-scaled preferences
+- Required/preferred completion semantics plus conservative pre-search
+  diagnostics for provably impossible required combinations
 - Existing-item input for evaluating or finishing a craft in progress
 - Clipboard item-text import (`--item-file`) to start from an item you own
 - League price overrides and multiple reported pathways
+- A reusable, structured application service shared with the CLI
+- Stable semantic crafting-method IDs, structured registry metadata, ID-keyed
+  prices, and explicit service-level family/method selection
+- Immutable data provenance with an exact RePoE bundle fingerprint on every
+  prepared job and result
+- Service-level hard budgets over first-try, retry-expected, or
+  restart-adjusted expected cost, with explicit finite/unbounded/unavailable
+  values and labeled complete over-budget exemplars
+- Generation-committed progress, cancellation, timeout/expansion limits,
+  typed termination reasons, and one resolved replayable seed per run
+- Strict version-1 JSON request/response DTOs, checked request schema, and
+  complete/incomplete/sampled/impossible/over-budget compatibility fixtures
+- Read-only application-service catalogs for normalized base search and
+  engine-equivalent normal affixes on a clean base at a chosen item level
 
 Implemented crafting actions:
 
@@ -90,6 +109,18 @@ curl -o data/fossils.json https://repoe-fork.github.io/fossils.json
 The optional catalogs let the CLI resolve names such as `Pristine Fossil`,
 select the correct Essence mod for the chosen item class, enforce lower-tier
 Essence random-modifier caps, and reject invalid bench crafts before search.
+
+At load time the optimizer computes a versioned SHA-256 fingerprint over the
+exact bytes and presence of all five JSON inputs. Paths, timestamps, search
+settings, and the descriptive RePoE version are excluded. This lets saved
+results identify the data snapshot that actually produced them rather than
+assuming that the README's tested version is installed.
+
+The RePoE JSON files do not identify their own release. A trusted updater or
+manual installation may put the version in `data/repoe-version.txt`; otherwise
+the CLI honestly reports the version as `unknown`. Whitespace around the
+sidecar value is ignored, and an empty or malformed value is rejected. The
+sidecar never changes the data fingerprint.
 
 ## Install
 
@@ -139,6 +170,7 @@ weight = 10.0
 stat = "base_maximum_life"
 min_value = 90
 weight = 5.0
+required = false           # preference: adds score but does not block COMPLETE
 
 [search]
 beam_width = 40
@@ -148,6 +180,39 @@ restart_cost = 1.0
 seed = 42
 top = 3
 ```
+
+Every want is required by default, preserving existing goal files. Set
+`required = false` for a preference: it still contributes score and guides
+search, but only required wants determine whether a result is `COMPLETE`.
+Presence and threshold goals contribute their weight when satisfied.
+`per_unit` goals contribute `weight ×` their non-negative attained units,
+optionally limited by `cap`. A completed result always ranks ahead of an
+incomplete one, even when the incomplete item satisfies higher-scoring
+preferences.
+
+For value-scaled scoring:
+
+```toml
+[[wants]]
+stat = "base_maximum_energy_shield"
+mode = "per_unit"
+min_value = 100             # required satisfaction threshold
+cap = 300                   # score no more than 300 attained units
+weight = 0.05
+required = true
+
+[[wants]]
+stat = "local_attribute_requirements_+%"
+mode = "per_unit"
+max_value = -10             # lower is better
+cap = 0                     # required for lower-is-better per-unit scoring
+weight = 1.0
+required = false
+```
+
+A required `per_unit` goal must declare exactly one threshold bound. A
+higher-is-better preferred goal may omit both threshold and cap, but then its
+maximum possible score is reported as unknown.
 
 Start from an item you already own:
 
@@ -214,12 +279,18 @@ Override built-in prices by exact method display name:
 "Exalted Orb" = 45.0
 ```
 
+This display-name table is the legacy TOML format. The CLI resolves it to
+semantic `MethodId` values before invoking the application service.
+
 See [`goals/example_life_chest.toml`](goals/example_life_chest.toml) and
 [`goals/finish_fractured_chest.toml`](goals/finish_fractured_chest.toml) for
 complete examples.
 
-The default orb set is always enabled. `[[methods]]` adds configured crafts; it
-does not form an allowlist or disable default methods.
+Legacy TOML/CLI runs retain the default orb set and treat `[[methods]]` as
+additions. The application service also supports exact `MethodId` allowlists
+and explicit selections that combine family-wide switches with per-method
+additions or exclusions. Filtering never reorders methods: built-ins retain
+registry order, followed by configured-method request order.
 
 ## Importing an Item
 
@@ -271,18 +342,26 @@ pools are unaffected — such mods still never appear in new rolls.
 
 The CLI reports:
 
-- Whether the target is complete
-- Raw goal score and search ranking score
+- Whether every required want is complete, plus required and total counts
+- Raw goal score and its known maximum, when bounded
 - The chosen method sequence
 - Per-step cost and hit chance
-- Estimated total cost
+- First-try, retry-expected, and restart-adjusted expected cost
+- Selected-budget comparison/excess and each path's
+  `complete`/`incomplete`/`over_budget` status
 - Combined one-shot path probability
 - Final modifiers and satisfied wants
+- Search termination reason, committed progress counters, elapsed time, and
+  the resolved replay seed
 
 Repeatable rerolls are priced as `craft cost / observed hit chance`. One-shot
 actions are paid once and retain their miss probability. The CLI also reports a
 pessimistic restart estimate for paths where a one-shot miss would force the
 whole plan to restart, including the configured replacement or reset cost.
+Programmatic service callers may bind a hard chaos-equivalent cap to any of
+the three cost models. This constrains a modeled expectation, not guaranteed
+wallet consumption. Legacy TOML/CLI requests remain unbounded until a UI or
+machine-readable adapter exposes budget input.
 
 Full rerolls use 50 Monte Carlo samples per expansion. Methods that enumerate
 modifier identities exactly but sample numeric rolls are also marked as
@@ -305,16 +384,23 @@ Command-line flags override the goal file:
 --restart-cost <N>  Cost to restore or replace the base after a failed path
 --seed <N>          Reproducible random sampling
 --top <N>           Number of distinct pathways to print
+--expansion-limit <N> Maximum generated successor states
+--timeout-ms <N>    Wall-clock search limit in milliseconds
 --base-item <NAME>  Override the goal's base
 --item-file <PATH>  Start from pasted item text ("-" for stdin); requires --goal
 --data-dir <PATH>   RePoE data directory
 ```
 
-`cost_weight` is relative to the total weight of your wants. Complete targets
-sort ahead of incomplete ones; within the same completion class, ranking
-subtracts `cost_weight ×` restart-adjusted expected cost. A value that is too
-low favors expensive high-score routes; a value that is too high favors cheap
-routes that barely improve the item.
+`cost_weight` is relative to the attainable raw-score scale, which may be
+unbounded for uncapped `per_unit` goals. Complete targets sort ahead of
+incomplete ones; within the same completion class, ranking subtracts
+`cost_weight ×` restart-adjusted expected cost. A value that is too low favors
+expensive high-score routes; a value that is too high favors cheap routes that
+barely improve the item.
+
+The CLI exposes timeout and expansion limits. Cooperative cancellation and
+streaming progress observers are currently application-service APIs for a
+future desktop adapter.
 
 ## Known Limitations
 
@@ -325,8 +411,9 @@ routes that barely improve the item.
   global optimality.
 - Recovery after a failed one-shot craft is not modeled as a full policy. The
   real cost usually lies between the printed optimistic and restart estimates.
-- Multi-step probabilities group sibling outcomes by goal score; equal-scoring
-  items do not necessarily support the same continuation.
+- Multi-step probabilities group sibling outcomes by required completion and
+  goal score; equal-ranked items do not necessarily support the same
+  continuation.
 - Numeric stat-roll probabilities are sampled for several otherwise exact
   actions.
 - Imported quality, sockets, and displayed total Energy Shield are descriptive
@@ -347,6 +434,7 @@ routes that barely improve the item.
 
 ```text
 src/
+  app/        Reusable application services shared by CLI and future UI adapters
   cli/        Argument parsing, validation, and result reporting
   currency/   CraftingMethod implementations
   data/       RePoE schemas and pure JSON loading
@@ -358,12 +446,43 @@ goals/        Example goal files
 tests/        Synthetic end-to-end integration tests
 ```
 
+`OptimizerService` is the reusable boundary between adapters and the crafting
+engine. It accepts owned, file-independent requests, validates and prepares a
+job, then runs search and returns evaluated results without printing. The CLI
+now only reads files/stdin, resolves flag precedence, and renders those
+structured results. These Stage A request types are intentionally internal
+until the versioned desktop request and result schemas are finalized.
+
+Each service also owns one immutable pairing of `GameData` and
+`DataProvenance`. Preparation summaries and optimization responses carry the
+optional RePoE version and stable bundle fingerprint. Prepared work remains
+tied to the exact service dataset allocation; matching fingerprints are useful
+for replay diagnostics but never substitute for that runtime safety check.
+
+Every crafting method has a stable semantic `MethodId` independent of its
+display name and price. Search identity, returned path steps, service-level
+allowlists, and `PriceBook` overrides all use that ID. The CLI preserves its
+legacy TOML behavior by resolving display-name `[prices]` entries before
+calling the service. A returned path step carries both the semantic ID and the
+human-readable name; path signatures and repeat suppression use the ID.
+
+The application registry also exposes each method's family, description,
+intrinsic price, setup/catalog requirement, coarse item-class support, and
+probability model. Probability metadata distinguishes exact enumeration,
+50-sample Monte Carlo, exact identity weights with sampled numeric rolls,
+additional mechanic approximations, and unavailable compatibility operations.
+Exact catalog entries and item-class lists remain part of the planned catalog
+APIs rather than this effective-instance registry.
+
 Every action implements this contract; the behavioral classification hooks
 have conservative defaults:
 
 ```rust
 pub trait CraftingMethod: Send + Sync {
+    fn id(&self) -> MethodId;
+    fn family(&self) -> MethodFamily;
     fn name(&self) -> &str;
+    fn description(&self) -> &str;
     fn cost_chaos(&self) -> f64;
     fn can_apply(&self, item: &ItemState, db: &GameData) -> bool;
     fn apply(
@@ -373,6 +492,7 @@ pub trait CraftingMethod: Send + Sync {
         rng: &mut dyn RngCore,
     ) -> Result<Vec<(ItemState, f64)>>;
     fn weights_are_probabilities(&self) -> bool { true }
+    fn probability_model(&self) -> ProbabilityModel;
     fn repeatable_on_failure(&self) -> bool { false }
     fn reroll_kind(&self) -> Option<RerollKind> { None }
     fn reroll_initializer_kind(&self) -> Option<RerollKind> { None }
@@ -381,9 +501,9 @@ pub trait CraftingMethod: Send + Sync {
 ```
 
 `apply` returns concrete successor states whose weights sum to 1.0. The
-probability hook distinguishes exact enumeration from sampled representatives;
-the retry and reroll hooks drive expected-cost pricing and prevent dominated
-reroll chains.
+probability hooks distinguish exact enumeration, sampled representatives, and
+known mechanic approximations; the retry and reroll hooks drive expected-cost
+pricing and prevent dominated reroll chains.
 
 `GameData` is immutable after loading and shared by reference. Search nodes
 clone only `ItemState`. Seeded runs are deterministic because the craftable
@@ -399,6 +519,13 @@ cargo fmt -- --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build --release
+```
+
+With local RePoE files installed, exercise the read-only catalog against an
+item-level-86 Astral Plate:
+
+```bash
+cargo run --release --example catalog_smoke
 ```
 
 Core rules:

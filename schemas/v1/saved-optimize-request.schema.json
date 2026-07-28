@@ -1,0 +1,872 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://poe1-htc.local/schemas/v1/saved-optimize-request.schema.json",
+  "title": "PoE1 HTC Saved Optimize Request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "starting_item",
+    "goals",
+    "methods",
+    "budget",
+    "search"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "starting_item": {
+      "$ref": "#/$defs/starting_item"
+    },
+    "goals": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/goal"
+      }
+    },
+    "methods": {
+      "$ref": "#/$defs/method_set"
+    },
+    "budget": {
+      "$ref": "#/$defs/budget"
+    },
+    "search": {
+      "$ref": "#/$defs/search"
+    }
+  },
+  "$defs": {
+    "positive_number": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "nonnegative_number": {
+      "type": "number",
+      "minimum": 0
+    },
+    "decimal_u64": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "maxLength": 20,
+      "format": "poe1-htc-decimal-u64-v1"
+    },
+    "method_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*/[a-z0-9]+(?:-[a-z0-9]+)*(?:/(?:[A-Za-z0-9._~-]|%[0-9A-F]{2})+)*$",
+      "format": "poe1-htc-method-id-v1"
+    },
+    "starting_item": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "item"
+          ],
+          "properties": {
+            "kind": {
+              "const": "described"
+            },
+            "item": {
+              "$ref": "#/$defs/described_item"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "text"
+          ],
+          "properties": {
+            "kind": {
+              "const": "imported_text"
+            },
+            "text": {
+              "type": "string"
+            },
+            "fallback_item_level": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          }
+        }
+      ]
+    },
+    "described_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "base",
+        "item_level"
+      ],
+      "properties": {
+        "base": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "item_level": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "rarity": {
+          "enum": [
+            "normal",
+            "magic",
+            "rare"
+          ]
+        },
+        "mods": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/starting_modifier"
+          }
+        },
+        "influences": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "shaper",
+              "elder",
+              "crusader",
+              "hunter",
+              "redeemer",
+              "warlord"
+            ]
+          }
+        },
+        "exarch_implicit": {
+          "type": "string"
+        },
+        "eater_implicit": {
+          "type": "string"
+        }
+      }
+    },
+    "starting_modifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mod_id"
+      ],
+      "properties": {
+        "mod_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": -2147483648,
+            "maximum": 2147483647
+          }
+        },
+        "fractured": {
+          "type": "boolean",
+          "default": false
+        },
+        "crafted": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "goal": {
+      "type": "object",
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "required": [
+            "mod_id"
+          ]
+        },
+        {
+          "required": [
+            "group"
+          ]
+        },
+        {
+          "required": [
+            "stat"
+          ]
+        }
+      ],
+      "properties": {
+        "mod_id": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "group": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "stat": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "mode": {
+          "enum": [
+            "presence",
+            "threshold",
+            "per_unit"
+          ],
+          "default": "presence"
+        },
+        "min_value": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "max_value": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "cap": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "weight": {
+          "$ref": "#/$defs/positive_number",
+          "default": 1
+        },
+        "required": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "const": "presence"
+            }
+          },
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "min_value"
+                ]
+              },
+              {
+                "required": [
+                  "max_value"
+                ]
+              },
+              {
+                "required": [
+                  "cap"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "const": "threshold"
+            }
+          },
+          "oneOf": [
+            {
+              "required": [
+                "min_value"
+              ]
+            },
+            {
+              "required": [
+                "max_value"
+              ]
+            }
+          ],
+          "not": {
+            "required": [
+              "cap"
+            ]
+          }
+        },
+        {
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "const": "per_unit"
+            }
+          },
+          "not": {
+            "required": [
+              "min_value",
+              "max_value"
+            ]
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "max_value"
+                ]
+              },
+              "then": {
+                "required": [
+                  "cap"
+                ]
+              }
+            },
+            {
+              "anyOf": [
+                {
+                  "required": [
+                    "min_value"
+                  ]
+                },
+                {
+                  "required": [
+                    "max_value"
+                  ]
+                },
+                {
+                  "required": [
+                    "required"
+                  ],
+                  "properties": {
+                    "required": {
+                      "const": false
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "method_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "access"
+      ],
+      "properties": {
+        "configured": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/configured_method"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/method_access"
+        },
+        "price_overrides": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/method_price"
+          }
+        }
+      }
+    },
+    "method_access": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "legacy_defaults_and_configured"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "method_ids"
+          ],
+          "properties": {
+            "kind": {
+              "const": "allowlist"
+            },
+            "method_ids": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/method_id"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "selection"
+          ],
+          "properties": {
+            "kind": {
+              "const": "explicit"
+            },
+            "selection": {
+              "$ref": "#/$defs/method_selection"
+            }
+          }
+        }
+      ]
+    },
+    "method_selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled_families": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/method_family"
+          }
+        },
+        "enabled_methods": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/method_id"
+          }
+        },
+        "disabled_methods": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/method_id"
+          }
+        }
+      }
+    },
+    "method_family": {
+      "enum": [
+        "currency",
+        "bench",
+        "essence",
+        "fossil",
+        "harvest",
+        "eldritch",
+        "influence",
+        "bestiary"
+      ]
+    },
+    "method_price": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method_id",
+        "amount_chaos"
+      ],
+      "properties": {
+        "method_id": {
+          "$ref": "#/$defs/method_id"
+        },
+        "amount_chaos": {
+          "$ref": "#/$defs/positive_number"
+        }
+      }
+    },
+    "configured_method": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/essence_method"
+        },
+        {
+          "$ref": "#/$defs/bench_method"
+        },
+        {
+          "$ref": "#/$defs/fossil_method"
+        },
+        {
+          "$ref": "#/$defs/harvest_method"
+        },
+        {
+          "$ref": "#/$defs/eldritch_chaos_method"
+        },
+        {
+          "$ref": "#/$defs/eldritch_exalt_method"
+        },
+        {
+          "$ref": "#/$defs/eldritch_annul_method"
+        },
+        {
+          "$ref": "#/$defs/conqueror_exalt_method"
+        },
+        {
+          "$ref": "#/$defs/bestiary_swap_method"
+        }
+      ]
+    },
+    "essence_method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "cost"
+      ],
+      "properties": {
+        "type": {
+          "const": "essence"
+        },
+        "name": {
+          "type": "string"
+        },
+        "essence": {
+          "type": "string"
+        },
+        "mod_id": {
+          "type": "string"
+        },
+        "cost": {
+          "$ref": "#/$defs/positive_number"
+        }
+      }
+    },
+    "bench_method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "mod_id",
+        "cost"
+      ],
+      "properties": {
+        "type": {
+          "const": "bench"
+        },
+        "name": {
+          "type": "string"
+        },
+        "mod_id": {
+          "type": "string"
+        },
+        "cost": {
+          "$ref": "#/$defs/positive_number"
+        }
+      }
+    },
+    "fossil_method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "cost"
+      ],
+      "properties": {
+        "type": {
+          "const": "fossil"
+        },
+        "name": {
+          "type": "string"
+        },
+        "fossil": {
+          "type": "string"
+        },
+        "cost": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "boosted_tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reduced_tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "blocked_mod_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "forced_mod_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "fossils": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/fossil_part"
+          }
+        }
+      }
+    },
+    "fossil_part": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fossil": {
+          "type": "string"
+        },
+        "boosted_tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reduced_tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "blocked_mod_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "forced_mod_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "harvest_method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "op",
+        "target",
+        "cost"
+      ],
+      "properties": {
+        "type": {
+          "const": "harvest"
+        },
+        "op": {
+          "enum": [
+            "reforge",
+            "augment"
+          ]
+        },
+        "target": {
+          "enum": [
+            "attack",
+            "caster",
+            "speed",
+            "life",
+            "defence",
+            "resistance",
+            "chaos",
+            "fire",
+            "cold",
+            "lightning",
+            "physical",
+            "critical",
+            "minion",
+            "mana"
+          ]
+        },
+        "cost": {
+          "$ref": "#/$defs/positive_number"
+        }
+      }
+    },
+    "eldritch_chaos_method": {
+      "$ref": "#/$defs/eldritch_method_base",
+      "unevaluatedProperties": false,
+      "properties": {
+        "type": {
+          "const": "eldritch_chaos"
+        }
+      }
+    },
+    "eldritch_exalt_method": {
+      "$ref": "#/$defs/eldritch_method_base",
+      "unevaluatedProperties": false,
+      "properties": {
+        "type": {
+          "const": "eldritch_exalt"
+        }
+      }
+    },
+    "eldritch_annul_method": {
+      "$ref": "#/$defs/eldritch_method_base",
+      "unevaluatedProperties": false,
+      "properties": {
+        "type": {
+          "const": "eldritch_annul"
+        }
+      }
+    },
+    "eldritch_method_base": {
+      "type": "object",
+      "required": [
+        "type",
+        "god"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "god": {
+          "enum": [
+            "exarch",
+            "eater"
+          ]
+        }
+      }
+    },
+    "conqueror_exalt_method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "influence"
+      ],
+      "properties": {
+        "type": {
+          "const": "conqueror_exalt"
+        },
+        "influence": {
+          "enum": [
+            "crusader",
+            "hunter",
+            "redeemer",
+            "warlord"
+          ]
+        }
+      }
+    },
+    "bestiary_swap_method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "add",
+        "beast_level",
+        "cost"
+      ],
+      "properties": {
+        "type": {
+          "const": "bestiary_swap"
+        },
+        "add": {
+          "enum": [
+            "prefix",
+            "suffix"
+          ]
+        },
+        "beast_level": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "cost": {
+          "$ref": "#/$defs/positive_number"
+        }
+      }
+    },
+    "budget": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "unbounded"
+            },
+            "metric": {
+              "$ref": "#/$defs/budget_metric"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "amount_chaos"
+          ],
+          "properties": {
+            "kind": {
+              "const": "hard_cap"
+            },
+            "amount_chaos": {
+              "$ref": "#/$defs/nonnegative_number"
+            },
+            "metric": {
+              "$ref": "#/$defs/budget_metric"
+            }
+          }
+        }
+      ]
+    },
+    "budget_metric": {
+      "enum": [
+        "first_try",
+        "retry_expected",
+        "restart_adjusted_expected"
+      ],
+      "default": "restart_adjusted_expected"
+    },
+    "search": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "beam_width",
+        "max_steps",
+        "cost_weight",
+        "restart_cost",
+        "top"
+      ],
+      "properties": {
+        "beam_width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_steps": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cost_weight": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "restart_cost": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "seed": {
+          "$ref": "#/$defs/decimal_u64"
+        },
+        "top": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "expansion_limit": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

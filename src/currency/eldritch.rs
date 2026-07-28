@@ -8,7 +8,10 @@ use std::cmp::Ordering;
 use anyhow::{bail, Result};
 use rand::{Rng, RngCore};
 
-use super::{CraftingMethod, MONTE_CARLO_SAMPLES};
+use super::{
+    CraftingMethod, ItemClassSupport, MethodFamily, MethodId, MethodSetup,
+    ProbabilityApproximation, ProbabilityModel, MONTE_CARLO_SAMPLES,
+};
 use crate::data::mods::GenerationType;
 use crate::data::GameData;
 use crate::engine::mod_pool::{eligible_mods, random_rolls_pub, weighted_pick};
@@ -19,6 +22,15 @@ use crate::item::{state::Rarity, ItemState};
 pub enum EldritchGod {
     SearingExarch,
     EaterOfWorlds,
+}
+
+impl EldritchGod {
+    fn id_token(self) -> &'static str {
+        match self {
+            Self::SearingExarch => "exarch",
+            Self::EaterOfWorlds => "eater",
+        }
+    }
 }
 
 /// Item base tags that can receive Eldritch implicits.
@@ -179,6 +191,26 @@ pub struct EldritchChaosOrb {
 }
 
 impl CraftingMethod for EldritchChaosOrb {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("eldritch", "chaos", &[self.god.id_token()])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Eldritch
+    }
+
+    fn description(&self) -> &str {
+        "Rerolls explicit modifiers on the side selected by Eldritch dominance."
+    }
+
+    fn setup(&self) -> MethodSetup {
+        MethodSetup::Configured
+    }
+
+    fn item_class_support(&self) -> ItemClassSupport {
+        ItemClassSupport::EldritchArmour
+    }
+
     fn name(&self) -> &str {
         match self.god {
             EldritchGod::SearingExarch => "Eldritch Chaos Orb (Exarch)",
@@ -239,6 +271,13 @@ impl CraftingMethod for EldritchChaosOrb {
         false
     }
 
+    fn probability_model(&self) -> ProbabilityModel {
+        ProbabilityModel::MonteCarloWithApproximation {
+            samples: MONTE_CARLO_SAMPLES,
+            approximation: ProbabilityApproximation::UniformEldritchAffixCount,
+        }
+    }
+
     fn repeatable_on_failure(&self) -> bool {
         true
     }
@@ -253,6 +292,26 @@ pub struct EldritchExaltedOrb {
 }
 
 impl CraftingMethod for EldritchExaltedOrb {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("eldritch", "exalted", &[self.god.id_token()])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Eldritch
+    }
+
+    fn description(&self) -> &str {
+        "Adds one explicit modifier on the side selected by Eldritch dominance."
+    }
+
+    fn setup(&self) -> MethodSetup {
+        MethodSetup::Configured
+    }
+
+    fn item_class_support(&self) -> ItemClassSupport {
+        ItemClassSupport::EldritchArmour
+    }
+
     fn name(&self) -> &str {
         match self.god {
             EldritchGod::SearingExarch => "Eldritch Exalted Orb (Exarch)",
@@ -266,6 +325,10 @@ impl CraftingMethod for EldritchExaltedOrb {
 
     fn weights_are_probabilities(&self) -> bool {
         false
+    }
+
+    fn probability_model(&self) -> ProbabilityModel {
+        ProbabilityModel::ExactIdentitySampledRolls
     }
 
     fn can_apply(&self, item: &ItemState, db: &GameData) -> bool {
@@ -324,6 +387,26 @@ pub struct EldritchOrbOfAnnulment {
 }
 
 impl CraftingMethod for EldritchOrbOfAnnulment {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("eldritch", "annulment", &[self.god.id_token()])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Eldritch
+    }
+
+    fn description(&self) -> &str {
+        "Removes one explicit modifier from the side selected by Eldritch dominance."
+    }
+
+    fn setup(&self) -> MethodSetup {
+        MethodSetup::Configured
+    }
+
+    fn item_class_support(&self) -> ItemClassSupport {
+        ItemClassSupport::EldritchArmour
+    }
+
     fn name(&self) -> &str {
         match self.god {
             EldritchGod::SearingExarch => "Eldritch Orb of Annulment (Exarch)",

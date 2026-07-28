@@ -79,6 +79,46 @@ struct DisplayLine {
     fractured: bool,
     crafted: bool,
     run: usize,
+    /// Advanced-copy `{ Prefix Modifier ... }` header this line belongs to.
+    /// Lines sharing a group id are exactly one modifier, so segmentation
+    /// never has to guess where a multi-line modifier ends.
+    group: Option<usize>,
+    /// Generation type declared by the advanced header, when it names one.
+    header_generation: Option<GenerationType>,
+}
+
+/// Modifier facts parsed from an advanced-copy header line such as
+/// `{ Master Crafted Prefix Modifier "Upgraded" (Tier: 1) — Life, Mana }`.
+struct AdvancedHeader {
+    generation: Option<GenerationType>,
+    crafted: bool,
+    fractured: bool,
+}
+
+/// Recognize an advanced mod-description header (Ctrl+Alt+C copies). Returns
+/// `None` for other brace-wrapped metadata so it keeps its ignored-with-warning
+/// path. Qualifiers ("Master Crafted", "Fractured") precede the
+/// `<Prefix|Suffix|...> Modifier` keyword; the quoted display name and tier
+/// after it are not needed for segmentation.
+fn parse_advanced_modifier_header(raw: &str) -> Option<AdvancedHeader> {
+    let inner = raw.strip_prefix('{')?.strip_suffix('}')?.trim();
+    let keyword = inner.split('"').next().unwrap_or(inner);
+    let lower = keyword.to_ascii_lowercase();
+    if !lower.contains("modifier") {
+        return None;
+    }
+    let generation = if lower.contains("prefix") {
+        Some(GenerationType::Prefix)
+    } else if lower.contains("suffix") {
+        Some(GenerationType::Suffix)
+    } else {
+        None
+    };
+    Some(AdvancedHeader {
+        generation,
+        crafted: lower.contains("crafted"),
+        fractured: lower.contains("fractured"),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +208,8 @@ pub fn import_item_text(text: &str, db: &GameData, options: ImportOptions) -> Re
     let mut previous_kind = None;
     let mut block = 0usize;
     let mut previous_block = 0usize;
+    let mut group_counter = 0usize;
+    let mut active_header: Option<(usize, AdvancedHeader)> = None;
 
     for (index, raw) in raw_lines.iter().enumerate() {
         if raw.is_empty() {
@@ -176,6 +218,7 @@ pub fn import_item_text(text: &str, db: &GameData, options: ImportOptions) -> Re
         if is_separator(raw) {
             block += 1;
             previous_kind = None;
+            active_header = None;
             continue;
         }
         if index == rarity_index || index == base_index {
@@ -256,6 +299,11 @@ pub fn import_item_text(text: &str, db: &GameData, options: ImportOptions) -> Re
             continue;
         }
         if raw.starts_with('{') && raw.ends_with('}') {
+            if let Some(header) = parse_advanced_modifier_header(raw) {
+                group_counter += 1;
+                active_header = Some((group_counter, header));
+                continue;
+            }
             warnings.push(ImportWarning {
                 code: "unsupported_metadata".to_string(),
                 message: format!(
@@ -283,6 +331,15 @@ pub fn import_item_text(text: &str, db: &GameData, options: ImportOptions) -> Re
             });
             continue;
         }
+        let (group, header_generation, fractured, crafted) = match &active_header {
+            Some((id, header)) => (
+                Some(*id),
+                header.generation.clone(),
+                fractured || header.fractured,
+                crafted || header.crafted,
+            ),
+            None => (None, None, fractured, crafted),
+        };
         if kind != SectionKind::Explicit && (fractured || crafted) {
             bail!(
                 "line {}: implicit/enchantment text cannot be fractured or crafted",
@@ -301,6 +358,8 @@ pub fn import_item_text(text: &str, db: &GameData, options: ImportOptions) -> Re
             fractured,
             crafted,
             run: next_run,
+            group,
+            header_generation,
         });
     }
 
@@ -1074,6 +1133,25 @@ fn candidates_at(
         }
         let displayed = &lines[index..index + templates.len()];
         if displayed.iter().any(|line| line.run != first.run) {
+            continue;
+        }
+        // Advanced-copy headers delimit modifiers exactly: a candidate must
+        // start at its group's first line and consume the whole group.
+        if let Some(group) = first.group {
+            let starts_group = index == 0 || lines[index - 1].group != Some(group);
+            let group_len = lines
+                .iter()
+                .filter(|line| line.group == Some(group))
+                .count();
+            if !starts_group || templates.len() != group_len {
+                continue;
+            }
+        }
+        if first
+            .header_generation
+            .as_ref()
+            .is_some_and(|generation| *generation != modifier.generation_type)
+        {
             continue;
         }
         if displayed

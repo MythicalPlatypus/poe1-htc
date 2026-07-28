@@ -6,7 +6,7 @@
 use anyhow::{bail, Result};
 use rand::RngCore;
 
-use super::CraftingMethod;
+use super::{CraftingMethod, MethodFamily, MethodId};
 use crate::data::GameData;
 use crate::item::{state::Rarity, ItemState};
 
@@ -36,6 +36,18 @@ impl FracturingOrb {
 }
 
 impl CraftingMethod for FracturingOrb {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("currency", "fracturing", &[])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
+    fn description(&self) -> &str {
+        "Fractures one uniformly selected explicit modifier on an eligible Rare item."
+    }
+
     fn name(&self) -> &str {
         "Fracturing Orb"
     }

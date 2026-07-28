@@ -3,19 +3,22 @@
 //! At each step the engine:
 //!   1. Expands the current beam by applying every available `CraftingMethod`
 //!      to every `ItemState` in the beam.
-//!   2. Scores each resulting state: `score_fn(state) - cost_weight *
-//!      restart-adjusted expected cost`.
-//!   3. Keeps the top `beam_width` states by score (ties preserve deterministic
-//!      generation order).
+//!   2. Evaluates each resulting state and computes
+//!      `raw_score - cost_weight * restart-adjusted expected cost`.
+//!   3. Keeps the top `beam_width` states. Goal-aware searches rank completed
+//!      states before incomplete states, then use the cost-adjusted score (ties
+//!      preserve deterministic generation order).
 //!
 //! The search terminates when `max_steps` is reached or the beam is empty.
 //!
 //! ## Expected-cost model
 //! For every successor we compute `p_at_least`: the probability that a single
 //! application of the method produces a state scoring at least as well as this
-//! successor (the sum of sibling outcome weights with `raw score >= this raw
-//! score`). For exact-enumeration methods this probability is exact; for Monte
-//! Carlo methods it is an empirical estimate with resolution 1/N (see
+//! successor. Goal-aware searches compare the lexicographic pair
+//! `(complete, raw_score)`, so an incomplete outcome never counts as being at
+//! least as good as a completed outcome, regardless of raw score. For
+//! exact-enumeration methods this probability is exact; for Monte Carlo methods
+//! it is an empirical estimate with resolution 1/N (see
 //! `MONTE_CARLO_SAMPLES`) and is flagged as an estimate.
 //!
 //! Steps are then priced by their retry semantics
@@ -38,16 +41,20 @@
 //! mod pools iterate in sorted order.
 
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ordered_float::OrderedFloat;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rayon::prelude::*;
 
-use crate::currency::{CraftingMethod, RerollKind};
+use crate::currency::{CraftingMethod, MethodId, RerollKind};
 use crate::data::GameData;
 use crate::item::ItemState;
+
+use super::cost::{BudgetComparison, BudgetMetric, BudgetPolicy, CostValue};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ModifierKey {
@@ -96,6 +103,11 @@ struct RerollTransition {
     consumed: Option<RerollContextKey>,
     initialized: Option<RerollContextKey>,
     superseded_initializer: Option<usize>,
+}
+
+struct RegisteredMethod<'method> {
+    method: &'method dyn CraftingMethod,
+    id: MethodId,
 }
 
 fn generation_type_key(generation_type: &crate::data::mods::GenerationType) -> u8 {
@@ -200,11 +212,15 @@ fn deduplicate_candidates(candidates: Vec<BeamNode>) -> Vec<BeamNode> {
         match positions.get(&key).copied() {
             Some(position) => {
                 let current = &unique[position];
-                if candidate.score > current.score
-                    || (candidate.score == current.score
-                        && (candidate.restart_adjusted_cost < current.restart_adjusted_cost
-                            || (candidate.restart_adjusted_cost == current.restart_adjusted_cost
-                                && candidate.success_prob > current.success_prob)))
+                if (candidate.complete && !current.complete)
+                    || (candidate.complete == current.complete
+                        && (candidate.score > current.score
+                            || (candidate.score == current.score
+                                && (candidate.restart_adjusted_cost
+                                    < current.restart_adjusted_cost
+                                    || (candidate.restart_adjusted_cost
+                                        == current.restart_adjusted_cost
+                                        && candidate.success_prob > current.success_prob)))))
                 {
                     unique[position] = candidate;
                 }
@@ -221,18 +237,36 @@ fn deduplicate_candidates(candidates: Vec<BeamNode>) -> Vec<BeamNode> {
 fn path_signature(steps: &[PathStep]) -> String {
     steps
         .iter()
-        .map(|step| step.method.as_str())
+        .map(|step| step.method_id.as_str())
         .collect::<Vec<_>>()
         .join("\u{1f}")
 }
 
+fn record_best_path(
+    paths: &mut std::collections::HashMap<String, BeamNode>,
+    node: &BeamNode,
+    goal_aware: bool,
+) {
+    let signature = path_signature(&node.steps);
+    match paths.entry(signature) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if compare_nodes(node, entry.get(), goal_aware) == Ordering::Less {
+                entry.insert(node.clone());
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(node.clone());
+        }
+    }
+}
+
 fn prune_prefix_dominated_paths(mut paths: Vec<(String, BeamNode)>) -> Vec<(String, BeamNode)> {
-    let metrics: std::collections::HashMap<String, (f64, f64)> = paths
+    let metrics: std::collections::HashMap<String, (bool, f64, f64)> = paths
         .iter()
         .map(|(signature, node)| {
             (
                 signature.clone(),
-                (node.raw_score, node.restart_adjusted_cost),
+                (node.complete, node.raw_score, node.restart_adjusted_cost),
             )
         })
         .collect();
@@ -240,14 +274,34 @@ fn prune_prefix_dominated_paths(mut paths: Vec<(String, BeamNode)>) -> Vec<(Stri
     paths.retain(|(_, node)| {
         !(0..node.steps.len()).any(|prefix_len| {
             let prefix = path_signature(&node.steps[..prefix_len]);
-            metrics.get(&prefix).is_some_and(|(score, cost)| {
-                *score >= node.raw_score && *cost <= node.restart_adjusted_cost
+            metrics.get(&prefix).is_some_and(|(complete, score, cost)| {
+                evaluation_at_least(*complete, *score, node.complete, node.raw_score)
+                    && *cost <= node.restart_adjusted_cost
             })
         })
     });
     paths
 }
 
+fn evaluation_at_least(
+    complete: bool,
+    raw_score: f64,
+    other_complete: bool,
+    other_raw_score: f64,
+) -> bool {
+    (complete && !other_complete) || (complete == other_complete && raw_score >= other_raw_score)
+}
+
+fn evaluation_better(
+    complete: bool,
+    raw_score: f64,
+    other_complete: bool,
+    other_raw_score: f64,
+) -> bool {
+    (complete && !other_complete) || (complete == other_complete && raw_score > other_raw_score)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BeamConfig {
     /// Number of states to keep after each expansion step.
     pub beam_width: usize,
@@ -264,9 +318,130 @@ pub struct BeamConfig {
     pub seed: Option<u64>,
 }
 
+/// Optional work limits for one search run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchLimits {
+    /// Maximum number of concrete successor states generated across fully
+    /// committed generations.
+    pub expansion_limit: Option<u64>,
+    /// Wall-clock limit measured from the start of the search.
+    pub timeout: Option<Duration>,
+}
+
+/// Thread-safe cooperative cancellation signal.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, AtomicOrdering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(AtomicOrdering::Acquire)
+    }
+}
+
+/// Snapshot emitted only after a search generation has been fully committed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchProgress {
+    pub elapsed_ms: u64,
+    pub completed_generations: usize,
+    pub max_steps: usize,
+    pub states_generated: u64,
+    pub states_retained: u64,
+    pub current_beam_size: usize,
+    pub best_score: f64,
+    pub complete_result_existed: bool,
+}
+
+/// Observer invoked synchronously after each fully committed generation.
+pub trait SearchObserver: Send + Sync {
+    fn on_progress(&self, progress: &SearchProgress);
+}
+
+/// Non-serialized runtime controls supplied by an application adapter.
+#[derive(Default)]
+pub struct SearchRuntime<'a> {
+    pub observer: Option<&'a dyn SearchObserver>,
+    pub cancellation: Option<&'a CancellationToken>,
+    pub limits: SearchLimits,
+}
+
+impl std::fmt::Debug for SearchRuntime<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SearchRuntime")
+            .field("has_observer", &self.observer.is_some())
+            .field("has_cancellation", &self.cancellation.is_some())
+            .field("limits", &self.limits)
+            .finish()
+    }
+}
+
+/// Why a search stopped. These are normal result states, not application
+/// errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SearchTerminationReason {
+    TargetReached,
+    StepLimit,
+    ExpansionLimit,
+    TimedOut,
+    Cancelled,
+    SearchExhausted,
+    Impossible,
+}
+
+impl SearchTerminationReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TargetReached => "target_reached",
+            Self::StepLimit => "step_limit",
+            Self::ExpansionLimit => "expansion_limit",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::SearchExhausted => "search_exhausted",
+            Self::Impossible => "impossible",
+        }
+    }
+}
+
+/// Termination facts for one search execution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchTermination {
+    pub reason: SearchTerminationReason,
+    pub snapshot: SearchProgress,
+}
+
+/// Results and normal termination state from one controlled search.
+#[derive(Debug)]
+pub struct SearchRun {
+    pub results: Vec<SearchResult>,
+    pub termination: SearchTermination,
+}
+
+/// Goal-aware evaluation of one item state.
+///
+/// `complete` reports whether all required goals are satisfied. `raw_score`
+/// may additionally reward preferred goals, so a completed state can remain
+/// worth expanding until it reaches the search's maximum possible score.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SearchEvaluation {
+    pub raw_score: f64,
+    pub complete: bool,
+}
+
 /// One applied crafting operation on a path, with its retry economics.
 #[derive(Debug, Clone)]
 pub struct PathStep {
+    /// Stable semantic method identity, independent of display name and price.
+    pub method_id: MethodId,
     /// Method name (e.g. "Chaos Orb").
     pub method: String,
     /// Cost of one application in chaos.
@@ -318,6 +493,8 @@ pub struct BeamNode {
     pub success_prob: f64,
     /// Unpenalized user goal score for completion checks.
     pub raw_score: f64,
+    /// Whether this state satisfies every required goal.
+    complete: bool,
     /// Ranking score using restart-adjusted expected cost.
     pub score: f64,
     /// Expected cost under the configured restart-on-miss policy.
@@ -386,21 +563,103 @@ fn valid_probability(probability: f64) -> bool {
     probability.is_finite() && probability > 0.0 && probability <= 1.0
 }
 
-fn reaches_target(node: &BeamNode, target_score: Option<f64>) -> bool {
-    target_score.is_some_and(|target| node.raw_score >= target)
+fn explicit_cost(amount: f64) -> CostValue {
+    CostValue::from_computed(amount).unwrap_or(CostValue::Unavailable)
 }
 
-/// Best-first node ordering. Completed targets always beat incomplete states;
-/// equal ranking scores prefer the cheaper restart policy.
-fn compare_nodes(a: &BeamNode, b: &BeamNode, target_score: Option<f64>) -> Ordering {
-    reaches_target(b, target_score)
-        .cmp(&reaches_target(a, target_score))
+fn node_costs(node: &BeamNode) -> PathCosts {
+    PathCosts {
+        first_try: explicit_cost(node.cumulative_cost),
+        retry_expected: explicit_cost(node.expected_cost),
+        restart_adjusted_expected: explicit_cost(node.restart_adjusted_cost),
+    }
+}
+
+fn assess_cost(cost: CostValue, cap: Option<f64>) -> CostBudgetAssessment {
+    CostBudgetAssessment {
+        comparison: cost
+            .compare_to_budget(cap)
+            .unwrap_or(BudgetComparison::NotComparable),
+        excess: cost.budget_excess(cap).unwrap_or(None),
+    }
+}
+
+fn budget_assessments(costs: PathCosts, policy: BudgetPolicy) -> PathBudgetAssessments {
+    let cap = policy.hard_cap_chaos();
+    PathBudgetAssessments {
+        first_try: assess_cost(costs.first_try, cap),
+        retry_expected: assess_cost(costs.retry_expected, cap),
+        restart_adjusted_expected: assess_cost(costs.restart_adjusted_expected, cap),
+    }
+}
+
+fn budget_assessment(
+    costs: PathCosts,
+    policy: BudgetPolicy,
+) -> (BudgetComparison, Option<CostValue>) {
+    let selected = budget_assessments(costs, policy).selected(policy.metric());
+    (selected.comparison, selected.excess)
+}
+
+fn budget_allows(node: &BeamNode, policy: BudgetPolicy) -> bool {
+    let (comparison, _) = budget_assessment(node_costs(node), policy);
+    match comparison {
+        BudgetComparison::Under => true,
+        BudgetComparison::Over => false,
+        BudgetComparison::NotComparable => policy.hard_cap_chaos().is_none(),
+    }
+}
+
+fn budget_allows_expansion(node: &BeamNode, policy: BudgetPolicy) -> bool {
+    budget_allows(node, policy)
+        || (policy.metric() == BudgetMetric::RestartAdjustedExpected
+            && !node.reroll_initializers.is_empty())
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn runtime_stop_reason(
+    runtime: &SearchRuntime<'_>,
+    started_at: Instant,
+) -> Option<SearchTerminationReason> {
+    if runtime
+        .cancellation
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        Some(SearchTerminationReason::Cancelled)
+    } else if runtime
+        .limits
+        .timeout
+        .is_some_and(|timeout| started_at.elapsed() >= timeout)
+    {
+        Some(SearchTerminationReason::TimedOut)
+    } else {
+        None
+    }
+}
+
+fn reaches_terminal_score(node: &BeamNode, maximum_score: Option<f64>) -> bool {
+    maximum_score.is_some_and(|maximum| node.complete && node.raw_score >= maximum)
+}
+
+/// Best-first node ordering. In goal-aware mode completed states always beat
+/// incomplete states; equal ranking scores prefer the cheaper restart policy.
+fn compare_nodes(a: &BeamNode, b: &BeamNode, goal_aware: bool) -> Ordering {
+    let completion_order = if goal_aware {
+        b.complete.cmp(&a.complete)
+    } else {
+        Ordering::Equal
+    };
+    completion_order
         .then_with(|| OrderedFloat(b.score).cmp(&OrderedFloat(a.score)))
         .then_with(|| {
             OrderedFloat(a.restart_adjusted_cost).cmp(&OrderedFloat(b.restart_adjusted_cost))
         })
 }
 
+#[derive(Debug, Clone)]
 pub struct SearchResult {
     /// The best-scoring item state found.
     pub state: ItemState,
@@ -416,15 +675,71 @@ pub struct SearchResult {
     pub score: f64,
     /// Expected chaos under the configured restart-on-miss policy.
     pub restart_cost: f64,
+    /// Serialization-safe forms of all three cost metrics.
+    pub costs: PathCosts,
+    /// Budget comparison and excess for every cost metric. This lets callers
+    /// compare policies without rerunning the search; pruning still uses the
+    /// metric selected by the active [`BudgetPolicy`].
+    pub budget_assessments: PathBudgetAssessments,
+    /// Comparison of the binding metric with the active hard cap.
+    pub budget_comparison: BudgetComparison,
+    /// Amount above the active cap. Unbounded expectations have an unbounded
+    /// excess; compliant, uncapped, and unavailable metrics report `None`.
+    pub budget_excess: Option<CostValue>,
     /// Craft applications that unexpectedly failed after reporting themselves
     /// applicable. Those branches were skipped during search.
     pub warnings: Vec<String>,
 }
 
+/// The three cost views reported for every candidate path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathCosts {
+    pub first_try: CostValue,
+    pub retry_expected: CostValue,
+    pub restart_adjusted_expected: CostValue,
+}
+
+impl PathCosts {
+    pub const fn selected(self, metric: BudgetMetric) -> CostValue {
+        match metric {
+            BudgetMetric::FirstTry => self.first_try,
+            BudgetMetric::RetryExpected => self.retry_expected,
+            BudgetMetric::RestartAdjustedExpected => self.restart_adjusted_expected,
+        }
+    }
+}
+
+/// One cost metric's relationship to the active hard cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CostBudgetAssessment {
+    pub comparison: BudgetComparison,
+    pub excess: Option<CostValue>,
+}
+
+/// Per-metric budget facts reported for every candidate path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathBudgetAssessments {
+    pub first_try: CostBudgetAssessment,
+    pub retry_expected: CostBudgetAssessment,
+    pub restart_adjusted_expected: CostBudgetAssessment,
+}
+
+impl PathBudgetAssessments {
+    pub const fn selected(self, metric: BudgetMetric) -> CostBudgetAssessment {
+        match metric {
+            BudgetMetric::FirstTry => self.first_try,
+            BudgetMetric::RetryExpected => self.retry_expected,
+            BudgetMetric::RestartAdjustedExpected => self.restart_adjusted_expected,
+        }
+    }
+}
+
 pub struct BeamSearch<'db> {
     pub config: BeamConfig,
     pub db: &'db GameData,
-    pub methods: Vec<Arc<dyn CraftingMethod>>,
+    methods: Vec<Arc<dyn CraftingMethod>>,
+    method_ids: Vec<MethodId>,
+    budget: BudgetPolicy,
 }
 
 impl<'db> BeamSearch<'db> {
@@ -433,11 +748,21 @@ impl<'db> BeamSearch<'db> {
         db: &'db GameData,
         methods: Vec<Arc<dyn CraftingMethod>>,
     ) -> Self {
+        let method_ids = methods.iter().map(|method| method.id()).collect();
         Self {
             config,
             db,
             methods,
+            method_ids,
+            budget: BudgetPolicy::default(),
         }
+    }
+
+    /// Apply a validated hard-cap policy without changing method order or RNG
+    /// derivation.
+    pub fn with_budget(mut self, budget: BudgetPolicy) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// Derive the RNG for one (step, node, method) expansion. With a seed this
@@ -470,20 +795,36 @@ impl<'db> BeamSearch<'db> {
 
     /// Like [`run`](Self::run), but returns up to `k` results with **distinct
     /// method sequences**, best first. Distinctness is judged on the ordered
-    /// list of method names, so "Transmute, Regal" and "Transmute, Alchemy"
-    /// are different pathways even when they reach similar items; the best
-    /// outcome per sequence is kept, including sequences that later fell off
-    /// the beam.
+    /// list of semantic method IDs, so display-label or price changes cannot
+    /// split one operation into false alternatives. The best outcome per
+    /// sequence is kept, including sequences that later fell off the beam.
     pub fn run_k<F>(&self, initial: ItemState, score_fn: F, k: usize) -> Vec<SearchResult>
     where
         F: Fn(&ItemState) -> f64 + Send + Sync,
     {
-        self.run_k_internal(initial, score_fn, k, None)
+        let runtime = SearchRuntime::default();
+        self.run_k_internal(
+            initial,
+            |state| SearchEvaluation {
+                raw_score: score_fn(state),
+                complete: false,
+            },
+            k,
+            false,
+            None,
+            &runtime,
+        )
+        .results
     }
 
     /// Goal-aware search: completed states are recorded as terminal results and
     /// always rank ahead of incomplete states. Among completed states, normal
     /// score/cost ranking still applies.
+    ///
+    /// This compatibility wrapper treats `raw_score >= target_score` as both
+    /// completion and the terminal ceiling. New callers that distinguish
+    /// required completion from optional score should use
+    /// [`run_k_to_goal`](Self::run_k_to_goal).
     pub fn run_k_to_target<F>(
         &self,
         initial: ItemState,
@@ -494,37 +835,88 @@ impl<'db> BeamSearch<'db> {
     where
         F: Fn(&ItemState) -> f64 + Send + Sync,
     {
-        self.run_k_internal(initial, score_fn, k, Some(target_score))
+        self.run_k_to_goal(
+            initial,
+            |state| {
+                let raw_score = score_fn(state);
+                SearchEvaluation {
+                    raw_score,
+                    complete: raw_score >= target_score,
+                }
+            },
+            k,
+            Some(target_score),
+        )
+    }
+
+    /// Goal-aware search with completion independent from raw score.
+    ///
+    /// Completed states rank ahead of incomplete states even when their raw
+    /// score is lower. A node is terminal only when it is complete **and** its
+    /// raw score reaches `maximum_score`; completed states below that ceiling
+    /// remain expandable so the search can improve preferred goals.
+    pub fn run_k_to_goal<F>(
+        &self,
+        initial: ItemState,
+        evaluate_fn: F,
+        k: usize,
+        maximum_score: Option<f64>,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(&ItemState) -> SearchEvaluation + Send + Sync,
+    {
+        let runtime = SearchRuntime::default();
+        self.run_k_internal(initial, evaluate_fn, k, true, maximum_score, &runtime)
+            .results
+    }
+
+    /// Goal-aware search with progress, cancellation, and optional work
+    /// limits. Returned paths always come from the last fully committed
+    /// generation.
+    pub fn run_k_to_goal_controlled<F>(
+        &self,
+        initial: ItemState,
+        evaluate_fn: F,
+        k: usize,
+        maximum_score: Option<f64>,
+        runtime: &SearchRuntime<'_>,
+    ) -> SearchRun
+    where
+        F: Fn(&ItemState) -> SearchEvaluation + Send + Sync,
+    {
+        self.run_k_internal(initial, evaluate_fn, k, true, maximum_score, runtime)
     }
 
     fn run_k_internal<F>(
         &self,
         initial: ItemState,
-        score_fn: F,
+        evaluate_fn: F,
         k: usize,
-        target_score: Option<f64>,
-    ) -> Vec<SearchResult>
+        goal_aware: bool,
+        maximum_score: Option<f64>,
+        runtime: &SearchRuntime<'_>,
+    ) -> SearchRun
     where
-        F: Fn(&ItemState) -> f64 + Send + Sync,
+        F: Fn(&ItemState) -> SearchEvaluation + Send + Sync,
     {
-        if k == 0 {
-            return Vec::new();
-        }
+        let started_at = Instant::now();
 
-        let initial_score = score_fn(&initial);
+        let initial_evaluation = evaluate_fn(&initial);
         let initial_node = BeamNode {
             state: initial,
             steps: Vec::new(),
             cumulative_cost: 0.0,
             expected_cost: 0.0,
             success_prob: 1.0,
-            raw_score: initial_score,
-            score: initial_score,
+            raw_score: initial_evaluation.raw_score,
+            complete: initial_evaluation.complete,
+            score: initial_evaluation.raw_score,
             restart_adjusted_cost: 0.0,
             reroll_contexts: std::collections::HashSet::new(),
             reroll_initializers: std::collections::HashMap::new(),
         };
-        let mut beam: Vec<BeamNode> = if reaches_target(&initial_node, target_score) {
+        let initial_is_terminal = reaches_terminal_score(&initial_node, maximum_score);
+        let mut beam: Vec<BeamNode> = if initial_is_terminal || k == 0 {
             Vec::new()
         } else {
             vec![initial_node.clone()]
@@ -533,10 +925,43 @@ impl<'db> BeamSearch<'db> {
         // Best node seen per distinct method sequence, across all steps.
         let mut best_by_path: std::collections::HashMap<String, BeamNode> =
             std::collections::HashMap::from([(String::new(), initial_node.clone())]);
+        // Goal-complete candidates are retained as explicit over-budget
+        // exemplars before hard-cap pruning. Incomplete over-budget nodes are
+        // neither expanded nor reported.
+        let mut over_budget_complete_by_path: std::collections::HashMap<String, BeamNode> =
+            std::collections::HashMap::new();
         let mut search_warnings = std::collections::BTreeSet::new();
+        let mut completed_generations = 0_usize;
+        let mut states_generated = 0_u64;
+        let mut states_retained = 0_u64;
+        let mut best_score = initial_node.raw_score;
+        let mut best_complete = initial_node.complete;
+        let mut termination_reason = if k == 0 {
+            Some(SearchTerminationReason::SearchExhausted)
+        } else if initial_is_terminal {
+            Some(SearchTerminationReason::TargetReached)
+        } else {
+            runtime_stop_reason(runtime, started_at)
+        };
 
         for step in 0..self.config.max_steps {
+            if termination_reason.is_some() {
+                break;
+            }
             if beam.is_empty() || self.config.beam_width == 0 {
+                termination_reason = Some(SearchTerminationReason::SearchExhausted);
+                break;
+            }
+            if let Some(reason) = runtime_stop_reason(runtime, started_at) {
+                termination_reason = Some(reason);
+                break;
+            }
+            if runtime
+                .limits
+                .expansion_limit
+                .is_some_and(|limit| states_generated >= limit)
+            {
+                termination_reason = Some(SearchTerminationReason::ExpansionLimit);
                 break;
             }
 
@@ -550,6 +975,10 @@ impl<'db> BeamSearch<'db> {
                     let mut local: Vec<BeamNode> = Vec::new();
                     let mut warnings = Vec::new();
                     for (method_idx, method) in self.methods.iter().enumerate() {
+                        if runtime_stop_reason(runtime, started_at).is_some() {
+                            break;
+                        }
+                        let method_id = self.method_ids[method_idx].clone();
                         let reroll_context = method
                             .reroll_kind()
                             .map(|kind| reroll_context_key(&node.state, kind));
@@ -577,7 +1006,7 @@ impl<'db> BeamSearch<'db> {
                         // the previous step's retry-until-hit probability.
                         if method.repeatable_on_failure()
                             && node.steps.last().is_some_and(|previous| {
-                                previous.repeatable && previous.method == method.name()
+                                previous.repeatable && previous.method_id == method_id
                             })
                         {
                             continue;
@@ -595,9 +1024,12 @@ impl<'db> BeamSearch<'db> {
                         };
                         self.push_successors(
                             node,
-                            method.as_ref(),
+                            RegisteredMethod {
+                                method: method.as_ref(),
+                                id: method_id,
+                            },
                             outcomes,
-                            &score_fn,
+                            &evaluate_fn,
                             RerollTransition {
                                 consumed: reroll_context,
                                 initialized: initializer_context,
@@ -609,60 +1041,139 @@ impl<'db> BeamSearch<'db> {
                     (local, warnings)
                 })
                 .collect();
-            let mut candidates = Vec::new();
-            for (local, warnings) in per_node {
-                candidates.extend(local);
-                search_warnings.extend(warnings);
-            }
-
-            if candidates.is_empty() {
+            if let Some(reason) = runtime_stop_reason(runtime, started_at) {
+                termination_reason = Some(reason);
                 break;
             }
+            let mut candidates = Vec::new();
+            let mut generation_warnings = std::collections::BTreeSet::new();
+            for (local, warnings) in per_node {
+                candidates.extend(local);
+                generation_warnings.extend(warnings);
+            }
+            let generated_this_generation = u64::try_from(candidates.len()).unwrap_or(u64::MAX);
+            if runtime.limits.expansion_limit.is_some_and(|limit| {
+                states_generated.saturating_add(generated_this_generation) > limit
+            }) {
+                termination_reason = Some(SearchTerminationReason::ExpansionLimit);
+                break;
+            }
+            search_warnings.extend(generation_warnings);
+            let generation_hit_terminal = goal_aware
+                && candidates
+                    .iter()
+                    .any(|node| reaches_terminal_score(node, maximum_score));
 
-            // Record the best node per method sequence BEFORE truncation, so
-            // alternative pathways survive even if the beam drops them.
             for node in &candidates {
-                let sig = path_signature(&node.steps);
-                match best_by_path.entry(sig) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        if compare_nodes(node, e.get(), target_score) == Ordering::Less {
-                            e.insert(node.clone());
-                        }
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(node.clone());
-                    }
+                if evaluation_better(node.complete, node.raw_score, best_complete, best_score) {
+                    best_complete = node.complete;
+                    best_score = node.raw_score;
                 }
             }
+
+            // Record budget-compliant alternatives before truncation. Capture
+            // complete over-budget exemplars, then prune every over-budget
+            // node before it can consume beam width or be expanded.
+            for node in &candidates {
+                if budget_allows(node, self.budget) {
+                    record_best_path(&mut best_by_path, node, goal_aware);
+                } else if goal_aware && node.complete {
+                    record_best_path(&mut over_budget_complete_by_path, node, goal_aware);
+                }
+            }
+            candidates.retain(|node| budget_allows_expansion(node, self.budget));
 
             // Monte Carlo methods frequently generate identical concrete
             // items. Keep those paths in best_by_path for reporting, but let
             // only the best-ranked copy consume beam width.
             let mut unique_candidates = deduplicate_candidates(candidates);
-            if target_score.is_some() {
-                unique_candidates.retain(|node| !reaches_target(node, target_score));
+            if goal_aware {
+                unique_candidates.retain(|node| {
+                    !reaches_terminal_score(node, maximum_score)
+                        || !budget_allows(node, self.budget)
+                });
             }
 
             // Sort descending by score, keep beam_width best.
-            unique_candidates.sort_by(|a, b| compare_nodes(a, b, None));
+            unique_candidates.sort_by(|a, b| compare_nodes(a, b, goal_aware));
             unique_candidates.truncate(self.config.beam_width);
             beam = unique_candidates;
-        }
 
-        let mut all: Vec<(String, BeamNode)> = best_by_path.into_iter().collect();
-        if target_score.is_some() {
-            all = prune_prefix_dominated_paths(all);
-            if all
-                .iter()
-                .any(|(_, node)| !node.steps.is_empty() && node.raw_score > initial_score)
-            {
-                all.retain(|(_, node)| !node.steps.is_empty());
+            completed_generations += 1;
+            states_generated = states_generated.saturating_add(generated_this_generation);
+            states_retained =
+                states_retained.saturating_add(u64::try_from(beam.len()).unwrap_or(u64::MAX));
+            let progress = SearchProgress {
+                elapsed_ms: elapsed_millis(started_at),
+                completed_generations,
+                max_steps: self.config.max_steps,
+                states_generated,
+                states_retained,
+                current_beam_size: beam.len(),
+                best_score,
+                complete_result_existed: best_complete,
+            };
+            if let Some(observer) = runtime.observer {
+                observer.on_progress(&progress);
+            }
+            if let Some(reason) = runtime_stop_reason(runtime, started_at) {
+                termination_reason = Some(reason);
+                break;
+            }
+            let compliant_terminal_count = best_by_path
+                .values()
+                .filter(|node| reaches_terminal_score(node, maximum_score))
+                .count();
+            if goal_aware && compliant_terminal_count >= k {
+                termination_reason = Some(SearchTerminationReason::TargetReached);
+                break;
+            }
+            if beam.is_empty() {
+                termination_reason = Some(if generation_hit_terminal {
+                    SearchTerminationReason::TargetReached
+                } else {
+                    SearchTerminationReason::SearchExhausted
+                });
+                break;
             }
         }
-        all.sort_by(|(sig_a, a), (sig_b, b)| {
-            compare_nodes(a, b, target_score).then_with(|| sig_a.cmp(sig_b))
+
+        let termination_reason = termination_reason.unwrap_or(SearchTerminationReason::StepLimit);
+
+        let mut compliant: Vec<(String, BeamNode)> = best_by_path.into_iter().collect();
+        if goal_aware {
+            compliant = prune_prefix_dominated_paths(compliant);
+            if compliant.iter().any(|(_, node)| {
+                !node.steps.is_empty()
+                    && evaluation_better(
+                        node.complete,
+                        node.raw_score,
+                        initial_node.complete,
+                        initial_node.raw_score,
+                    )
+            }) {
+                compliant.retain(|(_, node)| !node.steps.is_empty());
+            }
+        }
+        compliant.sort_by(|(sig_a, a), (sig_b, b)| {
+            compare_nodes(a, b, goal_aware).then_with(|| sig_a.cmp(sig_b))
         });
-        all.truncate(k);
+        let has_compliant_completion = compliant.iter().any(|(_, node)| node.complete);
+        compliant.truncate(k);
+        let mut over_budget = if has_compliant_completion {
+            Vec::new()
+        } else {
+            over_budget_complete_by_path.into_iter().collect::<Vec<_>>()
+        };
+        over_budget.sort_by(|(sig_a, a), (sig_b, b)| {
+            compare_nodes(a, b, goal_aware).then_with(|| sig_a.cmp(sig_b))
+        });
+        over_budget.truncate(k);
+        let mut all = compliant;
+        all.extend(over_budget);
+        all.sort_by(|(sig_a, a), (sig_b, b)| {
+            compare_nodes(a, b, goal_aware).then_with(|| sig_a.cmp(sig_b))
+        });
         let warning_count = search_warnings.len();
         let mut warnings: Vec<String> = search_warnings.into_iter().take(20).collect();
         if warning_count > warnings.len() {
@@ -671,18 +1182,45 @@ impl<'db> BeamSearch<'db> {
                 warning_count - warnings.len()
             ));
         }
-        all.into_iter()
-            .map(|(_, n)| SearchResult {
-                state: n.state,
-                steps: n.steps,
-                total_cost: n.cumulative_cost,
-                expected_cost: n.expected_cost,
-                success_prob: n.success_prob,
-                score: n.score,
-                restart_cost: n.restart_adjusted_cost,
-                warnings: warnings.clone(),
+        let results = all
+            .into_iter()
+            .map(|(_, n)| {
+                let costs = node_costs(&n);
+                let budget_assessments = budget_assessments(costs, self.budget);
+                let selected = budget_assessments.selected(self.budget.metric());
+                SearchResult {
+                    state: n.state,
+                    steps: n.steps,
+                    total_cost: n.cumulative_cost,
+                    expected_cost: n.expected_cost,
+                    success_prob: n.success_prob,
+                    score: n.score,
+                    restart_cost: n.restart_adjusted_cost,
+                    costs,
+                    budget_assessments,
+                    budget_comparison: selected.comparison,
+                    budget_excess: selected.excess,
+                    warnings: warnings.clone(),
+                }
             })
-            .collect()
+            .collect();
+        let snapshot = SearchProgress {
+            elapsed_ms: elapsed_millis(started_at),
+            completed_generations,
+            max_steps: self.config.max_steps,
+            states_generated,
+            states_retained,
+            current_beam_size: beam.len(),
+            best_score,
+            complete_result_existed: best_complete,
+        };
+        SearchRun {
+            results,
+            termination: SearchTermination {
+                reason: termination_reason,
+                snapshot,
+            },
+        }
     }
 
     /// Turn one method's outcome set into beam candidates, computing each
@@ -690,14 +1228,15 @@ impl<'db> BeamSearch<'db> {
     fn push_successors<F>(
         &self,
         node: &BeamNode,
-        method: &dyn CraftingMethod,
+        registered: RegisteredMethod<'_>,
         outcomes: Vec<(ItemState, f64)>,
-        score_fn: &F,
+        evaluate_fn: &F,
         reroll: RerollTransition,
         local: &mut Vec<BeamNode>,
     ) where
-        F: Fn(&ItemState) -> f64 + Send + Sync,
+        F: Fn(&ItemState) -> SearchEvaluation + Send + Sync,
     {
+        let method = registered.method;
         let cost = method.cost_chaos();
         let repeatable = method.repeatable_on_failure();
         let probability_estimate = !method.weights_are_probabilities();
@@ -709,12 +1248,15 @@ impl<'db> BeamSearch<'db> {
 
         // Zero, negative, NaN, and infinite weights cannot describe reachable
         // outcomes. Also reject non-finite scores before they reach sorting.
-        let weighted_scored: Vec<(ItemState, f64, f64)> = outcomes
+        let weighted_scored: Vec<(ItemState, f64, SearchEvaluation)> = outcomes
             .into_iter()
             .filter(|(_, weight)| weight.is_finite() && *weight > 0.0)
             .filter_map(|(state, weight)| {
-                let raw = score_fn(&state);
-                raw.is_finite().then_some((state, weight, raw))
+                let evaluation = evaluate_fn(&state);
+                evaluation
+                    .raw_score
+                    .is_finite()
+                    .then_some((state, weight, evaluation))
             })
             .collect();
         let max_weight = weighted_scored
@@ -731,29 +1273,36 @@ impl<'db> BeamSearch<'db> {
         if !scaled_total.is_finite() || scaled_total <= 0.0 {
             return;
         }
-        let scored: Vec<(ItemState, f64, f64)> = weighted_scored
+        let scored: Vec<(ItemState, f64, SearchEvaluation)> = weighted_scored
             .into_iter()
-            .filter_map(|(state, weight, raw)| {
+            .filter_map(|(state, weight, evaluation)| {
                 let normalized = (weight / max_weight) / scaled_total;
-                (normalized > 0.0).then_some((state, normalized, raw))
+                (normalized > 0.0).then_some((state, normalized, evaluation))
             })
             .collect();
         if scored.is_empty() {
             return;
         }
 
-        // p_at_least per outcome: total sibling weight with raw >= this raw.
-        // Sort indices by raw descending, prefix-sum weights, and give tied
-        // outcomes the cumulative weight through the end of their tie group.
+        // p_at_least per outcome: total sibling weight with a lexicographically
+        // greater-or-equal (complete, raw score) evaluation. Sort indices by
+        // that key descending, prefix-sum weights, and give tied outcomes the
+        // cumulative weight through the end of their tie group.
         let mut order: Vec<usize> = (0..scored.len()).collect();
-        order.sort_by(|&a, &b| scored[b].2.total_cmp(&scored[a].2));
+        order.sort_by(|&a, &b| {
+            scored[b]
+                .2
+                .complete
+                .cmp(&scored[a].2.complete)
+                .then_with(|| scored[b].2.raw_score.total_cmp(&scored[a].2.raw_score))
+        });
         let mut p_at_least = vec![0.0_f64; scored.len()];
         let mut cum = 0.0;
         let mut i = 0;
         while i < order.len() {
-            let tie_raw = scored[order[i]].2;
+            let tie_evaluation = scored[order[i]].2;
             let mut j = i;
-            while j < order.len() && scored[order[j]].2 == tie_raw {
+            while j < order.len() && scored[order[j]].2 == tie_evaluation {
                 cum += scored[order[j]].1;
                 j += 1;
             }
@@ -763,11 +1312,12 @@ impl<'db> BeamSearch<'db> {
             i = j;
         }
 
-        for (idx, (next_state, _prob, raw)) in scored.into_iter().enumerate() {
+        for (idx, (next_state, _prob, evaluation)) in scored.into_iter().enumerate() {
             // Cap only upward float drift. A floor would make genuinely rare
             // outcomes look cheaper and more likely than they are.
             let p = p_at_least[idx].min(1.0);
             let step_info = PathStep {
+                method_id: registered.id.clone(),
                 method: method.name().to_string(),
                 cost,
                 p_at_least: p,
@@ -789,9 +1339,9 @@ impl<'db> BeamSearch<'db> {
             let restart_cost =
                 expected_cost_with_restarts_and_reset(&steps, self.config.restart_cost);
             let score = if cost_weight == 0.0 {
-                raw
+                evaluation.raw_score
             } else {
-                raw - cost_weight * restart_cost
+                evaluation.raw_score - cost_weight * restart_cost
             };
             let mut reroll_contexts = node.reroll_contexts.clone();
             if let Some(context) = &reroll.consumed {
@@ -810,7 +1360,8 @@ impl<'db> BeamSearch<'db> {
                 cumulative_cost: node.cumulative_cost + cost,
                 expected_cost,
                 success_prob,
-                raw_score: raw,
+                raw_score: evaluation.raw_score,
+                complete: evaluation.complete,
                 score,
                 restart_adjusted_cost: restart_cost,
                 reroll_contexts,
@@ -823,11 +1374,21 @@ impl<'db> BeamSearch<'db> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     use anyhow::Result;
     use rand::RngCore;
 
     use super::*;
+    use crate::currency::MethodFamily;
+
+    fn test_method_id(operation: &str) -> MethodId {
+        MethodId::parse(format!("test/{operation}")).expect("test method ID should be canonical")
+    }
+
+    fn finite_cost(amount: f64) -> CostValue {
+        CostValue::finite(amount).expect("test cost should be finite")
+    }
 
     struct StaticMethod {
         name: &'static str,
@@ -838,8 +1399,20 @@ mod tests {
     }
 
     impl CraftingMethod for StaticMethod {
+        fn id(&self) -> MethodId {
+            test_method_id(self.name)
+        }
+
+        fn family(&self) -> MethodFamily {
+            MethodFamily::Currency
+        }
+
         fn name(&self) -> &str {
             self.name
+        }
+
+        fn description(&self) -> &str {
+            "Synthetic static-outcome method."
         }
 
         fn cost_chaos(&self) -> f64 {
@@ -873,6 +1446,97 @@ mod tests {
 
         fn reroll_kind(&self) -> Option<RerollKind> {
             self.reroll_kind
+        }
+    }
+
+    struct IdentifiedStaticMethod {
+        id: &'static str,
+        name: &'static str,
+        outcome: &'static str,
+        repeatable: bool,
+    }
+
+    impl CraftingMethod for IdentifiedStaticMethod {
+        fn id(&self) -> MethodId {
+            MethodId::parse(self.id).expect("fixture method ID should be canonical")
+        }
+
+        fn family(&self) -> MethodFamily {
+            MethodFamily::Currency
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Synthetic identified static method."
+        }
+
+        fn cost_chaos(&self) -> f64 {
+            1.0
+        }
+
+        fn can_apply(&self, item: &ItemState, _db: &GameData) -> bool {
+            item.base_id == "initial"
+        }
+
+        fn apply(
+            &self,
+            item: &ItemState,
+            _db: &GameData,
+            _rng: &mut dyn RngCore,
+        ) -> Result<Vec<(ItemState, f64)>> {
+            let mut next = item.clone();
+            next.base_id = self.outcome.to_string();
+            Ok(vec![(next, 1.0)])
+        }
+
+        fn repeatable_on_failure(&self) -> bool {
+            self.repeatable
+        }
+    }
+
+    struct StateTransitionMethod {
+        name: &'static str,
+        from: &'static str,
+        to: &'static str,
+    }
+
+    impl CraftingMethod for StateTransitionMethod {
+        fn id(&self) -> MethodId {
+            test_method_id(self.name)
+        }
+
+        fn family(&self) -> MethodFamily {
+            MethodFamily::Currency
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Synthetic state transition."
+        }
+
+        fn cost_chaos(&self) -> f64 {
+            0.0
+        }
+
+        fn can_apply(&self, item: &ItemState, _db: &GameData) -> bool {
+            item.base_id == self.from
+        }
+
+        fn apply(
+            &self,
+            item: &ItemState,
+            _db: &GameData,
+            _rng: &mut dyn RngCore,
+        ) -> Result<Vec<(ItemState, f64)>> {
+            let mut next = item.clone();
+            next.base_id = self.to.to_string();
+            Ok(vec![(next, 1.0)])
         }
     }
 
@@ -974,6 +1638,688 @@ mod tests {
     }
 
     #[test]
+    fn completed_low_raw_score_ranks_over_incomplete_high_raw_score() {
+        let db = empty_db();
+        let search = BeamSearch::new(
+            config(8, 1, 0.0),
+            &db,
+            vec![
+                Arc::new(StaticMethod {
+                    name: "complete-path",
+                    cost: 0.0,
+                    repeatable: false,
+                    reroll_kind: None,
+                    outcomes: vec![("complete-low", 1.0)],
+                }),
+                Arc::new(StaticMethod {
+                    name: "incomplete-path",
+                    cost: 0.0,
+                    repeatable: false,
+                    reroll_kind: None,
+                    outcomes: vec![("incomplete-high", 1.0)],
+                }),
+            ],
+        );
+
+        let results = search.run_k_to_goal(
+            initial(),
+            |state| match state.base_id.as_str() {
+                "complete-low" => SearchEvaluation {
+                    raw_score: 1.0,
+                    complete: true,
+                },
+                "incomplete-high" => SearchEvaluation {
+                    raw_score: 100.0,
+                    complete: false,
+                },
+                _ => SearchEvaluation {
+                    raw_score: 0.0,
+                    complete: false,
+                },
+            },
+            2,
+            Some(10.0),
+        );
+
+        assert_eq!(results[0].state.base_id, "complete-low");
+        assert!(results[0].score < results[1].score);
+    }
+
+    #[test]
+    fn completed_state_below_maximum_remains_expandable() {
+        let db = empty_db();
+        let methods: Vec<Arc<dyn CraftingMethod>> = vec![
+            Arc::new(StateTransitionMethod {
+                name: "satisfy-required",
+                from: "initial",
+                to: "required-complete",
+            }),
+            Arc::new(StateTransitionMethod {
+                name: "improve-preference",
+                from: "required-complete",
+                to: "preferred-complete",
+            }),
+        ];
+        let search = BeamSearch::new(config(1, 2, 0.0), &db, methods);
+
+        let result = search
+            .run_k_to_goal(
+                initial(),
+                |state| match state.base_id.as_str() {
+                    "required-complete" => SearchEvaluation {
+                        raw_score: 1.0,
+                        complete: true,
+                    },
+                    "preferred-complete" => SearchEvaluation {
+                        raw_score: 2.0,
+                        complete: true,
+                    },
+                    _ => SearchEvaluation {
+                        raw_score: 0.0,
+                        complete: false,
+                    },
+                },
+                1,
+                Some(2.0),
+            )
+            .into_iter()
+            .next()
+            .expect("the preferred goal should be reachable");
+
+        assert_eq!(result.state.base_id, "preferred-complete");
+        assert_eq!(result.steps.len(), 2);
+    }
+
+    #[test]
+    fn complete_initial_state_still_searches_for_preferred_score() {
+        let db = empty_db();
+        let search = BeamSearch::new(
+            config(1, 1, 0.0),
+            &db,
+            vec![Arc::new(StateTransitionMethod {
+                name: "improve-preference",
+                from: "initial",
+                to: "preferred-complete",
+            })],
+        );
+
+        let result = search
+            .run_k_to_goal(
+                initial(),
+                |state| SearchEvaluation {
+                    raw_score: f64::from(state.base_id == "preferred-complete"),
+                    complete: true,
+                },
+                1,
+                Some(1.0),
+            )
+            .into_iter()
+            .next()
+            .expect("a complete start below the maximum should remain expandable");
+
+        assert_eq!(result.state.base_id, "preferred-complete");
+        assert_eq!(result.steps.len(), 1);
+    }
+
+    #[test]
+    fn p_at_least_excludes_incomplete_higher_raw_siblings() {
+        let db = empty_db();
+        let search = BeamSearch::new(
+            config(8, 1, 0.0),
+            &db,
+            vec![Arc::new(StaticMethod {
+                name: "mixed-completion",
+                cost: 1.0,
+                repeatable: false,
+                reroll_kind: None,
+                outcomes: vec![("complete-low", 0.25), ("incomplete-high", 0.75)],
+            })],
+        );
+
+        let result = search
+            .run_k_to_goal(
+                initial(),
+                |state| match state.base_id.as_str() {
+                    "complete-low" => SearchEvaluation {
+                        raw_score: 1.0,
+                        complete: true,
+                    },
+                    "incomplete-high" => SearchEvaluation {
+                        raw_score: 100.0,
+                        complete: false,
+                    },
+                    _ => SearchEvaluation {
+                        raw_score: 0.0,
+                        complete: false,
+                    },
+                },
+                1,
+                Some(1.0),
+            )
+            .into_iter()
+            .next()
+            .expect("the completed outcome should rank first");
+
+        assert_eq!(result.state.base_id, "complete-low");
+        assert!((result.steps[0].p_at_least - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn goal_aware_ranking_remains_active_without_a_score_ceiling() {
+        let db = empty_db();
+        let search = BeamSearch::new(
+            config(8, 1, 0.0),
+            &db,
+            vec![Arc::new(StaticMethod {
+                name: "uncapped-goal",
+                cost: 1.0,
+                repeatable: false,
+                reroll_kind: None,
+                outcomes: vec![("complete-low", 0.5), ("incomplete-high", 0.5)],
+            })],
+        );
+
+        let results = search.run_k_to_goal(
+            initial(),
+            |state| match state.base_id.as_str() {
+                "complete-low" => SearchEvaluation {
+                    raw_score: 1.0,
+                    complete: true,
+                },
+                "incomplete-high" => SearchEvaluation {
+                    raw_score: 100.0,
+                    complete: false,
+                },
+                _ => SearchEvaluation {
+                    raw_score: 0.0,
+                    complete: false,
+                },
+            },
+            2,
+            None,
+        );
+
+        assert_eq!(results[0].state.base_id, "complete-low");
+    }
+
+    #[test]
+    fn retry_budget_prunes_but_reports_complete_over_budget_exemplar() {
+        let db = empty_db();
+        let method = || {
+            Arc::new(StaticMethod {
+                name: "rare-reroll",
+                cost: 10.0,
+                repeatable: true,
+                reroll_kind: None,
+                outcomes: vec![("complete", 0.1), ("incomplete", 0.9)],
+            }) as Arc<dyn CraftingMethod>
+        };
+        let evaluate = |state: &ItemState| SearchEvaluation {
+            raw_score: f64::from(state.base_id == "complete"),
+            complete: state.base_id == "complete",
+        };
+
+        let first_try = BeamSearch::new(config(8, 1, 0.0), &db, vec![method()])
+            .with_budget(
+                BudgetPolicy::hard_cap(15.0, BudgetMetric::FirstTry)
+                    .expect("test cap should be valid"),
+            )
+            .run_k_to_goal(initial(), evaluate, 1, Some(1.0));
+        assert_eq!(first_try.len(), 1);
+        assert_eq!(first_try[0].state.base_id, "complete");
+        assert_eq!(first_try[0].budget_comparison, BudgetComparison::Under);
+        assert_eq!(first_try[0].costs.first_try, finite_cost(10.0));
+        assert_eq!(first_try[0].costs.retry_expected, finite_cost(100.0));
+        assert_eq!(
+            first_try[0].budget_assessments.first_try,
+            CostBudgetAssessment {
+                comparison: BudgetComparison::Under,
+                excess: None,
+            }
+        );
+        assert_eq!(
+            first_try[0].budget_assessments.retry_expected,
+            CostBudgetAssessment {
+                comparison: BudgetComparison::Over,
+                excess: Some(finite_cost(85.0)),
+            }
+        );
+
+        let retry = BeamSearch::new(config(8, 1, 0.0), &db, vec![method()])
+            .with_budget(
+                BudgetPolicy::hard_cap(15.0, BudgetMetric::RetryExpected)
+                    .expect("test cap should be valid"),
+            )
+            .run_k_to_goal(initial(), evaluate, 1, Some(1.0));
+        assert_eq!(
+            retry.len(),
+            2,
+            "one over-budget completion and one compliant alternative"
+        );
+        assert_eq!(retry[0].state.base_id, "complete");
+        assert_eq!(retry[0].budget_comparison, BudgetComparison::Over);
+        assert_eq!(retry[0].budget_excess, Some(finite_cost(85.0)));
+        assert_eq!(
+            retry[0].budget_assessments.first_try.comparison,
+            BudgetComparison::Under
+        );
+        assert_eq!(
+            retry[0].budget_assessments.retry_expected.comparison,
+            BudgetComparison::Over
+        );
+        assert_eq!(
+            retry[1].state.base_id, "initial",
+            "the unchanged start dominates an equally scoring paid miss"
+        );
+        assert_eq!(retry[1].budget_comparison, BudgetComparison::Under);
+        assert_eq!(retry[1].costs.retry_expected, finite_cost(0.0));
+    }
+
+    #[test]
+    fn restart_adjusted_policy_can_reject_a_retry_affordable_one_shot() {
+        let db = empty_db();
+        let method = || {
+            Arc::new(StaticMethod {
+                name: "rare-one-shot",
+                cost: 10.0,
+                repeatable: false,
+                reroll_kind: None,
+                outcomes: vec![("complete", 0.1), ("incomplete", 0.9)],
+            }) as Arc<dyn CraftingMethod>
+        };
+        let evaluate = |state: &ItemState| SearchEvaluation {
+            raw_score: f64::from(state.base_id == "complete"),
+            complete: state.base_id == "complete",
+        };
+
+        let retry = BeamSearch::new(config(8, 1, 0.0), &db, vec![method()])
+            .with_budget(
+                BudgetPolicy::hard_cap(15.0, BudgetMetric::RetryExpected)
+                    .expect("test cap should be valid"),
+            )
+            .run_k_to_goal(initial(), evaluate, 1, Some(1.0));
+        assert_eq!(retry[0].budget_comparison, BudgetComparison::Under);
+        assert_eq!(retry[0].costs.retry_expected, finite_cost(10.0));
+        assert_eq!(retry[0].costs.restart_adjusted_expected, finite_cost(100.0));
+
+        let restart = BeamSearch::new(config(8, 1, 0.0), &db, vec![method()])
+            .with_budget(
+                BudgetPolicy::hard_cap(15.0, BudgetMetric::RestartAdjustedExpected)
+                    .expect("test cap should be valid"),
+            )
+            .run_k_to_goal(initial(), evaluate, 1, Some(1.0));
+        assert_eq!(restart[0].state.base_id, "complete");
+        assert_eq!(restart[0].budget_comparison, BudgetComparison::Over);
+        assert_eq!(restart[0].budget_excess, Some(finite_cost(85.0)));
+        assert_eq!(restart[1].state.base_id, "initial");
+        assert_eq!(restart[1].budget_comparison, BudgetComparison::Under);
+    }
+
+    #[test]
+    fn unbounded_budget_policy_preserves_seeded_results() {
+        let db = empty_db();
+        let methods = || {
+            vec![Arc::new(StaticMethod {
+                name: "two-outcomes",
+                cost: 2.0,
+                repeatable: false,
+                reroll_kind: None,
+                outcomes: vec![("high", 0.25), ("low", 0.75)],
+            }) as Arc<dyn CraftingMethod>]
+        };
+        let score = |state: &ItemState| f64::from(state.base_id == "high");
+        let baseline =
+            BeamSearch::new(config(8, 1, 0.0), &db, methods()).run_k(initial(), score, 2);
+        let explicit = BeamSearch::new(config(8, 1, 0.0), &db, methods())
+            .with_budget(BudgetPolicy::unbounded(BudgetMetric::FirstTry))
+            .run_k(initial(), score, 2);
+
+        assert_eq!(
+            baseline
+                .iter()
+                .map(|result| (&result.state.base_id, result.total_cost, result.score))
+                .collect::<Vec<_>>(),
+            explicit
+                .iter()
+                .map(|result| (&result.state.base_id, result.total_cost, result.score))
+                .collect::<Vec<_>>()
+        );
+        assert!(explicit
+            .iter()
+            .all(|result| result.budget_comparison == BudgetComparison::NotComparable));
+        assert!(explicit.iter().all(|result| {
+            result.budget_assessments.first_try.comparison == BudgetComparison::NotComparable
+                && result.budget_assessments.retry_expected.comparison
+                    == BudgetComparison::NotComparable
+                && result
+                    .budget_assessments
+                    .restart_adjusted_expected
+                    .comparison
+                    == BudgetComparison::NotComparable
+        }));
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingObserver {
+        progress: Mutex<Vec<SearchProgress>>,
+        cancel_after_update: Option<CancellationToken>,
+    }
+
+    impl SearchObserver for RecordingObserver {
+        fn on_progress(&self, progress: &SearchProgress) {
+            self.progress.lock().unwrap().push(progress.clone());
+            if let Some(token) = &self.cancel_after_update {
+                token.cancel();
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_returns_only_the_last_fully_committed_generation() {
+        let db = empty_db();
+        let token = CancellationToken::new();
+        let observer = RecordingObserver {
+            progress: Mutex::new(Vec::new()),
+            cancel_after_update: Some(token.clone()),
+        };
+        let methods: Vec<Arc<dyn CraftingMethod>> = vec![
+            Arc::new(StateTransitionMethod {
+                name: "first",
+                from: "initial",
+                to: "depth-one",
+            }),
+            Arc::new(StateTransitionMethod {
+                name: "second",
+                from: "depth-one",
+                to: "depth-two",
+            }),
+        ];
+        let controlled = BeamSearch::new(config(4, 2, 0.0), &db, methods).run_k_to_goal_controlled(
+            initial(),
+            |state| SearchEvaluation {
+                raw_score: match state.base_id.as_str() {
+                    "depth-one" => 1.0,
+                    "depth-two" => 2.0,
+                    _ => 0.0,
+                },
+                complete: false,
+            },
+            1,
+            None,
+            &SearchRuntime {
+                observer: Some(&observer),
+                cancellation: Some(&token),
+                limits: SearchLimits::default(),
+            },
+        );
+
+        assert_eq!(
+            controlled.termination.reason,
+            SearchTerminationReason::Cancelled
+        );
+        assert_eq!(controlled.termination.snapshot.completed_generations, 1);
+        assert_eq!(controlled.results[0].state.base_id, "depth-one");
+        let updates = observer.progress.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].completed_generations,
+            controlled.termination.snapshot.completed_generations
+        );
+        assert_eq!(
+            updates[0].states_generated,
+            controlled.termination.snapshot.states_generated
+        );
+        assert_eq!(
+            updates[0].states_retained,
+            controlled.termination.snapshot.states_retained
+        );
+        assert_eq!(
+            updates[0].current_beam_size,
+            controlled.termination.snapshot.current_beam_size
+        );
+        assert_eq!(
+            updates[0].best_score,
+            controlled.termination.snapshot.best_score
+        );
+        assert_eq!(
+            updates[0].complete_result_existed,
+            controlled.termination.snapshot.complete_result_existed
+        );
+        assert!(
+            controlled.termination.snapshot.elapsed_ms >= updates[0].elapsed_ms,
+            "final snapshot time cannot precede the committed progress update"
+        );
+    }
+
+    #[test]
+    fn pre_cancel_timeout_and_expansion_limit_are_normal_terminations() {
+        let db = empty_db();
+        let method = || {
+            vec![Arc::new(StaticMethod {
+                name: "limited",
+                cost: 1.0,
+                repeatable: false,
+                reroll_kind: None,
+                outcomes: vec![("one", 0.5), ("two", 0.5)],
+            }) as Arc<dyn CraftingMethod>]
+        };
+        let evaluate = |state: &ItemState| SearchEvaluation {
+            raw_score: f64::from(state.base_id != "initial"),
+            complete: false,
+        };
+
+        let token = CancellationToken::new();
+        token.cancel();
+        let cancelled = BeamSearch::new(config(4, 2, 0.0), &db, method()).run_k_to_goal_controlled(
+            initial(),
+            evaluate,
+            1,
+            None,
+            &SearchRuntime {
+                observer: None,
+                cancellation: Some(&token),
+                limits: SearchLimits::default(),
+            },
+        );
+        assert_eq!(
+            cancelled.termination.reason,
+            SearchTerminationReason::Cancelled
+        );
+        assert_eq!(cancelled.termination.snapshot.completed_generations, 0);
+        assert_eq!(cancelled.results[0].state.base_id, "initial");
+
+        let timed_out = BeamSearch::new(config(4, 2, 0.0), &db, method()).run_k_to_goal_controlled(
+            initial(),
+            evaluate,
+            1,
+            None,
+            &SearchRuntime {
+                observer: None,
+                cancellation: None,
+                limits: SearchLimits {
+                    expansion_limit: None,
+                    timeout: Some(Duration::ZERO),
+                },
+            },
+        );
+        assert_eq!(
+            timed_out.termination.reason,
+            SearchTerminationReason::TimedOut
+        );
+        assert_eq!(timed_out.termination.snapshot.completed_generations, 0);
+
+        let expansion_limited = BeamSearch::new(config(4, 2, 0.0), &db, method())
+            .run_k_to_goal_controlled(
+                initial(),
+                evaluate,
+                1,
+                None,
+                &SearchRuntime {
+                    observer: None,
+                    cancellation: None,
+                    limits: SearchLimits {
+                        expansion_limit: Some(1),
+                        timeout: None,
+                    },
+                },
+            );
+        assert_eq!(
+            expansion_limited.termination.reason,
+            SearchTerminationReason::ExpansionLimit
+        );
+        assert_eq!(
+            expansion_limited.termination.snapshot.completed_generations,
+            0
+        );
+        assert_eq!(expansion_limited.termination.snapshot.states_generated, 0);
+        assert_eq!(expansion_limited.results[0].state.base_id, "initial");
+    }
+
+    #[test]
+    fn progress_and_termination_distinguish_target_step_and_exhaustion() {
+        let db = empty_db();
+        let target = BeamSearch::new(
+            config(4, 3, 0.0),
+            &db,
+            vec![Arc::new(StaticMethod {
+                name: "target",
+                cost: 1.0,
+                repeatable: false,
+                reroll_kind: None,
+                outcomes: vec![("target", 1.0)],
+            })],
+        )
+        .run_k_to_goal_controlled(
+            initial(),
+            |state| SearchEvaluation {
+                raw_score: f64::from(state.base_id == "target"),
+                complete: state.base_id == "target",
+            },
+            1,
+            Some(1.0),
+            &SearchRuntime::default(),
+        );
+        assert_eq!(
+            target.termination.reason,
+            SearchTerminationReason::TargetReached
+        );
+        assert_eq!(target.termination.snapshot.completed_generations, 1);
+        assert_eq!(target.termination.snapshot.states_generated, 1);
+        assert!(target.termination.snapshot.complete_result_existed);
+
+        let step_limited = BeamSearch::new(
+            config(4, 1, 0.0),
+            &db,
+            vec![Arc::new(StaticMethod {
+                name: "continue",
+                cost: 1.0,
+                repeatable: false,
+                reroll_kind: None,
+                outcomes: vec![("next", 1.0)],
+            })],
+        )
+        .run_k_to_goal_controlled(
+            initial(),
+            |_| SearchEvaluation {
+                raw_score: 0.0,
+                complete: false,
+            },
+            1,
+            None,
+            &SearchRuntime::default(),
+        );
+        assert_eq!(
+            step_limited.termination.reason,
+            SearchTerminationReason::StepLimit
+        );
+        assert_eq!(step_limited.termination.snapshot.completed_generations, 1);
+
+        let exhausted = BeamSearch::new(config(4, 3, 0.0), &db, Vec::new())
+            .run_k_to_goal_controlled(
+                initial(),
+                |_| SearchEvaluation {
+                    raw_score: 0.0,
+                    complete: false,
+                },
+                1,
+                None,
+                &SearchRuntime::default(),
+            );
+        assert_eq!(
+            exhausted.termination.reason,
+            SearchTerminationReason::SearchExhausted
+        );
+        assert_eq!(exhausted.termination.snapshot.completed_generations, 1);
+        assert_eq!(exhausted.termination.snapshot.current_beam_size, 0);
+    }
+
+    #[test]
+    fn run_k_to_target_matches_explicit_threshold_evaluation() {
+        let db = empty_db();
+        let search = BeamSearch::new(
+            config(8, 1, 0.0),
+            &db,
+            vec![
+                Arc::new(StaticMethod {
+                    name: "target-path",
+                    cost: 1.0,
+                    repeatable: false,
+                    reroll_kind: None,
+                    outcomes: vec![("target", 1.0)],
+                }),
+                Arc::new(StaticMethod {
+                    name: "near-path",
+                    cost: 1.0,
+                    repeatable: false,
+                    reroll_kind: None,
+                    outcomes: vec![("near", 1.0)],
+                }),
+            ],
+        );
+        let score = |state: &ItemState| match state.base_id.as_str() {
+            "target" => 10.0,
+            "near" => 9.0,
+            _ => 0.0,
+        };
+
+        let legacy = search.run_k_to_target(initial(), score, 2, 10.0);
+        let explicit = search.run_k_to_goal(
+            initial(),
+            |state| {
+                let raw_score = score(state);
+                SearchEvaluation {
+                    raw_score,
+                    complete: raw_score >= 10.0,
+                }
+            },
+            2,
+            Some(10.0),
+        );
+
+        assert_eq!(
+            legacy
+                .iter()
+                .map(|result| result.state.base_id.as_str())
+                .collect::<Vec<_>>(),
+            ["target", "near"]
+        );
+        assert_eq!(legacy.len(), explicit.len());
+        for (legacy, explicit) in legacy.iter().zip(&explicit) {
+            assert_eq!(state_key(&legacy.state), state_key(&explicit.state));
+            assert_eq!(
+                path_signature(&legacy.steps),
+                path_signature(&explicit.steps)
+            );
+            assert_eq!(legacy.total_cost, explicit.total_cost);
+            assert_eq!(legacy.expected_cost, explicit.expected_cost);
+            assert_eq!(legacy.success_prob, explicit.success_prob);
+            assert_eq!(legacy.score, explicit.score);
+            assert_eq!(legacy.restart_cost, explicit.restart_cost);
+            assert_eq!(legacy.steps[0].p_at_least, explicit.steps[0].p_at_least);
+        }
+    }
+
+    #[test]
     fn invalid_and_zero_weights_are_not_reachable() {
         let db = empty_db();
         let method = StaticMethod {
@@ -1012,8 +2358,19 @@ mod tests {
     fn applicable_method_errors_are_reported_in_results() {
         struct BrokenMethod;
         impl CraftingMethod for BrokenMethod {
+            fn id(&self) -> MethodId {
+                test_method_id("broken")
+            }
+
+            fn family(&self) -> MethodFamily {
+                MethodFamily::Currency
+            }
+
             fn name(&self) -> &str {
                 "broken"
+            }
+            fn description(&self) -> &str {
+                "Synthetic method that always returns an error."
             }
             fn cost_chaos(&self) -> f64 {
                 1.0
@@ -1071,20 +2428,59 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_identical_rerolls_are_not_reported_as_extra_steps() {
+    fn different_semantic_ids_with_the_same_display_name_are_distinct_paths() {
         let db = empty_db();
-        let method: Arc<dyn CraftingMethod> = Arc::new(StaticMethod {
-            name: "reroll",
-            cost: 1.0,
-            repeatable: true,
-            reroll_kind: Some(RerollKind::RareExplicit),
-            outcomes: vec![("initial", 1.0)],
-        });
-        let search = BeamSearch::new(config(4, 4, 0.0), &db, vec![method]);
+        let methods: Vec<Arc<dyn CraftingMethod>> = vec![
+            Arc::new(IdentifiedStaticMethod {
+                id: "test/semantic-a",
+                name: "Same Display Name",
+                outcome: "outcome-a",
+                repeatable: false,
+            }),
+            Arc::new(IdentifiedStaticMethod {
+                id: "test/semantic-b",
+                name: "Same Display Name",
+                outcome: "outcome-b",
+                repeatable: false,
+            }),
+        ];
+        let search = BeamSearch::new(config(4, 1, 0.0), &db, methods);
+
+        let results = search.run_k(initial(), |_| 1.0, 3);
+        let paths = results
+            .iter()
+            .filter_map(|result| result.steps.first())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|step| step.method == "Same Display Name"));
+        assert_eq!(paths[0].method_id.as_str(), "test/semantic-a");
+        assert_eq!(paths[1].method_id.as_str(), "test/semantic-b");
+    }
+
+    #[test]
+    fn consecutive_repeatable_rerolls_with_the_same_semantic_id_are_suppressed() {
+        let db = empty_db();
+        let methods: Vec<Arc<dyn CraftingMethod>> = vec![
+            Arc::new(IdentifiedStaticMethod {
+                id: "test/same-reroll",
+                name: "First Display Name",
+                outcome: "initial",
+                repeatable: true,
+            }),
+            Arc::new(IdentifiedStaticMethod {
+                id: "test/same-reroll",
+                name: "Second Display Name",
+                outcome: "initial",
+                repeatable: true,
+            }),
+        ];
+        let search = BeamSearch::new(config(4, 4, 0.0), &db, methods);
 
         let results = search.run_k(initial(), |_| 1.0, 10);
         assert_eq!(results.len(), 2, "only no-op and one reroll should exist");
         assert!(results.iter().all(|result| result.steps.len() <= 1));
+        assert_eq!(results[1].steps[0].method_id.as_str(), "test/same-reroll");
     }
 
     #[test]
@@ -1138,8 +2534,19 @@ mod tests {
     fn direct_rarity_setup_keeps_cost_but_not_discarded_roll_probability() {
         struct Setup;
         impl CraftingMethod for Setup {
+            fn id(&self) -> MethodId {
+                test_method_id("setup")
+            }
+
+            fn family(&self) -> MethodFamily {
+                MethodFamily::Currency
+            }
+
             fn name(&self) -> &str {
                 "setup"
+            }
+            fn description(&self) -> &str {
+                "Synthetic rarity initializer."
             }
             fn cost_chaos(&self) -> f64 {
                 2.0
@@ -1175,8 +2582,19 @@ mod tests {
 
         struct Finish;
         impl CraftingMethod for Finish {
+            fn id(&self) -> MethodId {
+                test_method_id("finish")
+            }
+
+            fn family(&self) -> MethodFamily {
+                MethodFamily::Currency
+            }
+
             fn name(&self) -> &str {
                 "finish"
+            }
+            fn description(&self) -> &str {
+                "Synthetic finishing reroll."
             }
             fn cost_chaos(&self) -> f64 {
                 1.0
@@ -1254,6 +2672,7 @@ mod tests {
     fn restart_cost_rejects_impossible_or_invalid_probabilities() {
         for probability in [0.0, -0.1, 1.1, f64::NAN, f64::INFINITY] {
             let steps = [PathStep {
+                method_id: test_method_id("invalid"),
                 method: "invalid".to_string(),
                 cost: 1.0,
                 p_at_least: probability,
@@ -1295,6 +2714,7 @@ mod tests {
             let steps: Vec<PathStep> = methods
                 .iter()
                 .map(|method| PathStep {
+                    method_id: test_method_id(method),
                     method: (*method).to_string(),
                     cost: 1.0,
                     p_at_least: 1.0,
@@ -1309,6 +2729,7 @@ mod tests {
                 expected_cost: cost,
                 success_prob: 1.0,
                 raw_score,
+                complete: false,
                 score: raw_score,
                 restart_adjusted_cost: cost,
                 reroll_contexts: std::collections::HashSet::new(),
@@ -1332,7 +2753,55 @@ mod tests {
             .map(|(signature, _)| signature.as_str())
             .collect();
 
-        assert_eq!(signatures, ["", "gain", "gain\u{1f}improve"]);
+        assert_eq!(signatures, ["", "test/gain", "test/gain\u{1f}test/improve"]);
+    }
+
+    #[test]
+    fn prefix_pruning_retains_completed_extension_with_lower_raw_score() {
+        let make_node = |methods: &[&str], raw_score: f64, complete: bool, cost: f64| {
+            let steps = methods
+                .iter()
+                .map(|method| PathStep {
+                    method_id: test_method_id(method),
+                    method: (*method).to_string(),
+                    cost: 1.0,
+                    p_at_least: 1.0,
+                    repeatable: false,
+                    probability_estimate: false,
+                })
+                .collect();
+            BeamNode {
+                state: initial(),
+                steps,
+                cumulative_cost: cost,
+                expected_cost: cost,
+                success_prob: 1.0,
+                raw_score,
+                complete,
+                score: raw_score,
+                restart_adjusted_cost: cost,
+                reroll_contexts: std::collections::HashSet::new(),
+                reroll_initializers: std::collections::HashMap::new(),
+            }
+        };
+        let paths = [
+            make_node(&["high-raw"], 100.0, false, 1.0),
+            make_node(&["high-raw", "complete"], 1.0, true, 2.0),
+        ]
+        .into_iter()
+        .map(|node| (path_signature(&node.steps), node))
+        .collect();
+
+        let kept = prune_prefix_dominated_paths(paths);
+        let signatures = kept
+            .iter()
+            .map(|(signature, _)| signature.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            signatures,
+            ["test/high-raw", "test/high-raw\u{1f}test/complete"]
+        );
     }
 
     #[test]
@@ -1354,6 +2823,7 @@ mod tests {
             expected_cost: 0.0,
             success_prob,
             raw_score: score,
+            complete: false,
             score,
             restart_adjusted_cost: expected_cost_with_restarts(&[]),
             reroll_contexts: std::collections::HashSet::new(),
@@ -1370,6 +2840,29 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_states_prefer_completion_over_higher_raw_score() {
+        let make_node = |raw_score, complete| BeamNode {
+            state: initial(),
+            steps: Vec::new(),
+            cumulative_cost: 0.0,
+            expected_cost: 0.0,
+            success_prob: 1.0,
+            raw_score,
+            complete,
+            score: raw_score,
+            restart_adjusted_cost: 0.0,
+            reroll_contexts: std::collections::HashSet::new(),
+            reroll_initializers: std::collections::HashMap::new(),
+        };
+
+        let unique = deduplicate_candidates(vec![make_node(100.0, false), make_node(1.0, true)]);
+
+        assert_eq!(unique.len(), 1);
+        assert!(unique[0].complete);
+        assert_eq!(unique[0].raw_score, 1.0);
+    }
+
+    #[test]
     fn semantic_dedup_prefers_cheaper_path_when_score_ignores_cost() {
         struct TransitionMethod {
             name: &'static str,
@@ -1379,8 +2872,20 @@ mod tests {
         }
 
         impl CraftingMethod for TransitionMethod {
+            fn id(&self) -> MethodId {
+                test_method_id(self.name)
+            }
+
+            fn family(&self) -> MethodFamily {
+                MethodFamily::Currency
+            }
+
             fn name(&self) -> &str {
                 self.name
+            }
+
+            fn description(&self) -> &str {
+                "Synthetic state-transition method."
             }
 
             fn cost_chaos(&self) -> f64 {
@@ -1448,6 +2953,7 @@ mod tests {
             expected_cost: 0.0,
             success_prob: 1.0,
             raw_score: 1.0,
+            complete: false,
             score: 1.0,
             restart_adjusted_cost: 0.0,
             reroll_contexts: std::collections::HashSet::new(),

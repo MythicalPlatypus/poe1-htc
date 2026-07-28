@@ -5,7 +5,10 @@ use std::collections::HashSet;
 use anyhow::{bail, Result};
 use rand::RngCore;
 
-use super::{random_rare_affix_count, CraftingMethod, RerollKind, MONTE_CARLO_SAMPLES};
+use super::{
+    random_rare_affix_count, CraftingMethod, ItemClassSupport, MethodCatalog, MethodFamily,
+    MethodId, MethodSetup, RerollKind, MONTE_CARLO_SAMPLES,
+};
 use crate::data::mods::{Domain, GenerationType, Mod};
 use crate::data::GameData;
 use crate::engine::mod_pool::{random_rolls_pub, roll_mods};
@@ -148,11 +151,52 @@ impl Essence {
 }
 
 impl CraftingMethod for Essence {
+    fn id(&self) -> MethodId {
+        let maximum_item_level = self
+            .max_item_level
+            .map_or_else(|| "none".to_string(), |level| level.to_string());
+        let can_reforge_rare = if self.can_reforge_rare {
+            "true"
+        } else {
+            "false"
+        };
+        MethodId::semantic(
+            "essence",
+            "apply",
+            &[
+                &self.guaranteed_mod_id,
+                "max-item-level",
+                &maximum_item_level,
+                "reforge-rare",
+                can_reforge_rare,
+            ],
+        )
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Essence
+    }
+
+    fn description(&self) -> &str {
+        "Rerolls an item as Rare while guaranteeing one configured Essence modifier."
+    }
+
+    fn setup(&self) -> MethodSetup {
+        MethodSetup::CatalogOrConfigured(MethodCatalog::Essences)
+    }
+
+    fn item_class_support(&self) -> ItemClassSupport {
+        ItemClassSupport::CatalogRestricted
+    }
+
     fn name(&self) -> &str {
         &self.display_name
     }
     fn cost_chaos(&self) -> f64 {
         self.cost_chaos
+    }
+    fn provided_mod_ids(&self) -> Vec<&str> {
+        vec![self.guaranteed_mod_id.as_str()]
     }
     // Monte Carlo sampling — weights are 1/N, not probabilities.
     fn weights_are_probabilities(&self) -> bool {

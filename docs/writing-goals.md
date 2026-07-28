@@ -84,9 +84,9 @@ group conflicts. An impossible starting item is an error, not a warning.
 
 ## `[[wants]]` — what you are crafting toward
 
-Each `[[wants]]` entry is one desired outcome worth `weight` points. At
-least one is required. **All criteria inside a single entry must hold on the
-same mod**:
+Each `[[wants]]` entry is one desired outcome. At least one entry is required.
+Presence and threshold criteria must hold on the same mod; `per_unit` scoring
+instead sums the selected stat across every matching mod:
 
 ```toml
 # Any tier of the flat-life prefix group.
@@ -105,6 +105,25 @@ weight = 5.0
 [[wants]]
 mod_id = "IncreasedLife12"
 weight = 2.0
+required = false           # nice-to-have, not required for COMPLETE
+
+# Value-scaled preference: 0.05 points per Life, up to 300 Life.
+[[wants]]
+stat = "base_maximum_life"
+mode = "per_unit"
+cap = 300
+weight = 0.05
+required = false
+
+# Lower is better. At -10 or lower the threshold is satisfied; score is
+# weight × max(0, cap - attained).
+[[wants]]
+stat = "local_attribute_requirements_+%"
+mode = "per_unit"
+max_value = -10
+cap = 0
+weight = 1.0
+required = false
 ```
 
 | Field | Meaning |
@@ -112,13 +131,33 @@ weight = 2.0
 | `mod_id` | Exact RePoE mod ID (a specific tier) |
 | `group` | RePoE conflict group — matches any tier in the group |
 | `stat` | RePoE stat ID (e.g. `base_maximum_life`) |
-| `min_value` | Minimum rolled value; requires `stat` |
-| `weight` | Points scored when satisfied. Default 1.0, must be > 0 |
+| `mode` | `presence`, `threshold`, or `per_unit`. Omitted mode preserves legacy inference: a bound means `threshold`; otherwise `presence` |
+| `min_value` | Higher-is-better satisfaction threshold |
+| `max_value` | Lower-is-better satisfaction threshold; mutually exclusive with `min_value` |
+| `cap` | Optional higher-is-better `per_unit` score cap; mandatory for lower-is-better `per_unit` |
+| `weight` | Presence/threshold points when satisfied, or points per attained unit for `per_unit`. Default 1.0, must be > 0 |
+| `required` | Whether this want is mandatory for `COMPLETE`. Default `true` |
 
-Weights are how you tell the search what matters: a mandatory mod should
-have a much higher weight than a nice-to-have. Complete targets sort ahead
-of incomplete states. Within the same completion class, the search maximizes
-total score minus restart-adjusted cost (see `cost_weight` below).
+Use `required = true` for outcomes the final item must have and
+`required = false` for preferences. Presence/threshold wants contribute their
+full weight when satisfied. Higher-is-better `per_unit` contributes
+`weight × max(0, min(attained, cap))`; without `cap`, it uses
+`weight × max(0, attained)` and has no known maximum. Lower-is-better
+`per_unit` contributes `weight × max(0, cap - attained)`. Only required wants
+determine completion. Complete targets sort ahead of incomplete states even
+when an incomplete state has a larger preferred score. Within the same
+completion class, the search maximizes total score minus restart-adjusted cost
+(see `cost_weight` below).
+
+`presence` rejects bounds and `cap`. `threshold` requires exactly one bound
+and rejects `cap`. A required `per_unit` want also requires exactly one bound;
+a preferred higher-is-better `per_unit` want may omit one. Numeric selectors
+may use `stat`, `mod_id`, or `group`; without an explicit `stat`, the first
+RePoE-declared stat is used and a multi-stat match emits a warning.
+
+An all-preferred goal set is valid: it is complete by definition, but the
+search still explores until it finds the best preferred score or reaches its
+limits. Existing files that omit `required` remain all-required.
 
 Wants are satisfied by any mod on the final item — prefixes, suffixes,
 fractured mods, crafted mods, Eldritch implicits, and (on imported items)
@@ -308,6 +347,8 @@ cost_weight = 0.02
 restart_cost = 1.0
 seed = 42
 top = 3
+expansion_limit = 100000
+timeout_ms = 30000
 ```
 
 | Field | Default | Meaning |
@@ -318,24 +359,29 @@ top = 3
 | `restart_cost` | 1.0 | Chaos to restore/replace the base if a failed one-shot forces a restart |
 | `seed` | random | RNG seed; set it for reproducible runs |
 | `top` | 1 | Distinct pathways to report, best first |
+| `expansion_limit` | none | Maximum concrete successor states generated |
+| `timeout_ms` | none | Wall-clock limit in milliseconds |
 
 Every field can be overridden on the command line (`--beam-width`,
-`--max-steps`, `--cost-weight`, `--restart-cost`, `--seed`, `--top`);
-CLI flag beats goal file beats built-in default.
+`--max-steps`, `--cost-weight`, `--restart-cost`, `--seed`, `--top`,
+`--expansion-limit`, `--timeout-ms`); CLI flag beats goal file beats built-in
+default.
 
 `beam_width`, `max_steps`, and `top` must be greater than zero.
 `cost_weight` and `restart_cost` must be non-negative finite numbers.
 
 ### Choosing `cost_weight`
 
-`cost_weight` is the exchange rate between score and money. The cost term is
-the restart-on-one-shot-miss estimate, including `restart_cost`, rather than
-the optimistic expected cost printed above it. Rule of thumb: decide how much
-restart-adjusted chaos one point of score is worth to you and invert. If your
-want weights sum to ~25 and you would pay about 50 chaos per point, set `0.02`.
-Too low and the search happily recommends 500-chaos routes for marginal gains;
-too high and it stops at cheap, mediocre items. Completion is still a separate
-priority: any complete target sorts ahead of every incomplete state.
+`cost_weight` is the exchange rate between attainable raw score and money. The
+cost term is the restart-on-one-shot-miss estimate, including `restart_cost`,
+rather than the optimistic expected cost printed above it. Rule of thumb:
+decide how much restart-adjusted chaos one point of score is worth to you and
+invert. If the relevant attainable score range is ~25 points and you would pay
+about 50 chaos per point, set `0.02`. Uncapped `per_unit` goals may make that
+score range unbounded. Too low and the search happily recommends 500-chaos
+routes for marginal gains; too high and it stops at cheap, mediocre items.
+Completion is still a separate priority: any complete target sorts ahead of
+every incomplete state.
 
 The examples in [`goals/`](../goals) are annotated with this reasoning —
 copy one and adjust.

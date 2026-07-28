@@ -11,7 +11,10 @@
 use anyhow::{bail, Result};
 use rand::RngCore;
 
-use super::{random_rare_affix_count, CraftingMethod, RerollKind, MONTE_CARLO_SAMPLES};
+use super::{
+    random_rare_affix_count, CraftingMethod, MethodFamily, MethodId, MethodSetup, ProbabilityModel,
+    RerollKind, MONTE_CARLO_SAMPLES,
+};
 use crate::data::mods::GenerationType;
 use crate::data::GameData;
 use crate::engine::mod_pool::{
@@ -49,6 +52,25 @@ pub enum HarvestTarget {
 }
 
 impl HarvestTarget {
+    fn id_token(self) -> &'static str {
+        match self {
+            Self::Attack => "attack",
+            Self::Caster => "caster",
+            Self::Speed => "speed",
+            Self::Life => "life",
+            Self::Defence => "defence",
+            Self::Resistance => "resistance",
+            Self::Chaos => "chaos",
+            Self::Fire => "fire",
+            Self::Cold => "cold",
+            Self::Lightning => "lightning",
+            Self::Physical => "physical",
+            Self::Critical => "critical",
+            Self::Minion => "minion",
+            Self::Mana => "mana",
+        }
+    }
+
     /// RePoE modifier tag corresponding to this Harvest target.
     fn as_tag(self) -> &'static str {
         match self {
@@ -100,6 +122,13 @@ pub enum HarvestOp {
 }
 
 impl HarvestOp {
+    fn id_token(self) -> &'static str {
+        match self {
+            Self::Reforge => "reforge",
+            Self::Augment => "augment",
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "reforge" => Some(Self::Reforge),
@@ -130,6 +159,29 @@ impl HarvestCraft {
 }
 
 impl CraftingMethod for HarvestCraft {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("harvest", self.op.id_token(), &[self.target.id_token()])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Harvest
+    }
+
+    fn description(&self) -> &str {
+        match self.op {
+            HarvestOp::Reforge => {
+                "Rerolls a Rare item while guaranteeing at least one modifier of the selected tag."
+            }
+            HarvestOp::Augment => {
+                "Removes one random modifier and adds a modifier of the selected tag."
+            }
+        }
+    }
+
+    fn setup(&self) -> MethodSetup {
+        MethodSetup::Configured
+    }
+
     fn name(&self) -> &str {
         &self.display_name
     }
@@ -140,6 +192,15 @@ impl CraftingMethod for HarvestCraft {
 
     fn weights_are_probabilities(&self) -> bool {
         false
+    }
+
+    fn probability_model(&self) -> ProbabilityModel {
+        match self.op {
+            HarvestOp::Reforge => ProbabilityModel::MonteCarlo {
+                samples: MONTE_CARLO_SAMPLES,
+            },
+            HarvestOp::Augment => ProbabilityModel::ExactIdentitySampledRolls,
+        }
     }
 
     fn repeatable_on_failure(&self) -> bool {

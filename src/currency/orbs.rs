@@ -4,7 +4,10 @@
 //! Costs are rough chaos-equivalent market values and only need to be right
 //! relative to each other; tune per league via a price source if desired.
 
-use super::{random_rare_affix_count, CraftingMethod, RerollKind, MONTE_CARLO_SAMPLES};
+use super::{
+    random_rare_affix_count, CraftingMethod, MethodFamily, MethodId, ProbabilityModel, RerollKind,
+    MONTE_CARLO_SAMPLES,
+};
 use crate::data::mods::{GenerationType, ModStat};
 use crate::data::GameData;
 use crate::engine::mod_pool::{eligible_mods, random_rolls_pub, roll_mods};
@@ -98,6 +101,18 @@ fn has_eligible_mod_after_rarity_change(item: &ItemState, rarity: Rarity, db: &G
 pub struct OrbOfScouring;
 
 impl CraftingMethod for OrbOfScouring {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("currency", "scour", &[])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
+    fn description(&self) -> &str {
+        "Removes all removable explicit and crafted modifiers, lowering rarity as fractures require."
+    }
+
     fn name(&self) -> &str {
         "Orb of Scouring"
     }
@@ -147,6 +162,18 @@ impl CraftingMethod for OrbOfScouring {
 pub struct OrbOfTransmutation;
 
 impl CraftingMethod for OrbOfTransmutation {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("currency", "transmute", &[])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
+    fn description(&self) -> &str {
+        "Upgrades a Normal item to Magic with one or two random modifiers."
+    }
+
     fn name(&self) -> &str {
         "Orb of Transmutation"
     }
@@ -198,6 +225,18 @@ impl CraftingMethod for OrbOfTransmutation {
 pub struct OrbOfAlteration;
 
 impl CraftingMethod for OrbOfAlteration {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("currency", "alteration", &[])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
+    fn description(&self) -> &str {
+        "Rerolls removable modifiers on a Magic item while preserving fractures."
+    }
+
     fn name(&self) -> &str {
         "Orb of Alteration"
     }
@@ -261,6 +300,18 @@ impl CraftingMethod for OrbOfAlteration {
 pub struct OrbOfAugmentation;
 
 impl CraftingMethod for OrbOfAugmentation {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("currency", "augmentation", &[])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
+    fn description(&self) -> &str {
+        "Adds one random modifier to a Magic item with an open affix slot."
+    }
+
     fn name(&self) -> &str {
         "Orb of Augmentation"
     }
@@ -269,6 +320,10 @@ impl CraftingMethod for OrbOfAugmentation {
     }
     fn weights_are_probabilities(&self) -> bool {
         false
+    }
+
+    fn probability_model(&self) -> ProbabilityModel {
+        ProbabilityModel::ExactIdentitySampledRolls
     }
 
     fn can_apply(&self, item: &ItemState, db: &GameData) -> bool {
@@ -298,6 +353,18 @@ impl CraftingMethod for OrbOfAugmentation {
 pub struct RegalOrb;
 
 impl CraftingMethod for RegalOrb {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("currency", "regal", &[])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
+    fn description(&self) -> &str {
+        "Upgrades a Magic item to Rare and adds one random modifier."
+    }
+
     fn name(&self) -> &str {
         "Regal Orb"
     }
@@ -306,6 +373,10 @@ impl CraftingMethod for RegalOrb {
     }
     fn weights_are_probabilities(&self) -> bool {
         false
+    }
+
+    fn probability_model(&self) -> ProbabilityModel {
+        ProbabilityModel::ExactIdentitySampledRolls
     }
 
     fn can_apply(&self, item: &ItemState, db: &GameData) -> bool {
@@ -337,6 +408,18 @@ impl CraftingMethod for RegalOrb {
 pub struct OrbOfAlchemy;
 
 impl CraftingMethod for OrbOfAlchemy {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("currency", "alchemy", &[])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
+    fn description(&self) -> &str {
+        "Upgrades a Normal item to Rare with four to six random modifiers."
+    }
+
     fn name(&self) -> &str {
         "Orb of Alchemy"
     }
@@ -387,6 +470,18 @@ impl CraftingMethod for OrbOfAlchemy {
 pub struct ChaosOrb;
 
 impl CraftingMethod for ChaosOrb {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("currency", "chaos", &[])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
+    fn description(&self) -> &str {
+        "Rerolls all removable modifiers on a Rare item while preserving fractures."
+    }
+
     fn name(&self) -> &str {
         "Chaos Orb"
     }
@@ -449,6 +544,18 @@ impl CraftingMethod for ChaosOrb {
 pub struct ExaltedOrb;
 
 impl CraftingMethod for ExaltedOrb {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("currency", "exalted", &[])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
+    fn description(&self) -> &str {
+        "Adds one random modifier to a Rare item with an open affix slot."
+    }
+
     fn name(&self) -> &str {
         "Exalted Orb"
     }
@@ -457,6 +564,10 @@ impl CraftingMethod for ExaltedOrb {
     }
     fn weights_are_probabilities(&self) -> bool {
         false
+    }
+
+    fn probability_model(&self) -> ProbabilityModel {
+        ProbabilityModel::ExactIdentitySampledRolls
     }
 
     fn can_apply(&self, item: &ItemState, db: &GameData) -> bool {
@@ -485,6 +596,18 @@ impl CraftingMethod for ExaltedOrb {
 pub struct OrbOfAnnulment;
 
 impl CraftingMethod for OrbOfAnnulment {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("currency", "annulment", &[])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
+    fn description(&self) -> &str {
+        "Removes one uniformly selected removable modifier from a Magic or Rare item."
+    }
+
     fn name(&self) -> &str {
         "Orb of Annulment"
     }
@@ -540,6 +663,18 @@ impl CraftingMethod for OrbOfAnnulment {
 pub struct DivineOrb;
 
 impl CraftingMethod for DivineOrb {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("currency", "divine", &[])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
+    fn description(&self) -> &str {
+        "Rerolls numeric values on non-fractured explicit and crafted modifiers."
+    }
+
     fn name(&self) -> &str {
         "Divine Orb"
     }

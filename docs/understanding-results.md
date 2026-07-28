@@ -13,28 +13,41 @@ life + triple resistance.
 
 ```text
 Loaded 39292 mods, 5059 base items from data
+Data provenance: RePoE version unknown, fingerprint repoe-bundle-v1:sha256:<64 lowercase hex characters>
 Crafting catalogs: 774 bench recipes, 106 essences, 445 fossils
 Base item: Astral Plate (Metadata/Items/Armours/BodyArmours/BodyStr15), item level 86
 Search: beam_width=25, max_steps=8, cost_weight=0.05, restart_cost=1c, seed=42
+Budget: unbounded (restart_adjusted_expected cost shown for comparison)
 Starting item: Rare with 2 existing mod(s) (1 fractured, crafted: false)
+Search finished: target_reached after 2 generation(s), 8 ms; resolved seed 42
 ```
 
-Sanity-check this section first: the right base, the right item level, the
-starting mods you expected, and the search settings that were actually used
-(CLI flags override the goal file, which overrides defaults).
+Sanity-check this section first: the right data fingerprint, base, item level,
+starting mods, and effective search settings (CLI flags override the goal file,
+which overrides defaults). RePoE version `unknown` means no trusted
+`repoe-version.txt` sidecar was installed; the fingerprint still identifies
+the exact JSON bundle used for the result. The final line says why the run
+stopped and records the one seed that replays it. Other normal reasons are
+`step_limit`, `expansion_limit`, `timed_out`, `cancelled`,
+`search_exhausted`, and pre-search `impossible`.
 
 ## The recommended path
 
 ```text
-=== Best crafting path: target COMPLETE (4/4 wants, goal score 34.0/34.0, ranking score -28.019) ===
+=== Best crafting path: target COMPLETE (4/4 required, 4/4 total wants, goal score 34.0/34.0, ranking score -28.019) ===
   1. Chaos Orb — 1.00c per application; ~6.0% per try, reroll until hit -> ~16.7c expected
   2. Exalted Orb — 100.00c per application; one-shot, ~9.5% chance of >= this result
 ```
 
-- **`target COMPLETE (4/4 wants)`** — the plan's final item satisfies every
-  want. If it says `INCOMPLETE`, the search could not reach everything within
-  `max_steps`/`beam_width`; the score tells you how close it got.
-- **`goal score`** — sum of satisfied want weights (here all 34 points).
+- **`target COMPLETE (4/4 required, 4/4 total wants)`** — the plan's final
+  item satisfies every required want. Preferred wants (`required = false`) can
+  remain unsatisfied without changing `COMPLETE`; the total count and score
+  show how many it also landed. `INCOMPLETE` means at least one required want
+  is still missing.
+- **`goal score`** — sum of each want's contribution (here all 34 points).
+  Presence/threshold goals contribute their weight when satisfied; `per_unit`
+  goals contribute their value-scaled amount. `/unbounded` replaces the
+  denominator when no sound maximum is known.
 - **`ranking score`** — goal score minus `cost_weight ×` restart-adjusted
   expected cost, not the optimistic expected-cost line below. Complete targets
   always sort ahead of incomplete states; ranking score orders paths within
@@ -75,6 +88,13 @@ missed slam (annul, live with it, adjust the plan) is often cheaper than a full
 restart but not free. It can also fall outside either estimate. The tool does
 not yet model recovery policies — this is listed in Known Limitations.
 
+Application-service callers can bind a chaos-equivalent hard cap to first-try,
+retry-expected, or restart-adjusted expected cost. A compliant completion is
+`COMPLETE`; a goal-complete exemplar beyond the selected cap is
+`COMPLETE, OVER BUDGET` and prints its excess. This constrains a modeled
+expectation, not guaranteed wallet consumption. Saved JSON reports all three
+cost values and each one's `under`, `over`, or `not_comparable` comparison.
+
 ```text
 (Sampled step probabilities are estimates; full rerolls use 50 Monte Carlo samples. ~ on costs and 1-in-N odds denotes approximation.)
 ```
@@ -105,8 +125,8 @@ Fractured:
   Prime [IncreasedLife12]  base_maximum_life = 180
 
 --- Goal satisfaction ---
-  [x] stat base_maximum_life >= 175 (weight 10)
-  [x] stat base_fire_damage_resistance_% >= 30 (weight 8)
+  [x] [required, threshold, attained=180, contribution=10.000] stat base_maximum_life >= 175 (weight 10)
+  [x] [required, threshold, attained=42, contribution=8.000] stat base_fire_damage_resistance_% >= 30 (weight 8)
   ...
 ```
 
@@ -114,15 +134,17 @@ This is the *planned* final item — the outcome the probabilities refer to,
 shown with each mod's RePoE ID and rolled values. The bracketed IDs are the
 same identifiers you use in `[[wants]]` and `[[item.mods]]`, so reports are
 also the easiest way to learn the mod vocabulary. Imported items additionally
-list quality, sockets, implicits, and enchantments here.
+list quality, sockets, implicits, and enchantments here. Each goal line also
+shows required/preferred status, scoring mode, aggregated numeric value, and
+the exact score contribution.
 
 ## Alternative pathways
 
 ```text
---- Alternative pathway #2 (goal 34.0/34.0, 4/4 wants, ranking -69.399, retry ~156.7c, restart ~2068.0c, one-shot odds 5.7%) ---
+--- Alternative pathway #2 (complete, goal 34.0/34.0, 4/4 required, 4/4 total wants, ranking -69.399, retry ~156.7c, restart ~2068.0c, one-shot odds 5.7%) ---
   Chaos Orb, then Orb of Annulment, then Exalted Orb
 
---- Alternative pathway #3 (goal 26.0/34.0, 3/4 wants, ranking 25.167, retry ~16.7c, restart ~16.7c, rerolls only) ---
+--- Alternative pathway #3 (incomplete, goal 26.0/34.0, 3/4 required, 3/4 total wants, ranking 25.167, retry ~16.7c, restart ~16.7c, rerolls only) ---
   Chaos Orb
 ```
 
@@ -148,10 +170,11 @@ committing real currency to an expensive plan:
   score similarly, the model is telling you several plans are close — pick
   the one whose risk profile you prefer.
 
-One more honest caveat: multi-step probabilities group sibling outcomes by
-goal score. Two outcomes with equal score can support different follow-ups,
-so a multi-step "chance all steps land" is a policy estimate, not a
-guarantee that every counted branch continues exactly as printed.
+One more honest caveat: multi-step probabilities group sibling outcomes first
+by required completion and then by goal score. Two equally ranked outcomes can
+support different follow-ups, so a multi-step "chance all steps land" is a
+policy estimate, not a guarantee that every counted branch continues exactly
+as printed.
 
 ## Quick reference: tuning knobs
 

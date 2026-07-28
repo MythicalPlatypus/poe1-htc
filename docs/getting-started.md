@@ -61,6 +61,12 @@ Only `mods.json` and `base_items.json` are strictly required. The other three
 let the tool resolve names like `Pristine Fossil` and `Deafening Essence of
 Greed` and validate bench crafts — you want them.
 
+The JSON exports do not contain their own release number. If you know the
+version of the bundle you downloaded from a trusted source, you may put that
+single value in `data/repoe-version.txt`. Leave the file absent if you do not
+know; the optimizer will report `unknown` rather than guess. It always
+fingerprints the exact five-file bundle independently of this label.
+
 When a new league launches, re-run these downloads to refresh the data.
 
 ## 4. Build and verify
@@ -76,6 +82,7 @@ data check; you should see something like:
 ```text
 POE1 HTC — Crafting Path Optimizer
 Loaded 39292 mods, 5059 base items from data
+Data provenance: RePoE version unknown, fingerprint repoe-bundle-v1:sha256:<64 lowercase hex characters>
 Crafting catalogs: 774 bench recipes, 106 essences, 445 fossils
 
 No --goal file given; data check complete.

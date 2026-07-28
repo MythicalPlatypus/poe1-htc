@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "engine": {
+    "version": "0.1.0"
+  },
+  "data": {
+    "fingerprint": "repoe-bundle-v1:sha256:over-budget"
+  },
+  "search": {
+    "beam_width": 8,
+    "max_steps": 1,
+    "cost_weight": 0.0,
+    "restart_cost": 1.0,
+    "seed": "46",
+    "top": 1
+  },
+  "effective_limits": {},
+  "budget": {
+    "kind": "hard_cap",
+    "amount_chaos": 5.0,
+    "metric": "restart_adjusted_expected"
+  },
+  "resolved_seed": "46",
+  "outcome": "complete",
+  "termination": {
+    "reason": "target_reached",
+    "snapshot": {
+      "elapsed_ms": 1,
+      "completed_generations": 1,
+      "max_steps": 1,
+      "states_generated": 1,
+      "states_retained": 0,
+      "current_beam_size": 0,
+      "best_score": 1.0,
+      "complete_result_existed": true
+    }
+  },
+  "methods": [
+    {
+      "id": "bench/add-explicit/TestCraft",
+      "display_name": "Test Bench Craft",
+      "family": "bench",
+      "description": "Adds the test modifier.",
+      "effective_price_chaos": 10.0,
+      "default_price_chaos": 10.0,
+      "price_overridden": false,
+      "setup": {
+        "kind": "configured"
+      },
+      "item_class_support": "catalog_restricted",
+      "probability_model": {
+        "kind": "exact"
+      }
+    }
+  ],
+  "initial_item": {
+    "base_id": "Metadata/Items/TestPlate",
+    "base_name": "Test Plate",
+    "base_tags": [
+      "body_armour"
+    ],
+    "item_level": 86,
+    "rarity": "rare",
+    "prefixes": [],
+    "suffixes": [],
+    "fractured": [],
+    "corrupted": false,
+    "mirrored": false,
+    "quality": 0
+  },
+  "starting_goal": {
+    "score": 0.0,
+    "maximum_score": 1.0,
+    "satisfied_count": 0,
+    "goal_count": 1,
+    "satisfied_required_count": 0,
+    "required_goal_count": 1,
+    "complete": false,
+    "report": [
+      {
+        "description": "Test craft",
+        "required": true,
+        "satisfied": false,
+        "scoring_mode": "presence",
+        "contribution": 0.0
+      }
+    ]
+  },
+  "paths": [
+    {
+      "status": "over_budget",
+      "goal": {
+        "score": 1.0,
+        "maximum_score": 1.0,
+        "satisfied_count": 1,
+        "goal_count": 1,
+        "satisfied_required_count": 1,
+        "required_goal_count": 1,
+        "complete": true,
+        "report": [
+          {
+            "description": "Test craft",
+            "required": true,
+            "satisfied": true,
+            "scoring_mode": "presence",
+            "contribution": 1.0
+          }
+        ]
+      },
+      "ranking_score": {
+        "kind": "finite",
+        "value": 1.0
+      },
+      "final_item": {
+        "base_id": "Metadata/Items/TestPlate",
+        "base_name": "Test Plate",
+        "base_tags": [
+          "body_armour"
+        ],
+        "item_level": 86,
+        "rarity": "rare",
+        "prefixes": [],
+        "suffixes": [],
+        "fractured": [],
+        "crafted_mod": {
+          "mod_id": "TestCraft",
+          "generation_type": "prefix",
+          "rolls": [
+            {
+              "stat_id": "base_maximum_life",
+              "value": 50
+            }
+          ]
+        },
+        "corrupted": false,
+        "mirrored": false,
+        "quality": 0
+      },
+      "steps": [
+        {
+          "method_id": "bench/add-explicit/TestCraft",
+          "display_name": "Test Bench Craft",
+          "cost_per_application": {
+            "kind": "finite",
+            "amount_chaos": 10.0
+          },
+          "probability_at_least_this_good": 1.0,
+          "repeatable_on_failure": false,
+          "probability_is_estimate": false
+        }
+      ],
+      "one_shot_success_probability": 1.0,
+      "costs": {
+        "first_try": {
+          "value": {
+            "kind": "finite",
+            "amount_chaos": 10.0
+          },
+          "comparison": "over",
+          "excess": {
+            "kind": "finite",
+            "amount_chaos": 5.0
+          }
+        },
+        "retry_expected": {
+          "value": {
+            "kind": "finite",
+            "amount_chaos": 10.0
+          },
+          "comparison": "over",
+          "excess": {
+            "kind": "finite",
+            "amount_chaos": 5.0
+          }
+        },
+        "restart_adjusted_expected": {
+          "value": {
+            "kind": "finite",
+            "amount_chaos": 10.0
+          },
+          "comparison": "over",
+          "excess": {
+            "kind": "finite",
+            "amount_chaos": 5.0
+          }
+        }
+      }
+    }
+  ]
+}

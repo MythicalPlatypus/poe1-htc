@@ -30,7 +30,7 @@ use poe1_htc::currency::{
         ChaosOrb, DivineOrb, ExaltedOrb, OrbOfAlchemy, OrbOfAlteration, OrbOfAnnulment,
         OrbOfAugmentation, OrbOfScouring, OrbOfTransmutation, RegalOrb,
     },
-    CraftingMethod, Repriced, MONTE_CARLO_SAMPLES,
+    CraftingMethod, MethodFamily, MethodId, Repriced, MONTE_CARLO_SAMPLES,
 };
 use poe1_htc::data::{
     mods::{Domain, GenerationType, Mod, ModStat, SpawnWeight},
@@ -168,6 +168,14 @@ fn step_names(result: &poe1_htc::search::beam::SearchResult) -> Vec<&str> {
     result.steps.iter().map(|s| s.method.as_str()).collect()
 }
 
+fn step_ids(result: &poe1_htc::search::beam::SearchResult) -> Vec<&str> {
+    result.steps.iter().map(|s| s.method_id.as_str()).collect()
+}
+
+fn test_method_id(operation: &str) -> MethodId {
+    MethodId::parse(format!("test/{operation}")).expect("test method ID should be valid")
+}
+
 // ─── 1 + 2: beam-search ranking ─────────────────────────────────────────────
 
 /// One-shot synthetic method: applies once to an unmodified item and stamps a
@@ -178,8 +186,19 @@ struct StampMethod {
 }
 
 impl CraftingMethod for StampMethod {
+    fn id(&self) -> MethodId {
+        test_method_id(self.method_name)
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
     fn name(&self) -> &str {
         self.method_name
+    }
+    fn description(&self) -> &str {
+        "Synthetic one-shot marker method."
     }
     fn cost_chaos(&self) -> f64 {
         self.cost
@@ -241,6 +260,7 @@ fn cost_weight_zero_picks_highest_raw_score() {
         vec!["pricey"],
         "with cost ignored, the higher-scoring method must win"
     );
+    assert_eq!(step_ids(&result), vec!["test/pricey"]);
     assert_eq!(result.total_cost, 10.0);
     assert_eq!(result.score, 6.0);
 }
@@ -254,6 +274,7 @@ fn cost_weight_changes_winner() {
         vec!["cheap"],
         "with cost_weight=1.0 the cheap method must win"
     );
+    assert_eq!(step_ids(&result), vec!["test/cheap"]);
     assert_eq!(result.total_cost, 1.0);
     assert_eq!(result.score, 4.0);
 }
@@ -262,8 +283,19 @@ fn cost_weight_changes_winner() {
 struct AddOne;
 
 impl CraftingMethod for AddOne {
+    fn id(&self) -> MethodId {
+        test_method_id("add-one")
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
     fn name(&self) -> &str {
         "Add One"
+    }
+    fn description(&self) -> &str {
+        "Synthetic deterministic additive method."
     }
     fn cost_chaos(&self) -> f64 {
         1.0
@@ -306,6 +338,7 @@ fn beam_search_builds_multistep_path() {
         vec!["Add One"; 3],
         "must chain exactly 3 applications"
     );
+    assert_eq!(step_ids(&result), vec!["test/add-one"; 3]);
     assert_eq!(result.total_cost, 3.0);
     assert_eq!(
         result.expected_cost, 3.0,
@@ -766,8 +799,19 @@ struct CoinFlip {
 }
 
 impl CraftingMethod for CoinFlip {
+    fn id(&self) -> MethodId {
+        test_method_id("coin-flip")
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Currency
+    }
+
     fn name(&self) -> &str {
         "Coin Flip"
+    }
+    fn description(&self) -> &str {
+        "Synthetic weighted two-outcome method."
     }
     fn cost_chaos(&self) -> f64 {
         8.0
@@ -819,6 +863,8 @@ fn repeatable_step_prices_in_expected_retries() {
     let result = run_coin_flip(true);
     assert_eq!(result.steps.len(), 1);
     let step = &result.steps[0];
+    assert_eq!(step.method, "Coin Flip");
+    assert_eq!(step.method_id.as_str(), "test/coin-flip");
     assert!(
         (step.p_at_least - 0.25).abs() < 1e-12,
         "P(>= good) must be 0.25"
@@ -838,6 +884,8 @@ fn repeatable_step_prices_in_expected_retries() {
 #[test]
 fn oneshot_step_reports_hit_probability_instead() {
     let result = run_coin_flip(false);
+    assert_eq!(result.steps[0].method, "Coin Flip");
+    assert_eq!(result.steps[0].method_id.as_str(), "test/coin-flip");
     assert_eq!(result.total_cost, 8.0);
     assert_eq!(
         result.expected_cost, 8.0,
@@ -852,6 +900,7 @@ fn oneshot_step_reports_hit_probability_instead() {
 
 fn step(cost: f64, p_at_least: f64, repeatable: bool) -> PathStep {
     PathStep {
+        method_id: test_method_id("step"),
         method: "step".to_string(),
         cost,
         p_at_least,
@@ -866,7 +915,9 @@ fn run_k_returns_distinct_pathways_best_first() {
     // Two craft sequences plus the valid no-op starting-state pathway.
     assert_eq!(results.len(), 3);
     assert_eq!(results[0].steps[0].method, "pricey", "best pathway first");
+    assert_eq!(results[0].steps[0].method_id.as_str(), "test/pricey");
     assert_eq!(results[1].steps[0].method, "cheap");
+    assert_eq!(results[1].steps[0].method_id.as_str(), "test/cheap");
     assert!(results[2].steps.is_empty());
     assert_eq!(results[0].score, 6.0);
     assert_eq!(results[1].score, 5.0);
@@ -905,6 +956,7 @@ fn repriced_overrides_cost_and_delegates_everything_else() {
         cost: 3.5,
     };
     assert_eq!(repriced.cost_chaos(), 3.5);
+    assert_eq!(repriced.id().as_str(), "currency/chaos");
     assert_eq!(repriced.name(), "Chaos Orb");
     assert!(!repriced.weights_are_probabilities());
     assert!(repriced.repeatable_on_failure());
@@ -1077,6 +1129,7 @@ fn seeded_searches_are_reproducible() {
         "seeded runs must produce identical scores"
     );
     assert_eq!(step_names(&a), step_names(&b));
+    assert_eq!(step_ids(&a), step_ids(&b));
     assert_eq!(
         a.state.prefixes, b.state.prefixes,
         "seeded runs must produce identical prefixes (ids and roll values)"

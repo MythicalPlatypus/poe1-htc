@@ -8,7 +8,9 @@
 use anyhow::{bail, Result};
 use rand::RngCore;
 
-use super::CraftingMethod;
+use super::{
+    CraftingMethod, ItemClassSupport, MethodFamily, MethodId, MethodSetup, ProbabilityModel,
+};
 use crate::data::mods::{GenerationType, Mod, ModStat};
 use crate::data::GameData;
 use crate::engine::mod_pool::{eligible_mods, random_rolls_pub};
@@ -69,6 +71,17 @@ pub enum Influence {
 }
 
 impl Influence {
+    fn id_token(self) -> &'static str {
+        match self {
+            Self::Shaper => "shaper",
+            Self::Elder => "elder",
+            Self::Crusader => "crusader",
+            Self::Hunter => "hunter",
+            Self::Redeemer => "redeemer",
+            Self::Warlord => "warlord",
+        }
+    }
+
     fn marker(self) -> &'static str {
         match self {
             Self::Shaper => "shaper_item",
@@ -113,6 +126,26 @@ pub struct ConquerorExaltedOrb {
 }
 
 impl CraftingMethod for ConquerorExaltedOrb {
+    fn id(&self) -> MethodId {
+        MethodId::semantic("influence", "conqueror-exalt", &[self.influence.id_token()])
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Influence
+    }
+
+    fn description(&self) -> &str {
+        "Applies a Conqueror influence and adds one exclusive influence modifier."
+    }
+
+    fn setup(&self) -> MethodSetup {
+        MethodSetup::Configured
+    }
+
+    fn item_class_support(&self) -> ItemClassSupport {
+        ItemClassSupport::InfluenceCompatible
+    }
+
     fn name(&self) -> &str {
         self.influence
             .conqueror_orb_name()
@@ -186,6 +219,10 @@ impl CraftingMethod for ConquerorExaltedOrb {
     fn weights_are_probabilities(&self) -> bool {
         false
     }
+
+    fn probability_model(&self) -> ProbabilityModel {
+        ProbabilityModel::ExactIdentitySampledRolls
+    }
 }
 
 /// Retained for API compatibility, but direct influence acquisition is not a
@@ -196,6 +233,38 @@ pub struct ApplyInfluence {
 }
 
 impl CraftingMethod for ApplyInfluence {
+    fn id(&self) -> MethodId {
+        MethodId::semantic(
+            "unsupported",
+            "apply-influence",
+            &[self.influence.id_token()],
+        )
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Influence
+    }
+
+    fn description(&self) -> &str {
+        "Unavailable compatibility operation for direct influence acquisition."
+    }
+
+    fn setup(&self) -> MethodSetup {
+        MethodSetup::Unsupported
+    }
+
+    fn item_class_support(&self) -> ItemClassSupport {
+        ItemClassSupport::Unavailable
+    }
+
+    fn probability_model(&self) -> ProbabilityModel {
+        ProbabilityModel::Unavailable
+    }
+
+    fn default_price_chaos(&self) -> Option<f64> {
+        None
+    }
+
     fn name(&self) -> &str {
         "Apply Influence (unsupported)"
     }
@@ -229,6 +298,41 @@ pub struct AwakenersOrb {
 }
 
 impl CraftingMethod for AwakenersOrb {
+    fn id(&self) -> MethodId {
+        MethodId::semantic(
+            "unsupported",
+            "awakeners-orb",
+            &[
+                self.source_influence_a.id_token(),
+                self.source_influence_b.id_token(),
+            ],
+        )
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Influence
+    }
+
+    fn description(&self) -> &str {
+        "Unavailable compatibility operation requiring two influenced source items."
+    }
+
+    fn setup(&self) -> MethodSetup {
+        MethodSetup::Unsupported
+    }
+
+    fn item_class_support(&self) -> ItemClassSupport {
+        ItemClassSupport::Unavailable
+    }
+
+    fn probability_model(&self) -> ProbabilityModel {
+        ProbabilityModel::Unavailable
+    }
+
+    fn default_price_chaos(&self) -> Option<f64> {
+        None
+    }
+
     fn name(&self) -> &str {
         "Awakener's Orb (unsupported)"
     }

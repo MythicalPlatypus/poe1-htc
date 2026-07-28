@@ -48,3 +48,16 @@ max_steps = 8
 cost_weight = 0.05
 restart_cost = 1.0
 top = 3
+
+# Allflame softcore exchange rates (poe.ninja, 2026-07-25). Chaos Orb is the
+# pricing unit (1.0) and needs no override.
+[prices]
+"Orb of Transmutation" = 0.013
+"Orb of Augmentation" = 0.023
+"Orb of Alchemy" = 0.055
+"Orb of Alteration" = 0.10
+"Regal Orb" = 0.30
+"Orb of Scouring" = 0.40
+"Exalted Orb" = 0.82
+"Orb of Annulment" = 3.75
+"Divine Orb" = 90.6

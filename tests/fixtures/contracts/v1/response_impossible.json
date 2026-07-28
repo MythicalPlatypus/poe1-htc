@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "engine": {
+    "version": "0.1.0"
+  },
+  "data": {
+    "fingerprint": "repoe-bundle-v1:sha256:impossible"
+  },
+  "search": {
+    "beam_width": 50,
+    "max_steps": 10,
+    "cost_weight": 0.0,
+    "restart_cost": 1.0,
+    "seed": "45",
+    "top": 1
+  },
+  "effective_limits": {},
+  "budget": {
+    "kind": "unbounded",
+    "metric": "restart_adjusted_expected"
+  },
+  "resolved_seed": "45",
+  "outcome": "impossible",
+  "termination": {
+    "reason": "impossible",
+    "snapshot": {
+      "elapsed_ms": 0,
+      "completed_generations": 0,
+      "max_steps": 10,
+      "states_generated": 0,
+      "states_retained": 0,
+      "current_beam_size": 0,
+      "best_score": 0.0,
+      "complete_result_existed": false
+    }
+  },
+  "methods": [],
+  "initial_item": {
+    "base_id": "Metadata/Items/TestPlate",
+    "base_name": "Test Plate",
+    "base_tags": [
+      "body_armour"
+    ],
+    "item_level": 86,
+    "rarity": "rare",
+    "prefixes": [],
+    "suffixes": [],
+    "fractured": [],
+    "corrupted": false,
+    "mirrored": false,
+    "quality": 0
+  },
+  "starting_goal": {
+    "score": 0.0,
+    "maximum_score": 1.0,
+    "satisfied_count": 0,
+    "goal_count": 1,
+    "satisfied_required_count": 0,
+    "required_goal_count": 1,
+    "complete": false,
+    "report": [
+      {
+        "description": "Crafted-only target",
+        "required": true,
+        "satisfied": false,
+        "scoring_mode": "presence",
+        "contribution": 0.0
+      }
+    ]
+  },
+  "impossible_reasons": [
+    {
+      "code": "no_reachable_modifier",
+      "want_index": 0,
+      "field_path": "/goals/0",
+      "message": "No enabled method can provide a modifier matching this required goal."
+    }
+  ]
+}

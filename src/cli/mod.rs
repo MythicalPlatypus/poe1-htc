@@ -1,31 +1,20 @@
-//! Command-line interface: argument parsing, goal loading, and the top-level
-//! `run()` that wires `GameData` + `GoalSpec` into `BeamSearch` and prints the
-//! resulting crafting plan.
+//! Command-line adapter: argument parsing, file/stdin loading, precedence
+//! resolution, and human-readable output around the reusable application
+//! service and search engine.
 
 use std::io::Read;
-use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
-use crate::currency::{
-    bench::RemoveCraftedMods,
-    fracturing::FracturingOrb,
-    orbs::{
-        ChaosOrb, DivineOrb, ExaltedOrb, OrbOfAlchemy, OrbOfAlteration, OrbOfAnnulment,
-        OrbOfAugmentation, OrbOfScouring, OrbOfTransmutation, RegalOrb,
-    },
-    CraftingMethod, Repriced,
+use crate::app::{
+    AppErrorCode, AppWarning, BudgetPolicy, EvaluatedSearchResult, GoalSetRequest,
+    MethodAccessPolicy, MethodSetRequest, MethodSummary, OptimizeOutcome, OptimizeRequest,
+    OptimizerService, PathStatus, PreparationSummary, PriceBook, SearchRequest,
+    StartingItemRequest,
 };
 use crate::data::GameData;
-use crate::goal::GoalSpec;
-use crate::search::beam::{BeamConfig, BeamSearch, SearchResult};
-
-// Built-in defaults, lowest precedence (CLI flag > goal [search] > these).
-const DEFAULT_BEAM_WIDTH: usize = 50;
-const DEFAULT_MAX_STEPS: usize = 10;
-const DEFAULT_COST_WEIGHT: f64 = 0.0;
-const DEFAULT_RESTART_COST: f64 = 1.0;
+use crate::goal::{GoalSpec, SearchSpec};
 
 #[derive(Parser, Debug)]
 #[command(name = "poe1_htc", about = "Path of Exile 1 crafting path optimizer")]
@@ -82,6 +71,15 @@ pub struct Args {
     /// Overrides the goal file's [search] top.
     #[arg(long)]
     pub top: Option<usize>,
+
+    /// Maximum concrete successor states generated before returning partial
+    /// results from the last completed depth.
+    #[arg(long)]
+    pub expansion_limit: Option<u64>,
+
+    /// Wall-clock search limit in milliseconds.
+    #[arg(long)]
+    pub timeout_ms: Option<u64>,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -94,12 +92,21 @@ pub fn run(args: Args) -> Result<()> {
         bail!("--item-file cannot be combined with --base-item");
     }
 
-    let db = crate::data::loader::load_all(&args.data_dir)?;
+    let service = OptimizerService::from_loaded(crate::data::loader::load_all_with_provenance(
+        &args.data_dir,
+    )?);
+    let db = service.game_data();
     println!(
         "Loaded {} mods, {} base items from {}",
         db.mods.len(),
         db.base_items.len(),
         args.data_dir
+    );
+    let provenance = service.data_provenance();
+    println!(
+        "Data provenance: RePoE version {}, fingerprint {}",
+        provenance.repoe_version().unwrap_or("unknown"),
+        provenance.fingerprint()
     );
     let available_catalogs = [
         db.crafting_bench
@@ -131,189 +138,125 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     let goal = GoalSpec::load(goal_path)?;
-    goal.validate_against_db(&db)?;
+    let resolved_search = resolve_search_request(&args, &goal.search);
+    let GoalSpec {
+        mut item,
+        wants,
+        methods,
+        prices,
+        search: _,
+    } = goal;
 
-    let imported_start = args.item_file.is_some();
-    let (base_id, base, imported_initial) = if let Some(item_path) = args.item_file.as_deref() {
-        let item_text = read_item_text(item_path)?;
-        let imported = crate::import::import_item_text(
-            &item_text,
-            &db,
-            crate::import::ImportOptions {
-                fallback_item_level: Some(goal.item.item_level),
-                strict: true,
-            },
-        )
-        .with_context(|| format!("Failed to import item from {item_path}"))?;
-
-        if !imported.warnings.is_empty() {
-            println!("\nImport warnings:");
-            for warning in &imported.warnings {
-                println!("  - [{}] {}", warning.code, warning.message);
+    let item_path = args.item_file.as_deref();
+    let starting_item = if let Some(item_path) = item_path {
+        StartingItemRequest::ImportedText {
+            text: read_item_text(item_path)?,
+            fallback_item_level: Some(item.item_level),
+        }
+    } else {
+        if let Some(base_override) = &args.base_item {
+            item.base.clone_from(base_override);
+        }
+        StartingItemRequest::Described(item)
+    };
+    let request = OptimizeRequest {
+        starting_item,
+        goals: GoalSetRequest { wants },
+        methods: MethodSetRequest {
+            configured: methods,
+            access: MethodAccessPolicy::LegacyDefaultsAndConfigured,
+            price_overrides: PriceBook::new(),
+        },
+        budget: BudgetPolicy::default(),
+        search: resolved_search,
+    };
+    let prepared = service.prepare(request).map_err(|error| {
+        if error.code() == AppErrorCode::ItemImportFailed {
+            if let Some(item_path) = item_path {
+                return anyhow::Error::new(error)
+                    .context(format!("Failed to import item from {item_path}"));
             }
         }
-
-        let (base_id, base) = resolve_base_item(&db, &imported.base_name)?;
-        let initial =
-            crate::goal::build_imported_state(&imported, base_id.clone(), base.tags.clone(), &db)?;
-        (base_id, base, Some(initial))
-    } else {
-        // CLI --base-item overrides the goal file's [item] base.
-        let base_query = args.base_item.as_deref().unwrap_or(&goal.item.base);
-        let (base_id, base) = resolve_base_item(&db, base_query)?;
-        (base_id, base, None)
-    };
-    let starting_item_level = imported_initial
-        .as_ref()
-        .map_or(goal.item.item_level, |state| state.item_level);
-    println!(
-        "Base item: {} ({}), item level {}",
-        base.name, base_id, starting_item_level
+        anyhow::Error::new(error)
+    })?;
+    let (price_overrides, price_warnings) =
+        resolve_legacy_price_overrides(&prices, &prepared.summary().effective_methods)?;
+    let prepared = service.reprice_prepared(prepared, price_overrides)?;
+    print_preparation(
+        prepared.summary(),
+        prepared.initial_state(),
+        &price_warnings,
     );
 
-    let config = BeamConfig {
-        beam_width: args
-            .beam_width
-            .or(goal.search.beam_width)
-            .unwrap_or(DEFAULT_BEAM_WIDTH),
-        max_steps: args
-            .max_steps
-            .or(goal.search.max_steps)
-            .unwrap_or(DEFAULT_MAX_STEPS),
-        cost_weight: args
-            .cost_weight
-            .or(goal.search.cost_weight)
-            .unwrap_or(DEFAULT_COST_WEIGHT),
-        restart_cost: args
-            .restart_cost
-            .or(goal.search.restart_cost)
-            .unwrap_or(DEFAULT_RESTART_COST),
-        seed: args.seed.or(goal.search.seed),
-    };
-    if config.beam_width == 0 {
-        bail!("beam_width must be greater than 0");
-    }
-    if config.max_steps == 0 {
-        bail!("max_steps must be greater than 0");
-    }
-    if config.cost_weight < 0.0 || !config.cost_weight.is_finite() {
-        bail!("cost_weight must be a non-negative finite number");
-    }
-    if config.restart_cost < 0.0 || !config.restart_cost.is_finite() {
-        bail!("restart_cost must be a non-negative finite number");
-    }
+    let response = service.optimize_prepared(prepared)?;
     println!(
-        "Search: beam_width={}, max_steps={}, cost_weight={}, restart_cost={}c{}",
-        config.beam_width,
-        config.max_steps,
-        config.cost_weight,
-        config.restart_cost,
-        match config.seed {
-            Some(s) => format!(", seed={s}"),
-            None => String::new(),
-        }
+        "\nSearch finished: {} after {} generation(s), {} ms; resolved seed {}",
+        response.termination.reason.as_str(),
+        response.termination.snapshot.completed_generations,
+        response.termination.snapshot.elapsed_ms,
+        response.resolved_seed
     );
-
-    // Default orbs + any extra methods declared in the goal file.
-    let mut methods = default_methods();
-    for spec in &goal.methods {
-        methods.push(spec.build_for_item(&db, base, starting_item_level)?);
-    }
-    let mut method_names = std::collections::HashSet::new();
-    for method in &methods {
-        if !method_names.insert(method.name()) {
-            bail!(
-                "Duplicate crafting method name '{}'; give configured methods unique names",
-                method.name()
+    if response.outcome == OptimizeOutcome::Impossible {
+        println!("Required goals are provably impossible:");
+        for reason in &response.impossible_reasons {
+            println!(
+                "  - [{} at {}] {}",
+                reason.code.as_str(),
+                reason.field_path,
+                reason.message
             );
         }
+        return Ok(());
     }
-    if !goal.methods.is_empty() {
-        let names: Vec<&str> = methods[methods.len() - goal.methods.len()..]
-            .iter()
-            .map(|m| m.name())
-            .collect();
-        println!("Goal methods: {}", names.join(", "));
-    }
-
-    // Apply [prices] cost overrides by display name.
-    let mut unmatched_prices: Vec<&String> = goal.prices.keys().collect();
-    let methods: Vec<Arc<dyn CraftingMethod>> = methods
-        .into_iter()
-        .map(|m| match goal.prices.get(m.name()) {
-            Some(&cost) => {
-                unmatched_prices.retain(|n| n.as_str() != m.name());
-                println!("Price override: {} = {cost} chaos", m.name());
-                Arc::new(Repriced { inner: m, cost }) as Arc<dyn CraftingMethod>
-            }
-            None => m,
-        })
-        .collect();
-    for name in unmatched_prices {
-        println!("Warning: [prices] \"{name}\" matches no method name — ignored");
-    }
-
-    let initial = match imported_initial {
-        Some(initial) => initial,
-        None => goal
-            .item
-            .build_state(base_id.clone(), base.tags.clone(), &db)?,
-    };
-    if imported_start || !goal.item.mods.is_empty() {
-        println!(
-            "Starting item: {:?} with {} existing mod(s) ({} fractured, crafted: {})",
-            initial.rarity,
-            initial.mod_count(),
-            initial.fractured.len(),
-            initial.crafted_mod.is_some()
-        );
-    }
-    let starting_score = goal.score(&initial, &db);
-
-    let top = args.top.or(goal.search.top).unwrap_or(1);
-    if top == 0 {
-        bail!("top must be greater than 0");
-    }
-    let search = BeamSearch::new(config, &db, methods);
-    let results = search.run_k_to_target(initial, |s| goal.score(s, &db), top, goal.max_score());
-
-    match results.first() {
+    match response.results.first() {
         Some(best) => {
-            if !best.warnings.is_empty() {
+            if !best.result.warnings.is_empty() {
                 println!("\nSearch warnings (affected branches were skipped):");
-                for warning in &best.warnings {
+                for warning in &best.result.warnings {
                     println!("  - {warning}");
                 }
             }
-            print_result(best, &goal, &db);
-            for (i, alt) in results.iter().enumerate().skip(1) {
-                let raw_score = goal.score(&alt.state, &db);
-                let satisfied = goal.satisfied_count(&alt.state, &db);
-                let risk = if alt.steps.iter().any(|step| !step.repeatable) {
-                    format!("one-shot odds {}", fmt_prob(alt.success_prob))
+            print_result(best, db);
+            for (i, alt) in response.results.iter().enumerate().skip(1) {
+                let result = &alt.result;
+                let risk = if result.steps.iter().any(|step| !step.repeatable) {
+                    format!("one-shot odds {}", fmt_prob(result.success_prob))
                 } else {
                     "rerolls only".to_string()
                 };
+                let goal_score = fmt_goal_score(alt.raw_score, alt.max_score);
                 println!(
-                    "\n--- Alternative pathway #{} (goal {:.1}/{:.1}, {}/{} wants, ranking {:.3}, retry ~{:.1}c, restart ~{:.1}c, {}) ---",
+                    "\n--- Alternative pathway #{} ({}, goal {}, {}/{} required, {}/{} total wants, ranking {:.3}, retry ~{:.1}c, restart ~{:.1}c, {}) ---",
                     i + 1,
-                    raw_score,
-                    goal.max_score(),
-                    satisfied,
-                    goal.wants.len(),
-                    alt.score,
-                    alt.expected_cost,
-                    alt.restart_cost,
+                    alt.status.as_str(),
+                    goal_score,
+                    alt.satisfied_required_count,
+                    alt.required_goal_count,
+                    alt.satisfied_count,
+                    alt.goal_count,
+                    result.score,
+                    result.expected_cost,
+                    result.restart_cost,
                     risk
                 );
-                let names: Vec<&str> = alt.steps.iter().map(|s| s.method.as_str()).collect();
+                let names: Vec<&str> = result
+                    .steps
+                    .iter()
+                    .map(|step| step.method.as_str())
+                    .collect();
                 println!("  {}", names.join(", then "));
             }
-            let best_raw_score = goal.score(&best.state, &db);
-            if starting_score >= best_raw_score {
+            let starting_complete = response.starting_evaluation.complete();
+            if goal_evaluation_at_least(
+                starting_complete,
+                response.starting_score,
+                best.complete,
+                best.raw_score,
+            ) {
                 println!(
-                    "\nNote: the starting item already scores {starting_score:.1}; \
-                     no found path improves its raw goal score."
+                    "\nNote: the starting item already scores {:.1}; \
+                     no found path improves its required-completion and raw-score objective.",
+                    response.starting_score
                 );
             }
         }
@@ -322,6 +265,19 @@ pub fn run(args: Args) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn goal_evaluation_at_least(
+    complete: bool,
+    raw_score: f64,
+    other_complete: bool,
+    other_raw_score: f64,
+) -> bool {
+    match (complete, other_complete) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => raw_score >= other_raw_score,
+    }
 }
 
 fn read_item_text(path: &str) -> Result<String> {
@@ -337,6 +293,133 @@ fn read_item_text(path: &str) -> Result<String> {
     }
 }
 
+fn resolve_search_request(args: &Args, goal: &SearchSpec) -> SearchRequest {
+    let defaults = SearchRequest::default();
+    SearchRequest {
+        beam_width: args
+            .beam_width
+            .or(goal.beam_width)
+            .unwrap_or(defaults.beam_width),
+        max_steps: args
+            .max_steps
+            .or(goal.max_steps)
+            .unwrap_or(defaults.max_steps),
+        cost_weight: args
+            .cost_weight
+            .or(goal.cost_weight)
+            .unwrap_or(defaults.cost_weight),
+        restart_cost: args
+            .restart_cost
+            .or(goal.restart_cost)
+            .unwrap_or(defaults.restart_cost),
+        seed: args.seed.or(goal.seed),
+        top: args.top.or(goal.top).unwrap_or(defaults.top),
+        expansion_limit: args.expansion_limit.or(goal.expansion_limit),
+        timeout_ms: args.timeout_ms.or(goal.timeout_ms),
+    }
+}
+
+fn resolve_legacy_price_overrides(
+    prices: &std::collections::HashMap<String, f64>,
+    methods: &[MethodSummary],
+) -> Result<(PriceBook, Vec<AppWarning>)> {
+    let mut price_book = PriceBook::new();
+    let mut unmatched_names = prices.keys().cloned().collect::<Vec<_>>();
+
+    for method in methods {
+        if let Some(&cost) = prices.get(&method.display_name) {
+            price_book.set(method.id.clone(), cost)?;
+            unmatched_names.retain(|name| name != &method.display_name);
+        }
+    }
+
+    unmatched_names.sort_unstable();
+    let warnings = unmatched_names
+        .into_iter()
+        .map(|name| AppWarning::unmatched_price_override(&name))
+        .collect();
+
+    Ok((price_book, warnings))
+}
+
+fn print_preparation(
+    summary: &PreparationSummary,
+    initial: &crate::item::ItemState,
+    price_warnings: &[AppWarning],
+) {
+    if !summary.import_warnings.is_empty() {
+        println!("\nImport warnings:");
+        for warning in &summary.import_warnings {
+            println!("  - [{}] {}", warning.code, warning.message);
+        }
+    }
+    for warning in &summary.base_warnings {
+        println!("Warning: {}", warning.message());
+    }
+    for warning in &summary.goal_warnings {
+        println!(
+            "Warning: [{} at {}] {}",
+            warning.code.as_str(),
+            warning.field_path,
+            warning.message
+        );
+    }
+    println!(
+        "Base item: {} ({}), item level {}",
+        summary.base_name, summary.base_id, summary.item_level
+    );
+    println!(
+        "Search: beam_width={}, max_steps={}, cost_weight={}, restart_cost={}c{}",
+        summary.search.beam_width,
+        summary.search.max_steps,
+        summary.search.cost_weight,
+        summary.search.restart_cost,
+        match summary.search.seed {
+            Some(seed) => format!(", seed={seed}"),
+            None => String::new(),
+        }
+    );
+    match summary.budget.hard_cap_chaos() {
+        Some(cap) => println!(
+            "Budget: {cap}c hard cap on {} cost",
+            summary.budget.metric().as_str()
+        ),
+        None => println!(
+            "Budget: unbounded ({} cost shown for comparison)",
+            summary.budget.metric().as_str()
+        ),
+    }
+    if !summary.configured_methods.is_empty() {
+        println!(
+            "Goal methods: {}",
+            summary
+                .configured_methods
+                .iter()
+                .map(|method| method.display_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    for price in &summary.applied_price_overrides {
+        println!(
+            "Price override: {} = {} chaos",
+            price.method_name, price.cost
+        );
+    }
+    for warning in price_warnings {
+        println!("Warning: {}", warning.message());
+    }
+    if summary.report_starting_item {
+        println!(
+            "Starting item: {:?} with {} existing mod(s) ({} fractured, crafted: {})",
+            initial.rarity,
+            initial.mod_count(),
+            initial.fractured.len(),
+            initial.crafted_mod.is_some()
+        );
+    }
+}
+
 /// Human-readable probability: percentages down to 0.1%, then "~1 in N" so
 /// mirror-tier lottery odds don't collapse to "0.0%".
 fn fmt_prob(p: f64) -> String {
@@ -349,78 +432,40 @@ fn fmt_prob(p: f64) -> String {
     }
 }
 
-/// The default orb set offered to every search. Essences, fossils, harvest,
-/// bench, and eldritch methods need per-instance configuration and are added
-/// via the goal file's [[methods] ] entries.
-fn default_methods() -> Vec<Arc<dyn CraftingMethod>> {
-    vec![
-        Arc::new(OrbOfScouring),
-        Arc::new(OrbOfTransmutation),
-        Arc::new(OrbOfAlteration),
-        Arc::new(OrbOfAugmentation),
-        Arc::new(RegalOrb),
-        Arc::new(OrbOfAlchemy),
-        Arc::new(ChaosOrb),
-        Arc::new(ExaltedOrb),
-        Arc::new(OrbOfAnnulment),
-        Arc::new(DivineOrb),
-        Arc::new(FracturingOrb),
-        Arc::new(RemoveCraftedMods),
-    ]
-}
-
-/// Resolve `query` to a base item: first as an exact RePoE metadata ID,
-/// then as a case-insensitive display-name match. Ambiguous names resolve to
-/// the lexicographically smallest ID (deterministic) with a warning.
-fn resolve_base_item<'db>(
-    db: &'db GameData,
-    query: &str,
-) -> Result<(String, &'db crate::data::base_items::BaseItem)> {
-    if let Some(base) = db.base_items.get(query) {
-        return Ok((query.to_string(), base));
+fn fmt_goal_score(score: f64, maximum: Option<f64>) -> String {
+    match maximum {
+        Some(maximum) => format!("{score:.1}/{maximum:.1}"),
+        None => format!("{score:.1}/unbounded"),
     }
-
-    let query_lower = query.to_lowercase();
-    let mut matches: Vec<(&String, &crate::data::base_items::BaseItem)> = db
-        .base_items
-        .iter()
-        .filter(|(_, b)| b.name.to_lowercase() == query_lower)
-        .collect();
-    matches.sort_by_key(|(id, _)| id.as_str().to_string());
-
-    match matches.len() {
-        0 => bail!(
-            "Base item '{query}' not found (tried exact ID match and case-insensitive name match)"
-        ),
-        1 => {}
-        n => println!(
-            "Warning: {n} base items share the name '{query}'; using {} (pass the metadata ID to disambiguate)",
-            matches[0].0
-        ),
-    }
-    let (id, base) = matches[0];
-    Ok((id.clone(), base))
 }
 
 /// Pretty-print the winning path with retry economics, the final item, and
 /// goal satisfaction.
-fn print_result(result: &SearchResult, goal: &GoalSpec, db: &GameData) {
-    let raw_score = goal.score(&result.state, db);
-    let satisfied = goal.satisfied_count(&result.state, db);
-    let status = if goal.is_complete(&result.state, db) {
-        "COMPLETE"
-    } else {
-        "INCOMPLETE"
+fn print_result(evaluated: &EvaluatedSearchResult, db: &GameData) {
+    let result = &evaluated.result;
+    let status = match evaluated.status {
+        PathStatus::Complete => "COMPLETE",
+        PathStatus::Incomplete => "INCOMPLETE",
+        PathStatus::OverBudget => "COMPLETE, OVER BUDGET",
     };
+    let goal_score = fmt_goal_score(evaluated.raw_score, evaluated.max_score);
     println!(
-        "\n=== Best crafting path: target {status} ({satisfied}/{} wants, goal score {:.1}/{:.1}, ranking score {:.3}) ===",
-        goal.wants.len(),
-        raw_score,
-        goal.max_score(),
+        "\n=== Best crafting path: target {status} ({}/{} required, {}/{} total wants, goal score {}, ranking score {:.3}) ===",
+        evaluated.satisfied_required_count,
+        evaluated.required_goal_count,
+        evaluated.satisfied_count,
+        evaluated.goal_count,
+        goal_score,
         result.score
     );
     if result.steps.is_empty() {
         println!("(the starting item already scores best)");
+    }
+    if let Some(excess) = result.budget_excess {
+        let excess = excess
+            .amount_chaos()
+            .map_or_else(|| "unbounded".to_string(), |value| format!("{value:.1}c"));
+        println!("Budget excess: {excess}");
     }
     let mut any_estimate = false;
     for (i, step) in result.steps.iter().enumerate() {
@@ -545,9 +590,22 @@ fn print_result(result: &SearchResult, goal: &GoalSpec, db: &GameData) {
     }
 
     println!("\n--- Goal satisfaction ---");
-    for (desc, satisfied) in goal.report(&result.state, db) {
-        let mark = if satisfied { "[x]" } else { "[ ]" };
-        println!("  {mark} {desc}");
+    for entry in &evaluated.report {
+        let mark = if entry.satisfied { "[x]" } else { "[ ]" };
+        let kind = if entry.required {
+            "required"
+        } else {
+            "preferred"
+        };
+        let attained = entry
+            .attained
+            .map_or_else(|| "n/a".to_string(), |value| value.to_string());
+        println!(
+            "  {mark} [{kind}, {}, attained={attained}, contribution={:.3}] {}",
+            entry.scoring_mode.as_str(),
+            entry.contribution,
+            entry.description
+        );
     }
 }
 
@@ -573,7 +631,26 @@ fn print_mod_list(label: &str, mods: &[crate::item::Modifier], db: &GameData) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+
+    fn method_summary(id: &str, display_name: &str) -> MethodSummary {
+        MethodSummary {
+            id: crate::currency::MethodId::parse(id).expect("test method ID should be valid"),
+            display_name: display_name.to_string(),
+            family: if id.starts_with("bench/") {
+                crate::currency::MethodFamily::Bench
+            } else {
+                crate::currency::MethodFamily::Currency
+            },
+            description: "Legacy pricing test method.".to_string(),
+            default_price_chaos: Some(1.0),
+            setup: crate::currency::MethodSetup::BuiltIn,
+            item_class_support: crate::currency::ItemClassSupport::AnyCraftable,
+            probability_model: crate::currency::ProbabilityModel::Exact,
+        }
+    }
 
     #[test]
     fn item_file_requires_goal() {
@@ -605,5 +682,143 @@ mod tests {
         ])
         .expect_err("an imported item has an authoritative base");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn search_settings_keep_cli_then_goal_then_default_precedence() {
+        let defaults = Args::try_parse_from(["poe1_htc", "--goal", "goal.toml"])
+            .expect("minimal goal arguments should parse");
+        assert_eq!(
+            resolve_search_request(&defaults, &SearchSpec::default()),
+            SearchRequest::default()
+        );
+
+        let goal_search = SearchSpec {
+            beam_width: Some(20),
+            max_steps: Some(7),
+            cost_weight: Some(0.25),
+            restart_cost: Some(3.0),
+            seed: Some(11),
+            top: Some(4),
+            expansion_limit: Some(1_000),
+            timeout_ms: Some(5_000),
+        };
+        assert_eq!(
+            resolve_search_request(&defaults, &goal_search),
+            SearchRequest {
+                beam_width: 20,
+                max_steps: 7,
+                cost_weight: 0.25,
+                restart_cost: 3.0,
+                seed: Some(11),
+                top: 4,
+                expansion_limit: Some(1_000),
+                timeout_ms: Some(5_000),
+            }
+        );
+
+        let cli = Args::try_parse_from([
+            "poe1_htc",
+            "--goal",
+            "goal.toml",
+            "--beam-width",
+            "30",
+            "--max-steps",
+            "9",
+            "--cost-weight",
+            "0.5",
+            "--restart-cost",
+            "8",
+            "--seed",
+            "42",
+            "--top",
+            "6",
+        ])
+        .expect("search overrides should parse");
+        assert_eq!(
+            resolve_search_request(&cli, &goal_search),
+            SearchRequest {
+                beam_width: 30,
+                max_steps: 9,
+                cost_weight: 0.5,
+                restart_cost: 8.0,
+                seed: Some(42),
+                top: 6,
+                expansion_limit: Some(1_000),
+                timeout_ms: Some(5_000),
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_prices_match_effective_methods() {
+        let chaos = method_summary("currency/chaos", "Chaos Orb");
+        let bench = method_summary("bench/craft/life", "Bench: Maximum Life");
+        let prices = HashMap::from([
+            ("Chaos Orb".to_string(), 2.5),
+            ("Bench: Maximum Life".to_string(), 8.0),
+        ]);
+
+        let (price_book, warnings) =
+            resolve_legacy_price_overrides(&prices, &[bench.clone(), chaos.clone()])
+                .expect("valid legacy prices should adapt");
+
+        assert_eq!(price_book.get(&chaos.id), Some(2.5));
+        assert_eq!(price_book.get(&bench.id), Some(8.0));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn legacy_price_warnings_are_sorted_by_unmatched_name() {
+        let prices = HashMap::from([("Zulu".to_string(), 3.0), ("Alpha".to_string(), 2.0)]);
+
+        let (price_book, warnings) =
+            resolve_legacy_price_overrides(&prices, &[]).expect("valid prices should adapt");
+
+        assert!(price_book.is_empty());
+        assert!(warnings.iter().all(|warning| {
+            warning.code() == crate::app::AppWarningCode::UnmatchedPriceOverride
+        }));
+        assert_eq!(
+            warnings.iter().map(AppWarning::message).collect::<Vec<_>>(),
+            [
+                "[prices] \"Alpha\" matches no method name — ignored",
+                "[prices] \"Zulu\" matches no method name — ignored",
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_prices_use_case_sensitive_display_names_not_method_ids() {
+        let chaos = method_summary("currency/chaos", "Chaos Orb");
+        let prices = HashMap::from([
+            ("Chaos Orb".to_string(), 2.5),
+            ("chaos orb".to_string(), 3.0),
+            ("currency/chaos".to_string(), 4.0),
+        ]);
+
+        let (price_book, warnings) =
+            resolve_legacy_price_overrides(&prices, std::slice::from_ref(&chaos))
+                .expect("valid prices should adapt");
+
+        assert_eq!(price_book.get(&chaos.id), Some(2.5));
+        assert!(warnings.iter().all(|warning| {
+            warning.code() == crate::app::AppWarningCode::UnmatchedPriceOverride
+        }));
+        assert_eq!(
+            warnings.iter().map(AppWarning::message).collect::<Vec<_>>(),
+            [
+                "[prices] \"chaos orb\" matches no method name — ignored",
+                "[prices] \"currency/chaos\" matches no method name — ignored",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_improvement_note_uses_completion_before_preference_score() {
+        assert!(goal_evaluation_at_least(true, 1.0, false, 100.0));
+        assert!(!goal_evaluation_at_least(false, 100.0, true, 1.0));
+        assert!(goal_evaluation_at_least(true, 5.0, true, 5.0));
+        assert!(!goal_evaluation_at_least(true, 4.0, true, 5.0));
     }
 }

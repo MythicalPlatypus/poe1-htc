@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "engine": {
+    "version": "0.1.0"
+  },
+  "data": {
+    "repoe_version": "fixture-v1",
+    "fingerprint": "repoe-bundle-v1:sha256:complete"
+  },
+  "search": {
+    "beam_width": 4,
+    "max_steps": 2,
+    "cost_weight": 0.0,
+    "restart_cost": 1.0,
+    "seed": "42",
+    "top": 1
+  },
+  "effective_limits": {},
+  "budget": {
+    "kind": "unbounded",
+    "metric": "restart_adjusted_expected"
+  },
+  "resolved_seed": "42",
+  "outcome": "complete",
+  "termination": {
+    "reason": "target_reached",
+    "snapshot": {
+      "elapsed_ms": 1,
+      "completed_generations": 0,
+      "max_steps": 2,
+      "states_generated": 0,
+      "states_retained": 0,
+      "current_beam_size": 1,
+      "best_score": 1.0,
+      "complete_result_existed": true
+    }
+  },
+  "methods": [],
+  "initial_item": {
+    "base_id": "Metadata/Items/TestPlate",
+    "base_name": "Test Plate",
+    "base_tags": [
+      "body_armour"
+    ],
+    "item_level": 86,
+    "rarity": "rare",
+    "prefixes": [],
+    "suffixes": [],
+    "fractured": [],
+    "corrupted": false,
+    "mirrored": false,
+    "quality": 0
+  },
+  "starting_goal": {
+    "score": 1.0,
+    "maximum_score": 1.0,
+    "satisfied_count": 1,
+    "goal_count": 1,
+    "satisfied_required_count": 1,
+    "required_goal_count": 1,
+    "complete": true,
+    "report": [
+      {
+        "description": "Test target",
+        "required": true,
+        "satisfied": true,
+        "scoring_mode": "presence",
+        "contribution": 1.0
+      }
+    ]
+  },
+  "paths": [
+    {
+      "status": "complete",
+      "goal": {
+        "score": 1.0,
+        "maximum_score": 1.0,
+        "satisfied_count": 1,
+        "goal_count": 1,
+        "satisfied_required_count": 1,
+        "required_goal_count": 1,
+        "complete": true,
+        "report": [
+          {
+            "description": "Test target",
+            "required": true,
+            "satisfied": true,
+            "scoring_mode": "presence",
+            "contribution": 1.0
+          }
+        ]
+      },
+      "ranking_score": {
+        "kind": "finite",
+        "value": 1.0
+      },
+      "final_item": {
+        "base_id": "Metadata/Items/TestPlate",
+        "base_name": "Test Plate",
+        "base_tags": [
+          "body_armour"
+        ],
+        "item_level": 86,
+        "rarity": "rare",
+        "prefixes": [],
+        "suffixes": [],
+        "fractured": [],
+        "corrupted": false,
+        "mirrored": false,
+        "quality": 0
+      },
+      "steps": [],
+      "one_shot_success_probability": 1.0,
+      "costs": {
+        "first_try": {
+          "value": {
+            "kind": "finite",
+            "amount_chaos": 0.0
+          },
+          "comparison": "not_comparable"
+        },
+        "retry_expected": {
+          "value": {
+            "kind": "finite",
+            "amount_chaos": 0.0
+          },
+          "comparison": "not_comparable"
+        },
+        "restart_adjusted_expected": {
+          "value": {
+            "kind": "finite",
+            "amount_chaos": 0.0
+          },
+          "comparison": "not_comparable"
+        }
+      }
+    }
+  ]
+}

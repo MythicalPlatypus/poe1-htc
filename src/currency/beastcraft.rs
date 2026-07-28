@@ -11,7 +11,7 @@
 use anyhow::{bail, Result};
 use rand::RngCore;
 
-use super::CraftingMethod;
+use super::{CraftingMethod, MethodFamily, MethodId, MethodSetup, ProbabilityModel};
 use crate::data::mods::{GenerationType, ModStat};
 use crate::data::GameData;
 use crate::engine::mod_pool::{eligible_mods, random_rolls_pub};
@@ -26,6 +26,13 @@ pub enum BestiaryAffixSwapKind {
 }
 
 impl BestiaryAffixSwapKind {
+    fn id_token(self) -> &'static str {
+        match self {
+            Self::AddPrefixRemoveSuffix => "add-prefix-remove-suffix",
+            Self::AddSuffixRemovePrefix => "add-suffix-remove-prefix",
+        }
+    }
+
     fn source_type(self) -> GenerationType {
         match self {
             Self::AddPrefixRemoveSuffix => GenerationType::Suffix,
@@ -113,6 +120,34 @@ impl BestiaryAffixSwapCraft {
 }
 
 impl CraftingMethod for BestiaryAffixSwapCraft {
+    fn id(&self) -> MethodId {
+        let beast_level = self.beast_level.to_string();
+        MethodId::semantic(
+            "bestiary",
+            "affix-swap",
+            &[self.kind.id_token(), "beast-level", &beast_level],
+        )
+    }
+
+    fn family(&self) -> MethodFamily {
+        MethodFamily::Bestiary
+    }
+
+    fn description(&self) -> &str {
+        match self.kind {
+            BestiaryAffixSwapKind::AddPrefixRemoveSuffix => {
+                "Removes one random suffix and adds one prefix using the configured beast level."
+            }
+            BestiaryAffixSwapKind::AddSuffixRemovePrefix => {
+                "Removes one random prefix and adds one suffix using the configured beast level."
+            }
+        }
+    }
+
+    fn setup(&self) -> MethodSetup {
+        MethodSetup::Configured
+    }
+
     fn name(&self) -> &str {
         self.kind.display_name()
     }
@@ -178,6 +213,10 @@ impl CraftingMethod for BestiaryAffixSwapCraft {
 
     fn weights_are_probabilities(&self) -> bool {
         false
+    }
+
+    fn probability_model(&self) -> ProbabilityModel {
+        ProbabilityModel::ExactIdentitySampledRolls
     }
 }
 

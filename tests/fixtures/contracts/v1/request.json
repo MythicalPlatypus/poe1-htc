@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "starting_item": {
+    "kind": "described",
+    "item": {
+      "base": "Astral Plate",
+      "item_level": 86,
+      "rarity": "rare",
+      "mods": [
+        {
+          "mod_id": "IncreasedLife9",
+          "values": [
+            101
+          ],
+          "fractured": true,
+          "crafted": false
+        }
+      ]
+    }
+  },
+  "goals": [
+    {
+      "group": "IncreasedLife",
+      "stat": "base_maximum_life",
+      "mode": "threshold",
+      "min_value": 90,
+      "weight": 10.0,
+      "required": true
+    },
+    {
+      "stat": "base_maximum_energy_shield",
+      "mode": "per_unit",
+      "cap": 300,
+      "weight": 0.25,
+      "required": false
+    }
+  ],
+  "methods": {
+    "configured": [
+      {
+        "type": "bench",
+        "name": "Craft life",
+        "mod_id": "EinharMasterAddedLife1",
+        "cost": 2.0
+      },
+      {
+        "type": "harvest",
+        "op": "reforge",
+        "target": "life",
+        "cost": 15.0
+      }
+    ],
+    "access": {
+      "kind": "explicit",
+      "selection": {
+        "enabled_families": [
+          "bench"
+        ],
+        "enabled_methods": [
+          "currency/chaos"
+        ],
+        "disabled_methods": [
+          "bench/remove-crafted"
+        ]
+      }
+    },
+    "price_overrides": [
+      {
+        "method_id": "currency/chaos",
+        "amount_chaos": 1.0
+      }
+    ]
+  },
+  "budget": {
+    "kind": "hard_cap",
+    "amount_chaos": 250.0,
+    "metric": "restart_adjusted_expected"
+  },
+  "search": {
+    "beam_width": 100,
+    "max_steps": 12,
+    "cost_weight": 0.05,
+    "restart_cost": 1.0,
+    "seed": "18446744073709551615",
+    "top": 3,
+    "expansion_limit": 100000,
+    "timeout_ms": 30000
+  }
+}

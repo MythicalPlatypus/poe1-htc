@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "engine": {
+    "version": "0.1.0"
+  },
+  "data": {
+    "fingerprint": "repoe-bundle-v1:sha256:sampled"
+  },
+  "search": {
+    "beam_width": 50,
+    "max_steps": 1,
+    "cost_weight": 0.0,
+    "restart_cost": 1.0,
+    "seed": "44",
+    "top": 1
+  },
+  "effective_limits": {},
+  "budget": {
+    "kind": "unbounded",
+    "metric": "restart_adjusted_expected"
+  },
+  "resolved_seed": "44",
+  "outcome": "complete",
+  "termination": {
+    "reason": "target_reached",
+    "snapshot": {
+      "elapsed_ms": 3,
+      "completed_generations": 1,
+      "max_steps": 1,
+      "states_generated": 50,
+      "states_retained": 0,
+      "current_beam_size": 0,
+      "best_score": 1.0,
+      "complete_result_existed": true
+    }
+  },
+  "methods": [
+    {
+      "id": "currency/chaos",
+      "display_name": "Chaos Orb",
+      "family": "currency",
+      "description": "Rerolls a rare item's explicit modifiers.",
+      "effective_price_chaos": 1.0,
+      "default_price_chaos": 1.0,
+      "price_overridden": false,
+      "setup": {
+        "kind": "built_in"
+      },
+      "item_class_support": "any_craftable",
+      "probability_model": {
+        "kind": "monte_carlo",
+        "samples": 50
+      }
+    }
+  ],
+  "initial_item": {
+    "base_id": "Metadata/Items/TestPlate",
+    "base_name": "Test Plate",
+    "base_tags": [
+      "body_armour"
+    ],
+    "item_level": 86,
+    "rarity": "rare",
+    "prefixes": [],
+    "suffixes": [],
+    "fractured": [],
+    "corrupted": false,
+    "mirrored": false,
+    "quality": 0
+  },
+  "starting_goal": {
+    "score": 0.0,
+    "maximum_score": 1.0,
+    "satisfied_count": 0,
+    "goal_count": 1,
+    "satisfied_required_count": 0,
+    "required_goal_count": 1,
+    "complete": false,
+    "report": [
+      {
+        "description": "Sampled target",
+        "required": true,
+        "satisfied": false,
+        "scoring_mode": "presence",
+        "contribution": 0.0
+      }
+    ]
+  },
+  "paths": [
+    {
+      "status": "complete",
+      "goal": {
+        "score": 1.0,
+        "maximum_score": 1.0,
+        "satisfied_count": 1,
+        "goal_count": 1,
+        "satisfied_required_count": 1,
+        "required_goal_count": 1,
+        "complete": true,
+        "report": [
+          {
+            "description": "Sampled target",
+            "required": true,
+            "satisfied": true,
+            "scoring_mode": "presence",
+            "contribution": 1.0
+          }
+        ]
+      },
+      "ranking_score": {
+        "kind": "finite",
+        "value": 1.0
+      },
+      "final_item": {
+        "base_id": "Metadata/Items/TestPlate",
+        "base_name": "Test Plate",
+        "base_tags": [
+          "body_armour"
+        ],
+        "item_level": 86,
+        "rarity": "rare",
+        "prefixes": [
+          {
+            "mod_id": "SampledPrefix",
+            "generation_type": "prefix",
+            "rolls": [
+              {
+                "stat_id": "base_maximum_life",
+                "value": 100
+              }
+            ]
+          }
+        ],
+        "suffixes": [],
+        "fractured": [],
+        "corrupted": false,
+        "mirrored": false,
+        "quality": 0
+      },
+      "steps": [
+        {
+          "method_id": "currency/chaos",
+          "display_name": "Chaos Orb",
+          "cost_per_application": {
+            "kind": "finite",
+            "amount_chaos": 1.0
+          },
+          "probability_at_least_this_good": 0.2,
+          "repeatable_on_failure": true,
+          "probability_is_estimate": true
+        }
+      ],
+      "one_shot_success_probability": 1.0,
+      "costs": {
+        "first_try": {
+          "value": {
+            "kind": "finite",
+            "amount_chaos": 1.0
+          },
+          "comparison": "not_comparable"
+        },
+        "retry_expected": {
+          "value": {
+            "kind": "finite",
+            "amount_chaos": 5.0
+          },
+          "comparison": "not_comparable"
+        },
+        "restart_adjusted_expected": {
+          "value": {
+            "kind": "finite",
+            "amount_chaos": 5.0
+          },
+          "comparison": "not_comparable"
+        }
+      }
+    }
+  ]
+}

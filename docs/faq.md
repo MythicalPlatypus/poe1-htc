@@ -20,6 +20,12 @@ If your data lives elsewhere, point at it with `--data-dir <path>`.
 A download was truncated or an old export is in place. Re-download; each
 file should be several megabytes.
 
+**`Invalid RePoE version in .../repoe-version.txt`**
+The optional version sidecar is empty, is not UTF-8, or contains an internal
+control character. Replace it with the single trusted release value for this
+bundle, or remove it; the optimizer will then report the version as `unknown`
+while still reporting the bundle fingerprint.
+
 ## Running
 
 **It's very slow.**
@@ -35,9 +41,11 @@ for how to judge whether a plan is robust.
 
 **`No crafting path found — no method was applicable to the starting item.`**
 The starting item accepts none of the available methods. Typical causes:
-the item is corrupted or mirrored, every relevant modifier pool is empty, or
-none of the configured special methods can fire. Unique starts are rejected
-during validation rather than reaching this message.
+every relevant modifier pool is empty or none of the configured special
+methods can fire. An unsatisfied required goal on a corrupted or mirrored item
+is now conservatively proven before search and returned as a normal
+`impossible` result with an `item_not_craftable` reason. Unique starts are
+rejected during validation.
 
 **Why does it recommend Chaos-spamming instead of something clever?**
 With the default method set, that often *is* the cheapest route. Give the

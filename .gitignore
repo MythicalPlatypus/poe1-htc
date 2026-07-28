@@ -1,5 +1,6 @@
 /target
 data/*.json
+data/repoe-version.txt
 .idea/
 .cargo/
 .claude/

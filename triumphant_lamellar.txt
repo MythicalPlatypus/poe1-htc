@@ -1,0 +1,27 @@
+Item Class: Body Armours
+Rarity: Rare
+Behemoth Carapace
+Triumphant Lamellar
+--------
+Quality: +20% (augmented)
+Armour: 476 (augmented)
+Evasion Rating: 641 (augmented)
+--------
+Requirements:
+Level: 69
+Str: 95
+Dex: 116
+--------
+Sockets: W-W-W-W-W-W 
+--------
+Item Level: 77
+--------
+{ Prefix Modifier "Fawn's" (Tier: 3) — Life, Defences, Evasion }
++36(21-42) to Evasion Rating
++25(24-28) to maximum Life
+{ Suffix Modifier "of the Titan" (Tier: 2) — Attribute }
++48(43-50) to Strength
+{ Suffix Modifier "of the Maelstrom" (Tier: 3) — Elemental, Lightning, Resistance }
++36(36-41)% to Lightning Resistance
+{ Suffix Modifier "of the Ice" (Tier: 2) — Elemental, Cold, Resistance }
++44(42-45)% to Cold Resistance

@@ -1,0 +1,245 @@
+# goals/triumphant_lamellar.toml
+
+[item]
+base = "Triumphant Lamellar"
+item_level = 77
+rarity = "normal"
+
+# Hunter influence can produce Spell Critical Strike Chance and % maximum Life.
+[[methods]]
+type = "conqueror_exalt"
+influence = "hunter"
+
+# Highest dual-resistance bench crafts available at item level 77.
+[[methods]]
+type = "bench"
+name = "Bench: Fire and Cold Resistances"
+mod_id = "EinharMasterFireAndColdResist3"
+cost = 3.0
+
+[[methods]]
+type = "bench"
+name = "Bench: Cold and Lightning Resistances"
+mod_id = "EinharMasterColdAndLightningResist3_"
+cost = 3.0
+
+[[methods]]
+type = "bench"
+name = "Bench: Fire and Lightning Resistances"
+mod_id = "EinharMasterFireAndLightningResist3_"
+cost = 3.0
+
+# Hybrid elemental/chaos bench alternatives.
+[[methods]]
+type = "bench"
+name = "Bench: Cold and Chaos Resistances"
+mod_id = "JunMaster2ColdAndChaosDamageResistance2_"
+cost = 2.0
+
+[[methods]]
+type = "bench"
+name = "Bench: Lightning and Chaos Resistances"
+mod_id = "JunMaster2LightningAndChaosDamageResistance2_"
+cost = 2.0
+
+[[methods]]
+type = "bench"
+name = "Bench: Fire and Chaos Resistances"
+mod_id = "JunMaster2FireAndChaosDamageResistance2_"
+cost = 2.0
+
+[[methods]]
+type = "bench"
+name = "Bench: Increased Life and Mana"
+mod_id = "JunMaster2PercentageLifeAndMana1"
+cost = 6.0
+
+[[methods]]
+type = "bench"
+name = "Bench: Strength and Dexterity"
+mod_id = "JunMaster2StrengthAndDexterity2"
+cost = 2.0
+
+# ---------------------------------------------------------------------------
+# Reroll methods beyond Chaos Orbs. Essences guarantee one mod while
+# rerolling; Harvest reforges guarantee a mod with the target tag and keep
+# influence, so post-Hunter-slam they can force the spell crit suffix
+# (tags: caster + critical — the only critical-tag mods on a body armour).
+# Costs are Allflame softcore day-2: lifeforce ~0.016c each; reforge amounts
+# 50 (elemental/life) and ~150 (caster/critical) crystallised lifeforce.
+# ---------------------------------------------------------------------------
+
+[[methods]]
+type = "essence"
+essence = "Deafening Essence of Greed"  # guaranteed 160-174 life, rerolls rest
+cost = 2.0
+
+[[methods]]
+type = "essence"
+essence = "Screaming Essence of Greed"  # guaranteed 130-144 life, cheaper
+cost = 0.85
+
+[[methods]]
+type = "harvest"
+op = "reforge"
+target = "life"
+cost = 1.0
+
+[[methods]]
+type = "harvest"
+op = "reforge"
+target = "caster"
+cost = 2.5
+
+[[methods]]
+type = "harvest"
+op = "reforge"
+target = "critical"
+cost = 2.5
+
+# ---------------------------------------------------------------------------
+# Positive weighted filters from the screenshot
+# ---------------------------------------------------------------------------
+
+[[wants]]
+stat = "spell_additional_critical_strike_chance_permyriad"
+weight = 53.876
+
+[[wants]]
+stat = "base_damage_removed_from_mana_before_life_%"
+weight = 7.584
+
+[[wants]]
+stat = "base_resist_all_elements_%"
+weight = 4.692
+
+[[wants]]
+stat = "cold_and_lightning_damage_resistance_%"
+weight = 3.019
+
+[[wants]]
+stat = "fire_and_lightning_damage_resistance_%"
+weight = 3.002
+
+[[wants]]
+stat = "fire_and_cold_damage_resistance_%"
+weight = 3.002
+
+[[wants]]
+stat = "base_fire_damage_resistance_%"
+weight = 1.493
+
+[[wants]]
+stat = "base_lightning_damage_resistance_%"
+weight = 1.493
+
+[[wants]]
+stat = "base_cold_damage_resistance_%"
+weight = 1.493
+
+[[wants]]
+stat = "base_maximum_life"
+weight = 0.356
+
+[[wants]]
+stat = "cold_and_chaos_damage_resistance_%"
+weight = 2.044
+
+[[wants]]
+stat = "lightning_and_chaos_damage_resistance_%"
+weight = 2.044
+
+[[wants]]
+stat = "fire_and_chaos_damage_resistance_%"
+weight = 2.027
+
+[[wants]]
+stat = "maximum_life_+%"
+weight = 2.943
+
+[[wants]]
+stat = "damage_+%_per_power_charge"
+weight = 9.666
+
+[[wants]]
+stat = "additional_spell_block_%"
+weight = 2.777
+
+[[wants]]
+stat = "additional_block_%"
+weight = 2.719
+
+[[wants]]
+stat = "base_spell_suppression_chance_%"
+weight = 0.655
+
+[[wants]]
+stat = "base_chaos_damage_resistance_%"
+weight = 0.566
+
+[[wants]]
+stat = "physical_damage_taken_%_as_cold"
+weight = 0.634
+
+[[wants]]
+stat = "physical_damage_taken_%_as_fire"
+weight = 0.567
+
+[[wants]]
+stat = "physical_damage_taken_%_as_lightning"
+weight = 0.495
+
+[[wants]]
+stat = "avoid_fire_damage_%"
+weight = 0.863
+
+[[wants]]
+stat = "avoid_lightning_damage_%"
+weight = 0.954
+
+[[wants]]
+stat = "base_additional_physical_damage_reduction_%"
+weight = 1.395
+
+[[wants]]
+stat = "avoid_cold_damage_%"
+weight = 0.796
+
+[[wants]]
+stat = "additional_strength_and_dexterity"
+weight = 0.263
+
+[[wants]]
+stat = "additional_strength"
+weight = 0.177
+
+# Not included:
+# - implicit all Elemental Resistances: 4.854
+# - implicit increased Spell Damage: 1.862
+# - increased Elemental Damage taken: -2.494
+# - increased Physical Damage taken: -1.425
+#
+# Negative weights are rejected, and this version cannot add corruption or
+# synthesis implicits to a fresh base.
+
+[search]
+beam_width = 100
+max_steps = 16
+cost_weight = 0.01
+restart_cost = 1.0 # Replace with the six-white base's value in chaos.
+seed = 42
+top = 5
+
+# Allflame softcore exchange rates (poe.ninja, 2026-07-25). Chaos Orb is the
+# pricing unit (1.0) and needs no override.
+[prices]
+"Orb of Transmutation" = 0.013
+"Orb of Augmentation" = 0.023
+"Orb of Alchemy" = 0.055
+"Orb of Alteration" = 0.10
+"Regal Orb" = 0.30
+"Orb of Scouring" = 0.40
+"Exalted Orb" = 0.82
+"Orb of Annulment" = 3.75
+"Divine Orb" = 90.6
+"Hunter's Exalted Orb" = 116.4
